@@ -102,7 +102,7 @@ Rank leads by:
 1. local stock today;
 2. exact technical match;
 3. price under tender unit price;
-4. supplier can deliver to the school;
+4. supplier can deliver to the customer site/address;
 5. supplier can provide receipt/invoice;
 6. source quality.
 

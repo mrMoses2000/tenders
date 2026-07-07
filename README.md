@@ -2,6 +2,8 @@
 
 This repository stores the working instructions, Codex skill, references, and helper scripts for Kazakhstan tender/procurement work with Notion.
 
+The product is not limited to Nazarbayev Intellectual Schools. NIS requests are a frequent and well-known customer pattern, but the workflow must support any organization: schools, colleges, universities, clinics, offices, public-sector bodies, private companies, contractors, and one-off commercial requests.
+
 ## Layout
 
 - `skills/tender-procurement-notion/` - installable Codex skill.
@@ -9,6 +11,13 @@ This repository stores the working instructions, Codex skill, references, and he
 - `skills/tender-procurement-notion/scripts/` - small deterministic helpers.
 - `docs/` - human-readable audit, pipeline, and roadmap.
 - root legacy `*.md` files - original project instructions used as source material.
+
+Key docs:
+
+- `docs/tender-agent-pipeline.md` - operational procurement pipeline.
+- `docs/automation-roadmap.md` - next helper scripts and guardrails.
+- `docs/github-repo-scout.md` - decision on external GitHub projects.
+- `docs/product-and-messaging-architecture.md` - product boundary, WhatsApp/Telegram options, Ubuntu deployment model.
 
 ## Install In Codex
 

@@ -1,5 +1,7 @@
 # Tender Agent Pipeline
 
+This pipeline is client-agnostic. NIS schools are a common request type, but the same workflow must support any organization: schools, colleges, universities, clinics, offices, public bodies, private companies, contractors, and ad hoc commercial requests.
+
 ## 1. Intake
 
 Identify whether the request is:
@@ -23,6 +25,7 @@ For each line item, extract:
 - tender unit price;
 - tender line total;
 - city and destination;
+- customer organization and receiving site;
 - hard gates: size, volume, weight, article, model, color, material, purpose, package count.
 
 Normalize duplicate-looking names carefully. Same item name from different suppliers or different locations is not automatically the same tender line.

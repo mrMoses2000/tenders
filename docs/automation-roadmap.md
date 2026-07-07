@@ -23,7 +23,7 @@
      - Domsad/local shop cards.
 
 5. City logistics estimator
-   - Store known school addresses and 2GIS search URLs.
+   - Store known customer/destination addresses and 2GIS search URLs.
    - Estimate whether taxi, courier, or Gazelle is needed based on weight/volume.
 
 6. Acceptance-risk library

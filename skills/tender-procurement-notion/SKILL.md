@@ -1,13 +1,15 @@
 ---
 name: tender-procurement-notion
-description: Kazakhstan tender and urgent procurement research with Notion. Use when Codex must parse tender specs or Notion заявки, find and compare suppliers on Kaspi, OLX, 2GIS, Satu, Pulscen, Instagram, local supplier sites, validate technical conformity, rank purchase options, draft supplier questions, or update existing Notion tender databases. Never use to place orders, send messages, reserve goods, or pay.
+description: Kazakhstan tender and urgent procurement research with Notion for schools, NIS, public bodies, private companies, contractors, and other organizations. Use when Codex must parse tender specs or Notion заявки, find and compare suppliers on Kaspi, OLX, 2GIS, Satu, Pulscen, Instagram, local supplier sites, validate technical conformity, rank purchase options, draft supplier questions, or update existing Notion tender databases. Never use to place orders, send messages, reserve goods, or pay.
 ---
 
 # Tender Procurement + Notion
 
 ## Mission
 
-Find real purchasable options for Kazakhstan tender lines, verify them against the technical specification, and keep the existing Notion workspace auditable.
+Find real purchasable options for Kazakhstan tender/request lines, verify them against the technical specification, and keep the existing Notion workspace auditable.
+
+The customer may be any organization: NIS is a frequent pattern, not a product boundary.
 
 Optimize for this order:
 
@@ -61,7 +63,7 @@ Use this when the user gives a file/photo/specification with multiple lines.
 
 1. Reconstruct every line item.
 2. Recalculate line totals and the grand total.
-3. Detect duplicate item names from different suppliers or schools; do not merge unless the user or source says to aggregate.
+3. Detect duplicate item names from different suppliers, organizations, sites, schools, buildings, or departments; do not merge unless the user or source says to aggregate.
 4. Create or update Notion tender, request, and supplier records.
 5. Search and validate suppliers line by line.
 6. Report validated subtotal only for fully verified lines; keep pending lines separate.
@@ -94,7 +96,7 @@ Each candidate must get one of these statuses:
 - `❌ Не использовать без разъяснения` - a mandatory parameter differs or acceptance risk is high.
 - `⛔ Точное решение не найдено` - enough search was done and no trustworthy solution exists.
 
-Hard parameters include model/article, purpose, size, volume, weight, color number, set composition, material, voltage/current, count per package, school/dorm allocation, and delivery deadline.
+Hard parameters include model/article, purpose, size, volume, weight, color number, set composition, material, voltage/current, count per package, destination/site allocation, and delivery deadline.
 
 If the source says `310 мл` and the candidate is `280 мл`, or the tender says `25 кг` and the candidate is priced per kg, do not call it exact.
 

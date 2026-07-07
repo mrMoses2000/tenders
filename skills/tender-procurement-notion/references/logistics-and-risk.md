@@ -70,6 +70,6 @@ Same-day leads require explicit confirmation of:
 - payment path the user can use;
 - pickup/delivery cutoff time;
 - driver/courier availability;
-- school receiving time.
+- customer receiving time.
 
 If not confirmed, status remains `⚠️ Требует подтверждения`.
