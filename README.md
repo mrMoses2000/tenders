@@ -18,6 +18,7 @@ Key docs:
 - `docs/automation-roadmap.md` - next helper scripts and guardrails.
 - `docs/github-repo-scout.md` - decision on external GitHub projects.
 - `docs/product-and-messaging-architecture.md` - product boundary, WhatsApp/Telegram options, Ubuntu deployment model.
+- `docs/telegram-whatsapp-implementation-plan.md` - phased implementation plan for the persistent Telegram/WhatsApp procurement agent.
 
 ## Install In Codex
 
