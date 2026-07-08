@@ -45,7 +45,7 @@ Core properties:
 | `Единица измерения` | select | Unit from tender. |
 | `Цена за 1 единицу товара` | number | Tender unit price. Do not overwrite with supplier price. |
 | `Цена за общее кол-во` | formula | Tender line total. Read-only. |
-| `Цена каталога, ₸ с НДС` | number | Lowest valid supplier unit price found for the item, preferably in-budget. |
+| `Цена каталога, ₸ с НДС` | number | Cheapest technically valid supplier unit price found for the item after market search. |
 | `Цена закупки, ₸ без НДС` | formula | Read-only calculation from catalog/source price. |
 | `Сумма закупки, ₸ без НДС` | formula | Read-only calculation. |
 | `Разница до логистики, ₸` | formula | Read-only margin before logistics. |
@@ -107,13 +107,13 @@ When working inside `Максим -> Заявки`:
 1. Fetch the `Максим` page and actual schemas if they are not already known in the current context.
 2. Fetch the target request row or view before researching.
 3. Build the item fingerprint from `Тех. спек`, `Количество`, `Единица измерения`, `Цена за 1 единицу товара`, `Город`, `Тендер`, customer/delivery context and existing notes.
-4. Search by technical specification first. Price is a filter after technical fit, not the primary search key.
+4. Search by product/specification first. Do not include the tender price or price interval in search queries unless the user explicitly asks. Price is compared after candidates are collected and checked against the technical spec.
 5. Create or update several useful supplier candidates in `Поставщики`.
 6. Link every useful candidate to the request through both relation sides:
    - `Поставщики.📝 Заявка`;
    - `Заявки.Поставщики`.
 7. Preserve existing supplier relations unless they are duplicates or the user explicitly asks to replace them.
-8. Set `Заявки.Цена каталога, ₸ с НДС` to the lowest valid supplier unit price that matches hard technical requirements and is preferably at or below tender unit price.
+8. Set `Заявки.Цена каталога, ₸ с НДС` to the cheapest supplier unit price that matches hard technical requirements.
 9. Do not use a wrong-spec or unresolved analogue to fill the request's main price. Put it in `Поставщики` as reserve/risk and explain in notes.
 10. Update `Доказательства / заметка`, `Что уточнить`, `Дата проверки`, `Источник товара`, `Ссылка 2ГИС`, and `Соответствие техспеку` from evidence.
 
@@ -136,9 +136,9 @@ Rules:
 
 - Tender unit price lives in `Заявки.Цена за 1 единицу товара`.
 - Supplier candidate price lives in `Поставщики.Цена за единицу`.
-- Best valid request price lives in `Заявки.Цена каталога, ₸ с НДС`.
-- Prefer supplier candidates below tender unit price.
-- If all technically valid candidates are above tender unit price, mark them as reserve/risk and write the margin problem clearly.
+- Cheapest valid request price found lives in `Заявки.Цена каталога, ₸ с НДС`.
+- Tender unit price is used for margin comparison, not to limit search queries.
+- Prefer supplier candidates below tender unit price, but if all technically valid candidates are above tender unit price, still record the cheapest valid market price and write the margin problem clearly.
 - Do not call a candidate "best" only because it is cheap. Wrong technical spec means not usable.
 
 ## Common failure modes to avoid

@@ -22,7 +22,7 @@ Use these common properties when present:
 - `Количество`
 - `Единица измерения`
 - `Цена за 1 единицу товара` - tender unit price, not supplier price.
-- `Цена каталога, ₸ с НДС` - lowest valid supplier unit price for the request row, preferably in-budget and only after hard technical gates match.
+- `Цена каталога, ₸ с НДС` - cheapest technically valid supplier unit price found for the request row after market search.
 - `НДС подтверждён` - set `__YES__` only when explicitly proven.
 - `Источник товара`
 - `Источник фото`
@@ -33,7 +33,7 @@ Use these common properties when present:
 - `Доказательства / заметка`
 - `Что уточнить`
 
-Keep tender price and supplier price separate. Never overwrite `Цена за 1 единицу товара` with supplier price. Never fill `Цена каталога, ₸ с НДС` from a wrong-spec offer just because it is cheap or visible.
+Keep tender price and supplier price separate. Never overwrite `Цена за 1 единицу товара` with supplier price. Do not use tender price as a search-query constraint. Never fill `Цена каталога, ₸ с НДС` from a wrong-spec offer just because it is cheap or visible.
 
 ## Supplier Records
 
@@ -69,7 +69,7 @@ When updating a request:
 - write the current date in `Дата проверки`;
 - use a status that matches evidence, not optimism;
 - put the call script in `Что уточнить`.
-- update `Цена каталога, ₸ с НДС` to the lowest valid technically matching supplier unit price when one is found.
+- update `Цена каталога, ₸ с НДС` to the cheapest valid technically matching supplier unit price when one is found, even if it is above tender price; if above tender price, explain the margin problem clearly.
 
 ## Evidence Note Pattern
 
@@ -84,7 +84,7 @@ Checked YYYY-MM-DD. Need [quantity] of [spec]. Best leads: [supplier/price/sourc
 For urgent line-item searches, update the row with:
 
 - best source URL;
-- best price lead if technically valid and within budget;
+- cheapest technically valid price lead found, with margin warning if above tender price;
 - all useful supplier relations;
 - `⚠️ Требует подтверждения` unless stock/delivery/docs are proven;
 - evidence note listing all ranked leads;

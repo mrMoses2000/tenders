@@ -21,7 +21,7 @@ Record every lead with:
 
 ## Search Matrix
 
-Search by the hard technical specification first. Do not start from the cheapest visible price and then force-fit the item to the tender line.
+Search by the item and hard technical specification first. Do not put tender unit price, budget intervals, or "до X тенге" into search queries unless the user explicitly asks for that search shape. First collect the real market spread, then validate by technical fit, then rank by cheapest valid price.
 
 For every item, search in this order unless the user says otherwise:
 
@@ -95,9 +95,9 @@ Use `❌ Не использовать без разъяснения` when:
 - product purpose differs;
 - color or model differs;
 - the product is a near substitute and the user has not approved analogs;
-- price is above the hard budget and no approval exists.
+- price is above tender price and no margin-loss approval exists, if the candidate is being treated as a purchase-ready primary option.
 
-Over-budget candidates can remain in `Поставщики` as reserve/risk leads, but they must not become the primary solution while an in-budget technically valid option might exist.
+Above-tender candidates can remain in `Поставщики` as real market leads. If the cheapest technically valid candidate is above tender price, record it as the current cheapest valid result and flag the margin problem. Continue searching for cheaper valid options unless the user stops the search.
 
 ## Urgent Lead Ranking
 
@@ -105,7 +105,7 @@ Rank leads by:
 
 1. local stock today;
 2. exact technical match;
-3. price under tender unit price and positive margin;
+3. cheapest valid supplier price found;
 4. supplier can deliver to the customer site/address;
 5. supplier can provide receipt/invoice;
 6. source quality.

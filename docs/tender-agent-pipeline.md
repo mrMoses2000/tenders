@@ -58,7 +58,7 @@ Compare candidate to fingerprint:
 - do not use without clarification;
 - no verified solution.
 
-Keep source price separate from tender price. Do not label unverified marketplace prices as confirmed procurement price. Do not use wrong-spec or over-budget candidates as the main request price.
+Keep source price separate from tender price. Do not label unverified marketplace prices as confirmed procurement price. Do not use wrong-spec candidates as the main request price. Do not constrain searches by tender price; collect market options first, then compare against tender price for margin.
 
 ## 5. Notion Update
 
@@ -72,7 +72,7 @@ Update the row with:
 - evidence note;
 - exact call/message script;
 - price lead if visible and relevant.
-- `Цена каталога, ₸ с НДС` as the lowest technically valid supplier unit price, preferably under tender unit price.
+- `Цена каталога, ₸ с НДС` as the cheapest technically valid supplier unit price found, with a margin warning if it is above tender unit price.
 
 Create supplier records only for useful leads. Do not create duplicate suppliers.
 
