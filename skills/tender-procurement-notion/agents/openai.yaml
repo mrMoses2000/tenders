@@ -1,7 +1,7 @@
 interface:
   display_name: "Tender Procurement Notion"
   short_description: "Tender sourcing and Notion updates"
-  default_prompt: "Use $tender-procurement-notion to research tender line items, validate supplier offers, rank purchase options, and update Notion safely."
+  default_prompt: "Use $tender-procurement-notion to research tender line items by technical specification first, create/reuse multiple supplier candidates in Notion, link them through the request row's Поставщики relation, write the lowest valid in-budget supplier price to Цена каталога, and update Notion safely without sending messages or ordering."
 
 policy:
   allow_implicit_invocation: true

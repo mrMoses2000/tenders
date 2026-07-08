@@ -11,6 +11,8 @@ Common databases:
 - `Тендера` - one tender/project page.
 - `Клиенты` - customer organization.
 
+For the current `Максим` workspace, the actual structure is documented in repository file `docs/notion-maxim-structure.md`. Use it as the map for database names, relation directions, and price fields.
+
 ## Request Row Fields
 
 Use these common properties when present:
@@ -20,7 +22,7 @@ Use these common properties when present:
 - `Количество`
 - `Единица измерения`
 - `Цена за 1 единицу товара` - tender unit price, not supplier price.
-- `Цена каталога, ₸ с НДС` - current source gross/catalog price only when visible.
+- `Цена каталога, ₸ с НДС` - lowest valid supplier unit price for the request row, preferably in-budget and only after hard technical gates match.
 - `НДС подтверждён` - set `__YES__` only when explicitly proven.
 - `Источник товара`
 - `Источник фото`
@@ -31,7 +33,7 @@ Use these common properties when present:
 - `Доказательства / заметка`
 - `Что уточнить`
 
-Keep tender price and supplier price separate.
+Keep tender price and supplier price separate. Never overwrite `Цена за 1 единицу товара` with supplier price. Never fill `Цена каталога, ₸ с НДС` from a wrong-spec offer just because it is cheap or visible.
 
 ## Supplier Records
 
@@ -43,6 +45,8 @@ Create supplier records for useful leads only. Include:
 - phone/email/site when available;
 - notes with city, address, source evidence, stock/price assumptions, and next questions;
 - relation to the request row.
+
+In `Максим`, supplier candidates belong in the `Поставщики` database, not only in the request notes. Fill these fields when known: `Компания`, `📝 Заявка`, `Цена за единицу`, `Кол-во`, `Сумма товара`, `Логистика`, `Итого с логистикой`, `Цена / условия`, `Приоритет`, `Статус`, `Город`, `Категория`, `Сайт`, `2ГИС`, `Телефон`, `Адрес`, `Заметки`.
 
 If a select option such as city is missing, omit the select and write the city in notes. Do not create schema options unless the user asks.
 
@@ -60,10 +64,12 @@ Do not create duplicates for the same supplier just because the product differs.
 When updating a request:
 
 - preserve unrelated supplier relations unless the user asks to replace them;
+- append all useful supplier candidates to `Поставщики`; do not link only the cheapest or only the first result;
 - append or summarize new evidence instead of erasing important history;
 - write the current date in `Дата проверки`;
 - use a status that matches evidence, not optimism;
 - put the call script in `Что уточнить`.
+- update `Цена каталога, ₸ с НДС` to the lowest valid technically matching supplier unit price when one is found.
 
 ## Evidence Note Pattern
 
@@ -78,7 +84,7 @@ Checked YYYY-MM-DD. Need [quantity] of [spec]. Best leads: [supplier/price/sourc
 For urgent line-item searches, update the row with:
 
 - best source URL;
-- best price lead if within budget;
+- best price lead if technically valid and within budget;
 - all useful supplier relations;
 - `⚠️ Требует подтверждения` unless stock/delivery/docs are proven;
 - evidence note listing all ranked leads;

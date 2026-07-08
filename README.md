@@ -19,6 +19,7 @@ Key docs:
 - `docs/github-repo-scout.md` - decision on external GitHub projects.
 - `docs/product-and-messaging-architecture.md` - product boundary, WhatsApp/Telegram options, Ubuntu deployment model.
 - `docs/telegram-whatsapp-implementation-plan.md` - phased implementation plan for the persistent Telegram/WhatsApp procurement agent.
+- `docs/notion-maxim-structure.md` - actual Notion structure under `Максим` and required request/supplier relation workflow.
 
 ## Install In Codex
 

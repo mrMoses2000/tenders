@@ -14,6 +14,8 @@ Identify whether the request is:
 
 Fetch Notion first when the user points to an existing workspace path such as `Максим -> Заявки -> Караганда_1`.
 
+For `Максим`, use `docs/notion-maxim-structure.md` as the current map of databases, fields, relations, and price rules.
+
 ## 2. Build The Fingerprint
 
 For each line item, extract:
@@ -45,6 +47,8 @@ Search local suppliers first:
 
 For urgent work, keep expanding until the requested minimum number of leads is found or all sensible routes are exhausted.
 
+Default expectation is several supplier candidates per line, not one. Create/reuse supplier rows in `Поставщики`, then link them to the request row through `Заявки.Поставщики`.
+
 ## 4. Validate
 
 Compare candidate to fingerprint:
@@ -54,7 +58,7 @@ Compare candidate to fingerprint:
 - do not use without clarification;
 - no verified solution.
 
-Keep source price separate from tender price. Do not label unverified marketplace prices as confirmed procurement price.
+Keep source price separate from tender price. Do not label unverified marketplace prices as confirmed procurement price. Do not use wrong-spec or over-budget candidates as the main request price.
 
 ## 5. Notion Update
 
@@ -68,6 +72,7 @@ Update the row with:
 - evidence note;
 - exact call/message script;
 - price lead if visible and relevant.
+- `Цена каталога, ₸ с НДС` as the lowest technically valid supplier unit price, preferably under tender unit price.
 
 Create supplier records only for useful leads. Do not create duplicate suppliers.
 

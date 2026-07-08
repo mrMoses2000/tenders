@@ -16,11 +16,12 @@ Optimize for this order:
 1. technical conformity;
 2. real stock and same-day or realistic logistics;
 3. traceable supplier identity;
-4. price within tender budget;
+4. price within tender budget and margin preservation;
 5. document/payment practicality;
 6. margin after delivery.
 
 Cheap but unverified offers are leads, not solutions.
+Wrong-spec offers are not solutions even if they are cheap. Over-budget offers are reserve/risk unless the user approves the margin loss.
 
 ## Allowed Work
 
@@ -49,12 +50,14 @@ Use this when the user says a contract is at risk, needs delivery today, or name
 2. Extract the hard fingerprint: name, quantity, unit, exact size/fascia/color/model, tender price, delivery city, customer address if known.
 3. Search local city first, then nearby cities, then Kazakhstan-wide only if same-day/local fails.
 4. Produce at least the requested number of supplier leads; if not possible, explain which routes were exhausted.
+   - Default minimum is 3 useful supplier candidates per line when the market has enough options.
+   - If the user asks for a minimum such as 10 stores, satisfy that minimum with real useful leads or state why it is impossible.
 5. Separate leads into:
    - `buy first` - likely in budget and locally actionable;
    - `call next` - plausible but missing stock/price/delivery;
    - `expensive reserve` - available but over budget;
    - `do not use` - fails technical spec.
-6. Update the existing Notion row with source, date, price lead, supplier relations, evidence note, and exact call script.
+6. Create/reuse supplier rows in `Поставщики`, link all useful candidates into the request row's `Поставщики` relation, then update source, date, lowest valid price lead, evidence note, and exact call script.
 7. Give the user a short ranked call list, not a long essay.
 
 ### Full Tender Intake
@@ -65,7 +68,7 @@ Use this when the user gives a file/photo/specification with multiple lines.
 2. Recalculate line totals and the grand total.
 3. Detect duplicate item names from different suppliers, organizations, sites, schools, buildings, or departments; do not merge unless the user or source says to aggregate.
 4. Create or update Notion tender, request, and supplier records.
-5. Search and validate suppliers line by line.
+5. Search and validate suppliers line by line. Search from `Тех. спек` and hard gates first; use price as a filter after technical fit.
 6. Report validated subtotal only for fully verified lines; keep pending lines separate.
 
 ### Notion Cleanup Or Update
@@ -104,6 +107,8 @@ If the source says `310 мл` and the candidate is `280 мл`, or the tender say
 
 Read `references/notion-upsert.md` before creating or updating Notion records in a tender database.
 
+For the `Максим` workspace path, also follow `docs/notion-maxim-structure.md` from the `/Users/mosesvasilenko/tenders` repository when available. If you do not have that file in context, fetch the `Максим` page and current database schemas before editing.
+
 Default row fields to maintain:
 
 - `Источник товара`
@@ -119,6 +124,10 @@ Default row fields to maintain:
 
 Supplier records should be created only for real leads with a name/site/phone/page and connected to the relevant request row. If the supplier city option does not exist in Notion, omit the select property and put the city in notes.
 
+For each researched request line, create or reuse several supplier candidates when available and link every useful candidate to `Заявки.Поставщики`. Do not leave supplier options only in notes.
+
+Set `Цена каталога, ₸ с НДС` in the request row to the lowest valid supplier unit price that matches hard technical requirements and is preferably at or below the tender unit price. Do not fill this field from a wrong-spec analogue. If every valid option is above the tender price, mark it as reserve/risk in the supplier records and explain the margin problem.
+
 ## References
 
 Load only the relevant file:
@@ -127,6 +136,7 @@ Load only the relevant file:
 - `references/notion-upsert.md` - Notion schema mapping and upsert discipline.
 - `references/logistics-and-risk.md` - city search order, delivery rules, and dangerous substitutions.
 - `references/messages.md` - supplier question drafts; draft only unless the user explicitly approves sending.
+- Repository doc `docs/notion-maxim-structure.md` - actual `Максим` Notion map and mandatory relation/price workflow.
 
 Use `scripts/check_candidates.py` when you have a CSV/JSON shortlist and need fast price/quantity/status checks.
 

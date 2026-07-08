@@ -21,6 +21,8 @@ Record every lead with:
 
 ## Search Matrix
 
+Search by the hard technical specification first. Do not start from the cheapest visible price and then force-fit the item to the tender line.
+
 For every item, search in this order unless the user says otherwise:
 
 1. existing Notion suppliers linked to the same tender/city;
@@ -95,13 +97,15 @@ Use `❌ Не использовать без разъяснения` when:
 - the product is a near substitute and the user has not approved analogs;
 - price is above the hard budget and no approval exists.
 
+Over-budget candidates can remain in `Поставщики` as reserve/risk leads, but they must not become the primary solution while an in-budget technically valid option might exist.
+
 ## Urgent Lead Ranking
 
 Rank leads by:
 
 1. local stock today;
 2. exact technical match;
-3. price under tender unit price;
+3. price under tender unit price and positive margin;
 4. supplier can deliver to the customer site/address;
 5. supplier can provide receipt/invoice;
 6. source quality.
