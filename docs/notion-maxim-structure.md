@@ -1,6 +1,6 @@
 # Notion structure: Максим
 
-Observed: 2026-07-08
+Observed: 2026-07-11
 
 This document maps the working Notion area used for procurement requests.
 
@@ -17,13 +17,26 @@ Root page:
 | `Тендера` | `collection://37b4e642-8c82-8009-951e-000ba16ea48f` | Tender/project header: city, customer relation, total, status, row count. |
 | `Заявки` | `collection://3734e642-8c82-80fb-a95c-000b05301c9f` | One line item per tender/request row. This is the main work table. |
 | `Клиенты` | `collection://3734e642-8c82-80f7-b2cc-000be68fe7b8` | Customer/destination organizations, addresses and contacts. |
-| `Поставщики` | `collection://37b4e642-8c82-8003-86f5-000b27ac3de4` | Supplier candidates and real supplier records. Multiple rows may point to one request item. |
+| `Поставщики` | `collection://37b4e642-8c82-8003-86f5-000b27ac3de4` | Reusable directory of real companies, sellers, stores and market points. Product observations never live here. |
+| `Предложения` | `collection://30f4933a-6bf6-4c2f-bf52-19304b4a8231` | One concrete offer/observation for one request line and one supplier. Stores item-specific price, logistics, evidence and readiness. |
+| `Архив legacy-поставщиков` | `collection://87154a63-c650-4e20-99b5-be2048537a7c` | Soft-deleted product-shaped supplier cards removed during migration 1.6. Never use for new procurement. |
 | `Грузопервозки` | `collection://3734e642-8c82-8059-8207-000baf7901f8` | Freight and city delivery options. |
 | `Камеры хранения` | `collection://3734e642-8c82-805e-b5cd-000b8716d798` | Storage/warehouse points linked to freight. |
 
 Child page:
 
 - `План разговора с Зауре Коргашевной — Караганда_1`
+
+Migration state on 2026-07-11:
+
+- the six pilot offers for №23 and six for №61 are detached and marked `Устарело`; both lines are ready for fresh research;
+- all 31 unfinished `Караганда_1` rows have empty research/output fields and no selected offer;
+- all 35 delivered rows retain `Статус = Доставлен в школу`;
+- 67 product-shaped legacy supplier cards are outside the working directory in `Архив legacy-поставщиков`;
+- supplier product fields and the duplicate single-select `Категория` have been deleted;
+- views in `Предложения`: `Все активные`, `Связаться`, `Экономика`, `Статусы`, `Закуплено / история`.
+- Formula/rollup economics and a user-controlled selected-offer relation are active.
+- Existing direct `Заявки ↔ Поставщики` relations remain during the compatibility period.
 
 ## `Заявки`
 
@@ -50,6 +63,24 @@ Core properties:
 | `Сумма закупки, ₸ без НДС` | formula | Read-only calculation. |
 | `Разница до логистики, ₸` | formula | Read-only margin before logistics. |
 | `Поставщики` | relation to `Поставщики` | Must contain all useful supplier candidates for this line, not only the winner. |
+| `Предложения` | relation to `Предложения` | All dated offers/observations researched for this line. |
+| `Количество предложений` | rollup | Count of related offers. Read-only. |
+| `Выбранное предложение` | relation to `Предложения` | Commercial choice explicitly made/confirmed by the user. Do not auto-select by lowest price. |
+| `Выбранная цена` | rollup | Selected offer price. Read-only. |
+| `Выбранная логистика прогноз` | rollup | Selected forecast logistics. Read-only. |
+| `Выбранная себестоимость прогноз` | rollup | Selected full forecast cost. Read-only. |
+| `Выбранная прибыль прогноз` | rollup | Selected forecast profit. Read-only. |
+| `Выбранная прибыль, % от выручки` | rollup | Selected forecast profit divided by tender revenue. Read-only. |
+| `Выбранная прибыль факт, % от выручки` | rollup | Selected actual profit divided by tender revenue. Read-only. |
+| `Выбранный поставщик` | rollup | Supplier from the user-selected offer. Read-only. |
+| `Выбранный источник` | rollup | Source URL from the user-selected offer. Read-only. |
+| `Выбранное фото (URL)` | rollup | Direct image URL from the user-selected offer. Read-only. |
+| `Выбранное соответствие ТЗ` | rollup | Technical status from the selected offer. Read-only. |
+| `Выбранное наличие` | rollup | Stock state from the selected offer. Read-only. |
+| `Выбранный статус работы` | rollup | Work status from the selected offer. Read-only. |
+| `Выбранная фактическая цена` | rollup | Selected actual purchase price. Read-only. |
+| `Выбранная себестоимость факт` | rollup | Selected actual full cost. Read-only. |
+| `Выбранная прибыль факт` | rollup | Selected actual profit. Read-only. |
 | `Соответствие техспеку` | select | Evidence-based match status. |
 | `Источник товара` | URL | Best current product/source URL for the primary candidate. |
 | `Ссылка 2ГИС` | URL | Store identity/location proof when useful. |
@@ -81,24 +112,51 @@ Core properties:
 | Property | Type | How to use |
 |---|---|---|
 | `Компания` | title | Supplier/company/source name. Use a concrete source name. |
-| `📝 Заявка` | relation to `Заявки` | Link supplier candidate to every relevant request line. |
-| `Цена за единицу` | number | Supplier unit price for the candidate item. |
-| `Кол-во` | number | Confirmed/visible quantity or quantity being quoted. |
-| `Сумма товара` | number | `Цена за единицу × Кол-во` when known. |
-| `Логистика` | number | Delivery/logistics cost when known. |
-| `Итого с логистикой` | number | Total purchase cost with logistics when known. |
-| `Цена / условия` | text | Human-readable price, payment, quantity and document notes. |
-| `Приоритет` | select | `1 - лучший`, `2 - резерв`, `3 - только если подтвердят`, `4 - невыгодно / риск`. |
+| `📝 Заявка` | relation to `Заявки` | Compatibility relation to relevant request lines. |
+| `Предложения` | relation to `Предложения` | Concrete dated product offers from this supplier. |
+| `Тип поставщика` | select | Company, marketplace seller, store, market/pavilion, original counterparty, etc. |
+| `Город` | select | Structured main supplier city; options are extended as real cities appear. |
+| `Филиал / уточнение` | text | Branch/address clarification or explanation that shipment city is unknown. |
+| `БИН / ИИН` | text | Legal identifier when proven. |
+| `WhatsApp` | phone | Direct WhatsApp-capable contact when known. |
+| `Категории товаров` | multi-select | Reusable sourcing categories. |
+| `Работа с документами` | select | Document capability state. |
+| `Виды документов` | multi-select | Invoice, receipt, waybill, VAT invoice, etc., only when proven. |
+| `Способы оплаты` | multi-select | Supported payment methods when proven. |
+| `Надёжность` | select | Evidence-based supplier reliability. |
+| `Дата последнего контакта` | date | Latest real interaction. |
+| `Дата последней закупки` | date | Latest proven purchase. |
+| `Успешных закупок` | number | Count of proven successful purchases. |
+| `Причина не работать` | text | Durable exclusion reason, if any. |
 | `Статус` | status | Usually `Лид` until confirmed/active. |
-| `Город` | select | Supplier/source city. |
-| `Категория` | select | Category if obvious. |
-| `Сайт` | URL | Product page, website, marketplace listing or search result. |
+| `Сайт` | URL | Stable supplier/company/store home page. Exact product/listing URL belongs in `Предложения.Источник`. |
 | `2ГИС` | URL | Store identity/location proof. |
 | `Телефон` | phone | Supplier phone if available. |
 | `Email` | email | Supplier email if available. |
 | `Адрес` | text | Supplier address when known. |
 | `Контактное лицо` | text | Contact person. |
-| `Заметки` | text | Technical fit, stock assumptions, risks and next questions. |
+| `Общие заметки` | text | Supplier-level reputation and operating notes only; no item price or technical description. |
+
+The item fields `Цена за единицу`, `Кол-во`, `Сумма товара`, `Логистика`, `Итого с логистикой`, `Цена / условия`, `Приоритет` and duplicate `Категория` were removed in migration 1.6. Any attempt to recreate them in `Поставщики` is a schema regression. Store those facts in `Предложения`.
+
+## `Предложения`
+
+One row represents one request × supplier × dated observation. A price/terms change should normally create a new observation rather than erase useful history.
+
+Key field groups:
+
+| Group | Properties and rule |
+|---|---|
+| Identity | `Предложение`, one `Заявка`, one `Поставщик` when identity is known, `Товар поставщика`, `Модель / артикул`, `Фасовка / размер`. |
+| Evidence | `Тип источника`, `Источник`, direct `Источник фото`, attachment `Фото товара`, `Дата проверки`, `Доказательства`, `Что уточнить`. |
+| Price | `Цена предложения`, select `Единица цены`, `Цена и НДС`, `Минимальный заказ`. |
+| Availability | `Наличие`, `Количество доступно`, `Срок / дата доступности`. Required tender quantity is never copied into available quantity. |
+| Fulfilment | select `Город поставщика`, `Способ получения`, `Точка отгрузки / самовывоза`, `Прогноз логистики`, `Доставка подтверждена`. |
+| Validation | `Соответствие ТЗ`, `Документы подтверждены`, `Статус работы`, `Приоритет`. Unknown evidence stays `Не проверено`/`Неизвестно`. |
+| Forecast | rollups `Требуемое количество`, `Тендерная цена за единицу`; formulas for goods cost, full cost, profit, profit as % of revenue, and `Экономика`. Read-only. |
+| Actual | `Фактическая цена`, `Фактическое количество`, `Доля фактической логистики`, `Дата закупки`; formulas for actual cost/profit/profit as % of revenue. Fill only from proven facts. |
+
+Independent states must not be collapsed into one optimistic status. An offer can match the technical spec while stock, documents, delivery, or VAT remain unknown.
 
 ## Mandatory workflow
 
@@ -108,23 +166,25 @@ When working inside `Максим -> Заявки`:
 2. Fetch the target request row or view before researching.
 3. Build the item fingerprint from `Тех. спек`, `Количество`, `Единица измерения`, `Цена за 1 единицу товара`, `Город`, `Тендер`, customer/delivery context and existing notes.
 4. Search by product/specification first. Do not include the tender price or price interval in search queries unless the user explicitly asks. Price is compared after candidates are collected and checked against the technical spec.
-5. Create or update several useful supplier candidates in `Поставщики`.
-6. Link every useful candidate to the request through both relation sides:
+5. Create or reuse persistent company identities in `Поставщики`.
+6. Create a `Предложения` row for each useful supplier observation and link it to exactly one request and one supplier when known.
+7. Keep every useful candidate connected through the compatibility relations:
    - `Поставщики.📝 Заявка`;
    - `Заявки.Поставщики`.
-7. Preserve existing supplier relations unless they are duplicates or the user explicitly asks to replace them.
-8. Set `Заявки.Цена каталога, ₸ с НДС` to the cheapest supplier unit price that matches hard technical requirements.
-9. Do not use a wrong-spec or unresolved analogue to fill the request's main price. Put it in `Поставщики` as reserve/risk and explain in notes.
-10. Update `Доказательства / заметка`, `Что уточнить`, `Дата проверки`, `Источник товара`, `Ссылка 2ГИС`, and `Соответствие техспеку` from evidence.
+8. Preserve existing supplier relations unless they are duplicates or the user explicitly asks to replace them.
+9. Set `Заявки.Цена каталога, ₸ с НДС` to the cheapest supplier unit price that matches hard technical requirements.
+10. Do not use a wrong-spec or unresolved analogue to fill the request's main price. Keep it as a reserve/risk offer and explain the issue.
+11. Update request evidence fields from the ranked offer set.
+12. Set `Выбранное предложение` only after the user explicitly chooses/confirms it; never infer a winner from price alone.
 
 ## Supplier count rule
 
 Default expectation for one line item:
 
-- at least 3 useful supplier candidates when the market has enough options;
+- at least 5 useful supplier candidates when the market has enough options;
 - at least 1 primary in-budget candidate when possible;
 - at least 1 reserve candidate;
-- if fewer than 3 are found, write exactly which sources were exhausted.
+- if fewer than 5 are found, write exactly which sources were exhausted.
 
 For urgent rescue tasks, follow the user's requested minimum. If the user says "не менее 10 магазинов", create/reuse at least 10 supplier/source rows when genuinely useful, and link them to the request line.
 
@@ -135,7 +195,7 @@ The work is not to find "anything available". The work is to find technically va
 Rules:
 
 - Tender unit price lives in `Заявки.Цена за 1 единицу товара`.
-- Supplier candidate price lives in `Поставщики.Цена за единицу`.
+- Supplier candidate price lives in `Предложения.Цена предложения`.
 - Cheapest valid request price found lives in `Заявки.Цена каталога, ₸ с НДС`.
 - Tender unit price is used for margin comparison, not to limit search queries.
 - Prefer supplier candidates below tender unit price, but if all technically valid candidates are above tender unit price, still record the cheapest valid market price and write the margin problem clearly.
@@ -144,8 +204,12 @@ Rules:
 ## Common failure modes to avoid
 
 - Creating only one supplier row for an item when several options exist.
-- Writing supplier information only in `Доказательства / заметка` instead of `Поставщики`.
+- Writing supplier information only in notes instead of `Поставщики` and `Предложения`.
 - Forgetting to link supplier rows back to `Заявки.Поставщики`.
+- Copying required quantity into `Количество доступно` without stock evidence.
+- Encoding unknown stock, delivery, documents, or VAT as `Нет`.
+- Putting a product name or item-specific price into the reusable supplier identity.
+- Auto-selecting the cheapest offer without user confirmation and readiness checks.
 - Filling `Цена каталога, ₸ с НДС` with an over-budget or wrong-spec offer.
 - Searching by item name only and ignoring `Тех. спек`.
 - Treating Kaspi/OLX/Instagram price as confirmed stock without date, city, quantity and delivery evidence.

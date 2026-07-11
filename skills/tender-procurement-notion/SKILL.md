@@ -50,14 +50,14 @@ Use this when the user says a contract is at risk, needs delivery today, or name
 2. Extract the hard fingerprint: name, quantity, unit, exact size/fascia/color/model, tender price, delivery city, customer address if known.
 3. Search local city first, then nearby cities, then Kazakhstan-wide only if same-day/local fails.
 4. Produce at least the requested number of supplier leads; if not possible, explain which routes were exhausted.
-   - Default minimum is 3 useful supplier candidates per line when the market has enough options.
+   - Default minimum is 5 useful supplier candidates per line when the market has enough options.
    - If the user asks for a minimum such as 10 stores, satisfy that minimum with real useful leads or state why it is impossible.
 5. Separate leads into:
    - `buy first` - likely in budget and locally actionable;
    - `call next` - plausible but missing stock/price/delivery;
    - `expensive reserve` - available but over budget;
    - `do not use` - fails technical spec.
-6. Create/reuse supplier rows in `Поставщики`, link all useful candidates into the request row's `Поставщики` relation, then update source, date, lowest valid price lead, evidence note, and exact call script.
+6. Create/reuse the company in `Поставщики`, then create one `Предложения` row per request × supplier × dated observation. Keep the compatibility relation `Заявки.Поставщики`, then update source, date, lowest valid price lead, evidence note, and exact call script.
 7. Give the user a short ranked call list, not a long essay.
 
 ### Full Tender Intake
@@ -88,6 +88,8 @@ Use this when the user asks to correct rows, supplier relations, statuses, deliv
 3. Browser/public web for static pages and broad search.
 4. Local scripts in this skill for candidate checks and report shaping.
 
+When the repository deterministic core is available, use it for unit normalization, duplicate detection, arithmetic, delivery allocation, stable payload generation, and public HTML extraction before spending model or visual-browser work on the same deterministic task. It never replaces evidence judgment or performs a Notion write.
+
 Prefer source evidence over memory. Current prices, stock, contacts, and delivery promises must be freshly checked.
 
 ## Technical Validation
@@ -109,7 +111,9 @@ Read `references/notion-upsert.md` before creating or updating Notion records in
 
 For the `Максим` workspace path, also follow `docs/notion-maxim-structure.md` from the `/Users/mosesvasilenko/tenders` repository when available. If you do not have that file in context, fetch the `Максим` page and current database schemas before editing.
 
-Default row fields to maintain:
+The source request is immutable during supplier research: do not change `Тех. спек`, `Количество`, `Единица измерения`, or `Цена за 1 единицу товара` unless the user explicitly corrects the tender source.
+
+Default request fields to maintain:
 
 - `Источник товара`
 - `Источник фото`
@@ -124,7 +128,24 @@ Default row fields to maintain:
 
 Supplier records should be created only for real leads with a name/site/phone/page and connected to the relevant request row. If the supplier city option does not exist in Notion, omit the select property and put the city in notes.
 
-For each researched request line, create or reuse several supplier candidates when available and link every useful candidate to `Заявки.Поставщики`. Do not leave supplier options only in notes.
+`Поставщики` is a reusable company directory. Store persistent identity, contacts, categories, document/payment capability, reliability, and purchase history there. Do not put a product-specific name, URL, technical description, price, quantity, logistics estimate, conditions, or priority into supplier data; those belong to `Предложения`. The product-shaped legacy fields were removed from the `Максим` schema on 2026-07-11 and must not be recreated.
+
+For each researched request line, create or reuse several supplier candidates when available and create a separate `Предложения` row for every useful candidate. Link each offer to exactly one `Заявка` and one real `Поставщик` whenever supplier identity is known. Keep `Заявки.Поставщики` populated during the compatibility period. Do not leave options only in notes.
+
+For every offer:
+
+- preserve the seller's model/article and packaging separately from the price unit;
+- use independent statuses for technical fit, stock, delivery, documents, work stage, VAT, and economy;
+- write `Количество доступно` only when the source or supplier actually proves stock quantity; required tender quantity is not stock;
+- represent missing evidence as `Не проверено` or `Неизвестно`, never as `Нет` or zero;
+- store forecast logistics separately from actual allocated logistics;
+- treat formula and rollup fields as read-only;
+- record actual price, quantity, delivery share, and purchase date only from a user-reported or otherwise proven fact;
+- create a new dated observation when price or terms materially change instead of erasing useful history.
+
+Do not set `Заявки.Выбранное предложение` automatically just because an offer is cheapest. Selection is a commercial decision and requires the user's choice after technical fit, availability, documents, delivery, and full cost are understood.
+
+When the user selects an offer, keep exactly one page in `Заявки.Выбранное предложение`. Selected supplier, source, photo URL, technical status, stock, work status, price, logistics, cost, profit, and profit percentage are read-only rollups from that relation. Original request name/specification/quantity/unit/tender price never come from an offer.
 
 Set `Цена каталога, ₸ с НДС` in the request row to the lowest valid supplier unit price found after technical validation. Do not fill this field from a wrong-spec analogue. If the cheapest technically valid option is above the tender price, still record it as the market result, but clearly explain the margin problem in supplier notes and `Доказательства / заметка`.
 
@@ -136,6 +157,7 @@ Load only the relevant file:
 - `references/notion-upsert.md` - Notion schema mapping and upsert discipline.
 - `references/logistics-and-risk.md` - city search order, delivery rules, and dangerous substitutions.
 - `references/messages.md` - supplier question drafts; draft only unless the user explicitly approves sending.
+- `references/deterministic-core.md` - local deterministic helpers, safe public HTML extractor, and command examples.
 - Repository doc `docs/notion-maxim-structure.md` - actual `Максим` Notion map and mandatory relation/price workflow.
 
 Use `scripts/check_candidates.py` when you have a CSV/JSON shortlist and need fast price/quantity/status checks.

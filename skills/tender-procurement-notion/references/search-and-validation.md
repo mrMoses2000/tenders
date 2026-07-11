@@ -97,7 +97,7 @@ Use `❌ Не использовать без разъяснения` when:
 - the product is a near substitute and the user has not approved analogs;
 - price is above tender price and no margin-loss approval exists, if the candidate is being treated as a purchase-ready primary option.
 
-Above-tender candidates can remain in `Поставщики` as real market leads. If the cheapest technically valid candidate is above tender price, record it as the current cheapest valid result and flag the margin problem. Continue searching for cheaper valid options unless the user stops the search.
+Above-tender candidates can remain as rows in `Предложения` linked to a reusable supplier identity. If the cheapest technically valid candidate is above tender price, record it as the current cheapest valid result and flag the margin problem. Continue searching for cheaper valid options unless the user stops the search.
 
 ## Urgent Lead Ranking
 

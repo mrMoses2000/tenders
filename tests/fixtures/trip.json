@@ -1,0 +1,30 @@
+{
+  "market_name": "Алматы-1",
+  "city": "Алматы",
+  "trip_cost": "5000",
+  "minimum_net_savings": "5000",
+  "items": [
+    {
+      "item_id": "№4",
+      "name": "Хозяйственный товар",
+      "quantity": "20",
+      "fallback_landed_unit_price": "2500",
+      "market_unit_price_low": "1500",
+      "market_unit_price_high": "1900",
+      "probability_found": "0.7",
+      "unit": "шт.",
+      "evidence": "Публичные сигналы и прошлая закупка"
+    },
+    {
+      "item_id": "№7",
+      "name": "Расходный материал",
+      "quantity": "10",
+      "fallback_landed_unit_price": "1800",
+      "market_unit_price_low": "1200",
+      "market_unit_price_high": "1500",
+      "probability_found": "0.5",
+      "unit": "кг",
+      "evidence": "Рыночная гипотеза"
+    }
+  ]
+}

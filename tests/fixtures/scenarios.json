@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Караганда — локально",
+    "unit_price": "2700",
+    "quantity": "5",
+    "logistics": "1000",
+    "risk_reserve_percent": "2",
+    "lead_days": 1,
+    "evidence_level": 4
+  },
+  {
+    "name": "Алматы — межгород",
+    "unit_price": "2200",
+    "quantity": "5",
+    "logistics": "5000",
+    "risk_reserve_percent": "10",
+    "lead_days": 3,
+    "evidence_level": 2
+  }
+]
