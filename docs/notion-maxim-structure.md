@@ -29,9 +29,10 @@ Child page:
 
 Migration state on 2026-07-11:
 
-- the six pilot offers for №23 and six for №61 are detached and marked `Устарело`; both lines are ready for fresh research;
-- all 31 unfinished `Караганда_1` rows have empty research/output fields and no selected offer;
-- all 35 delivered rows retain `Статус = Доставлен в школу`;
+- the six historical offers for №23 and six for №61 are linked back to their request rows and remain marked `Устарело`; each row also has five fresh dated observations;
+- a later school reconciliation established 35 active lines: 29 not found, 2 replacements and 4 partial/delivery-balance lines;
+- every active line has at least five supplier offers; the offer database contains 197 observations in total;
+- original movement statuses were preserved where the school sheet only changed reconciliation; direct delivery confirmations and partial deliveries use `Статус = Доставлен в школу`;
 - 67 product-shaped legacy supplier cards are outside the working directory in `Архив legacy-поставщиков`;
 - supplier product fields and the duplicate single-select `Категория` have been deleted;
 - views in `Предложения`: `Все активные`, `Связаться`, `Экономика`, `Статусы`, `Закуплено / история`.
@@ -98,6 +99,7 @@ Known status values:
 
 - `Соответствие техспеку`: `✅ Совпадает`, `⚠️ Требует подтверждения`, `❌ Не использовать без разъяснения`, `⛔ Точное решение не найдено`.
 - `Статус`: `Не загружен`, `Доставлен в школу`, `Доставлен на склад`, `В пути`, `Получен и подтвержден`.
+- `Статус сверки`: `Не найдено в школе`, `Доставлено вопреки фото`, `Замена / переделать`, `Нужно уточнить`, `Найдено школой`, `Частично / допоставка`.
 
 Observed `Караганда_1` numbering:
 
