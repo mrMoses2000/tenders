@@ -6,6 +6,15 @@ from .models import SupplierIdentity
 from .normalization import canonical_domain, normalize_phone, normalize_text
 
 
+_SHARED_PLATFORM_DOMAINS = {
+    "2gis.kz",
+    "goszakup.gov.kz",
+    "instagram.com",
+    "kaspi.kz",
+    "olx.kz",
+}
+
+
 def supplier_match_keys(supplier: SupplierIdentity) -> tuple[str, ...]:
     keys: list[str] = []
     domain = canonical_domain(supplier.site_url)
@@ -15,7 +24,7 @@ def supplier_match_keys(supplier: SupplierIdentity) -> tuple[str, ...]:
         keys.append("bin:" + bin_iin)
     if phone:
         keys.append("phone:" + phone)
-    if domain:
+    if domain and domain not in _SHARED_PLATFORM_DOMAINS:
         keys.append("domain:" + domain)
     name_city = f"{normalize_text(supplier.name)}|{normalize_text(supplier.city)}"
     keys.append("name-city:" + name_city)
@@ -23,7 +32,14 @@ def supplier_match_keys(supplier: SupplierIdentity) -> tuple[str, ...]:
 
 
 def supplier_key(supplier: SupplierIdentity) -> str:
-    identity = supplier_match_keys(supplier)[0]
+    identity = (
+        ("stable:" + supplier.stable_id.strip())
+        if supplier.stable_id.strip()
+        else ("notion:" + supplier.notion_page_url.strip())
+        if supplier.notion_page_url.strip()
+        else "name-city:"
+        + f"{normalize_text(supplier.name)}|{normalize_text(supplier.city)}"
+    )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return f"supplier:{digest}"
 

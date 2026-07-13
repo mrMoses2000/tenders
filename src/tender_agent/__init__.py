@@ -1,6 +1,6 @@
 """Deterministic procurement helpers for the tender agent."""
 
-from .economics import allocate_delivery_cost, calculate_landed_cost
+from .economics import allocate_delivery_cost, calculate_landed_cost, calculate_purchase_quantity
 from .models import CandidateOffer, RequestLine, SupplierIdentity
 from .validation import validate_candidate
 
@@ -10,6 +10,7 @@ __all__ = [
     "SupplierIdentity",
     "allocate_delivery_cost",
     "calculate_landed_cost",
+    "calculate_purchase_quantity",
     "validate_candidate",
 ]
 

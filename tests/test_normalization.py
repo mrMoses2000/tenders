@@ -21,6 +21,11 @@ class NormalizationTests(unittest.TestCase):
     def test_phone_normalization(self) -> None:
         self.assertEqual(normalize_phone("8 (777) 142-74-32"), "+77771427432")
 
+    def test_procurement_units_from_notion_are_normalized(self) -> None:
+        self.assertEqual(normalize_unit("Одна пачка"), "упаковка")
+        self.assertEqual(normalize_unit("Пара"), "пара")
+        self.assertEqual(normalize_unit("Метр погонный"), "м")
+
 
 if __name__ == "__main__":
     unittest.main()

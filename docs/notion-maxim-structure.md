@@ -1,6 +1,6 @@
 # Notion structure: Максим
 
-Observed: 2026-07-11
+Observed: 2026-07-13
 
 This document maps the working Notion area used for procurement requests.
 
@@ -30,8 +30,8 @@ Child page:
 Migration state on 2026-07-11:
 
 - the six historical offers for №23 and six for №61 are linked back to their request rows and remain marked `Устарело`; each row also has five fresh dated observations;
-- a later school reconciliation established 35 active lines: 29 not found, 2 replacements and 4 partial/delivery-balance lines;
-- every active line has at least five supplier offers; the offer database contains 197 observations in total;
+- the corrected school reconciliation establishes 36 active lines: 30 not found, 2 replacements and 4 partial/delivery-balance lines; laboratory acid-resistant gloves №40 are not the household gloves confirmed by the user;
+- every active line has at least five non-rejected useful supplier leads; the offer database contains 210 observations in total (180 working leads, 8 rejected analogues and 22 historical/stale rows);
 - original movement statuses were preserved where the school sheet only changed reconciliation; direct delivery confirmations and partial deliveries use `Статус = Доставлен в школу`;
 - 67 product-shaped legacy supplier cards are outside the working directory in `Архив legacy-поставщиков`;
 - supplier product fields and the duplicate single-select `Категория` have been deleted;
@@ -56,6 +56,10 @@ Core properties:
 | `Наименование` | title | Short item name from tender/spec. |
 | `Тех. спек` | text | Hard technical requirement. Search must be based on this first. |
 | `Количество` | number | Required quantity. |
+| `Поставлено всего` | number | Proven total delivered before school acceptance/rejection is split. |
+| `Принято школой` | number | Quantity explicitly accepted/found by the school. |
+| `Отклонено / замена` | number | Delivered quantity rejected or requiring replacement. |
+| `Остаток к закупке` | number | Current procurement balance. Leave empty when a partial-delivery balance is not yet known. |
 | `Единица измерения` | select | Unit from tender. |
 | `Цена за 1 единицу товара` | number | Tender unit price. Do not overwrite with supplier price. |
 | `Цена за общее кол-во` | formula | Tender line total. Read-only. |
@@ -149,13 +153,13 @@ Key field groups:
 
 | Group | Properties and rule |
 |---|---|
-| Identity | `Предложение`, one `Заявка`, one `Поставщик` when identity is known, `Товар поставщика`, `Модель / артикул`, `Фасовка / размер`. |
+| Identity | persisted `Ключ наблюдения` (`offer:v3:<sha256>`), `Предложение`, one `Заявка`, one `Поставщик`, `Товар поставщика`, `Модель / артикул`, `Фасовка / размер`. |
 | Evidence | `Тип источника`, `Источник`, direct `Источник фото`, attachment `Фото товара`, `Дата проверки`, `Доказательства`, `Что уточнить`. |
-| Price | `Цена предложения`, select `Единица цены`, `Цена и НДС`, `Минимальный заказ`. |
+| Price | `Цена предложения`, select `Единица цены`, `Количество в ценовой единице`, `Единица содержимого`, `Цена и НДС`, `Минимальный заказ`, `Кратность заказа`. |
 | Availability | `Наличие`, `Количество доступно`, `Срок / дата доступности`. Required tender quantity is never copied into available quantity. |
 | Fulfilment | select `Город поставщика`, `Способ получения`, `Точка отгрузки / самовывоза`, `Прогноз логистики`, `Доставка подтверждена`. |
 | Validation | `Соответствие ТЗ`, `Документы подтверждены`, `Статус работы`, `Приоритет`. Unknown evidence stays `Не проверено`/`Неизвестно`. |
-| Forecast | rollups `Требуемое количество`, `Тендерная цена за единицу`; formulas for goods cost, full cost, profit, profit as % of revenue, and `Экономика`. Read-only. |
+| Safe forecast | `Количество к закупке`, `Расчётное количество покупки`, `Безопасная себестоимость прогноз`, `Безопасная прибыль прогноз`, `Безопасная прибыль, %`, `Безопасная экономика`. These are the only decision fields; old formulas are explicitly `legacy (без MOQ/остатка)`. |
 | Actual | `Фактическая цена`, `Фактическое количество`, `Доля фактической логистики`, `Дата закупки`; formulas for actual cost/profit/profit as % of revenue. Fill only from proven facts. |
 
 Independent states must not be collapsed into one optimistic status. An offer can match the technical spec while stock, documents, delivery, or VAT remain unknown.

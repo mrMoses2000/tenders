@@ -45,6 +45,13 @@ class LogisticsTests(unittest.TestCase):
                 RouteObservation("Астана", "Караганда", "малый груз", "5000", date(2026, 7, 2)),
             ])
 
+    def test_duplicate_scenario_names_get_independent_ranks(self) -> None:
+        ranked = compare_procurement_scenarios([
+            ProcurementScenario("Одинаковое имя", "100", "1"),
+            ProcurementScenario("Одинаковое имя", "200", "1"),
+        ])
+        self.assertEqual([item.rank for item in ranked], [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

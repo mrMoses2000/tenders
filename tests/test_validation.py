@@ -81,6 +81,34 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(validate_candidate(request, offer).technical_status, TECH_PENDING)
 
+    def test_out_of_stock_offer_is_not_usable(self) -> None:
+        offer = CandidateOffer(
+            supplier_item="Цемент ПЦ-400 50 кг",
+            source_url="https://example.com/cement",
+            checked_at=date(2026, 7, 11),
+            price=Decimal("2290"),
+            price_unit="мешок",
+            attributes={"марка": "ПЦ-400", "фасовка": "50 кг"},
+            stock_status="Нет",
+        )
+        result = validate_candidate(self.request, offer)
+        self.assertEqual(result.readiness, "Отклонено")
+        self.assertFalse(result.usable)
+
+    def test_validation_uses_moq_for_available_quantity(self) -> None:
+        request = RequestLine(
+            "№11", "Головка", "Huter", Decimal("5"), "шт", Decimal("3800"),
+            hard_requirements={"бренд": "Huter"},
+        )
+        offer = CandidateOffer(
+            "Головка Huter", "https://example.com/huter", date(2026, 7, 13),
+            price=Decimal("1232"), price_unit="шт", minimum_order=Decimal("36"),
+            available_quantity=Decimal("20"), attributes={"бренд": "Huter"},
+        )
+        result = validate_candidate(request, offer)
+        self.assertEqual(result.purchase_quantity, Decimal("36"))
+        self.assertFalse(result.enough_quantity)
+
 
 if __name__ == "__main__":
     unittest.main()

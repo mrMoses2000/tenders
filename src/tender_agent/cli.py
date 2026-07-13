@@ -45,6 +45,8 @@ def _parser() -> argparse.ArgumentParser:
     landed.add_argument("--offer-price")
     landed.add_argument("--logistics", default="0")
     landed.add_argument("--extra", default="0")
+    landed.add_argument("--minimum-order")
+    landed.add_argument("--order-multiple")
 
     allocate = commands.add_parser("allocate-delivery", help="Allocate delivery by weights")
     allocate.add_argument("--total", required=True)
@@ -79,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
             offer_unit_price=Decimal(args.offer_price) if args.offer_price is not None else None,
             logistics=Decimal(args.logistics),
             extra_cost=Decimal(args.extra),
+            minimum_order=Decimal(args.minimum_order) if args.minimum_order is not None else None,
+            order_multiple=Decimal(args.order_multiple) if args.order_multiple is not None else None,
         )
         output = result.as_dict()
     elif args.command == "allocate-delivery":

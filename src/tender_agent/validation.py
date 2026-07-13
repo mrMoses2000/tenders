@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from .economics import calculate_purchase_quantity
 from .models import CandidateOffer, RequestLine, ValidationResult
 from .normalization import effective_unit_price, normalize_text, normalize_unit
 
@@ -18,6 +19,24 @@ def _same_value(expected: str, actual: str) -> bool:
 def validate_candidate(request: RequestLine, offer: CandidateOffer) -> ValidationResult:
     errors: list[str] = []
     confirmations: list[str] = []
+    purchase_quantity = None
+    if request.procurement_quantity_known and request.procurement_quantity is not None:
+        purchase_quantity = (
+            Decimal("0")
+            if request.procurement_quantity == 0
+            else calculate_purchase_quantity(
+                request.procurement_quantity,
+                minimum_order=offer.minimum_order,
+                order_multiple=offer.order_multiple,
+            )
+        )
+    else:
+        confirmations.append("Уточнить остаток к закупке")
+    if purchase_quantity is not None and purchase_quantity > request.procurement_quantity:
+        confirmations.append(
+            f"Закупка увеличивается с {request.procurement_quantity} до {purchase_quantity} "
+            "из-за минимального заказа или кратности"
+        )
 
     effective_price: Decimal | None = None
     if offer.price is None:
@@ -51,14 +70,17 @@ def validate_candidate(request: RequestLine, offer: CandidateOffer) -> Validatio
     if offer.stock_status == "Нет":
         enough_quantity = False
         errors.append("Поставщик подтвердил отсутствие товара")
-    elif offer.available_quantity is None:
+    elif purchase_quantity == 0:
+        enough_quantity = True
+    elif offer.available_quantity is None or purchase_quantity is None:
         enough_quantity = None
-        confirmations.append("Подтвердить доступное количество")
+        if offer.available_quantity is None:
+            confirmations.append("Подтвердить доступное количество")
     else:
-        enough_quantity = offer.available_quantity >= request.required_quantity
+        enough_quantity = offer.available_quantity >= purchase_quantity
         if not enough_quantity:
             confirmations.append(
-                f"Доступно {offer.available_quantity}, требуется {request.required_quantity}"
+                f"Доступно {offer.available_quantity}, для покупки требуется {purchase_quantity}"
             )
 
     if offer.stock_status == "Не проверено":
@@ -94,4 +116,5 @@ def validate_candidate(request: RequestLine, offer: CandidateOffer) -> Validatio
         normalized_unit=unit_name,
         effective_unit_price=effective_price,
         enough_quantity=enough_quantity,
+        purchase_quantity=purchase_quantity,
     )

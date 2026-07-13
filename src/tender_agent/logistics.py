@@ -106,12 +106,26 @@ def compare_procurement_scenarios(scenarios: Iterable[ProcurementScenario]) -> l
         ))
 
     usable = sorted(
-        (item for item in calculated if item.usable),
-        key=lambda item: (item.risk_adjusted_cost, item.lead_days if item.lead_days is not None else 10**9, -item.evidence_level, item.name),
+        ((index, item) for index, item in enumerate(calculated) if item.usable),
+        key=lambda pair: (
+            pair[1].risk_adjusted_cost,
+            pair[1].lead_days if pair[1].lead_days is not None else 10**9,
+            -pair[1].evidence_level,
+            pair[1].name,
+            pair[0],
+        ),
     )
-    ranks = {item.name: index + 1 for index, item in enumerate(usable)}
-    return [RankedScenario(
+    ranks = {source_index: rank for rank, (source_index, _) in enumerate(usable, start=1)}
+    ranked = [RankedScenario(
         item.name, item.goods_cost, item.landed_cost, item.risk_reserve,
         item.risk_adjusted_cost, item.lead_days, item.evidence_level,
-        ranks.get(item.name), item.usable,
-    ) for item in sorted(calculated, key=lambda item: (ranks.get(item.name, 10**9), item.name))]
+        ranks.get(index), item.usable,
+    ) for index, item in enumerate(calculated)]
+    return sorted(
+        ranked,
+        key=lambda item: (
+            item.rank if item.rank is not None else 10**9,
+            item.name,
+            item.risk_adjusted_cost,
+        ),
+    )
