@@ -1489,6 +1489,41 @@ ValidatedOffer
 
 ## 23. Журнал изменений плана
 
+### 2026-07-19 — версия 3.0: event-driven procurement core
+
+Цель: превратить текущий набор инструкций и детерминированных помощников в воспроизводимый pipeline, где исходные документы и пользовательские утверждения сохраняются как неизменяемые факты, рабочее состояние вычисляется правилами, а Notion/PDF/MD/сообщения являются проекциями одного канонического snapshot.
+
+Границы версии 3.0:
+
+- локальный модульный Python core без обязательных внешних зависимостей;
+- SQLite как durable execution/audit store для одного оператора и локального worker; схема должна быть переносима в Postgres без изменения доменных контрактов;
+- Notion остаётся рабочей витриной, но не используется как очередь, транзакционная БД или единственное хранилище исполнения;
+- Telegram, WhatsApp, браузер и Notion подключаются через protocol/adapters; реальные сообщения, заказы, резервы и оплаты без явного approval запрещены;
+- обратная совместимость существующих CLI, моделей и Notion-полей сохраняется.
+
+Порядок реализации:
+
+1. ввести стабильные идентификаторы тендера, строки и источника; бытовые aliases хранить отдельно от исходного ТЗ;
+2. реализовать append-only `FactAssertion` с типом факта, количеством, источником, временем, доказательством, уверенностью и ссылкой на superseded-факт;
+3. реализовать reconciliation engine, вычисляющий независимые оси закупки, движения, местонахождения, приёмки и замены, а также остаток и понятный `Статус сверки`;
+4. добавить канонический JSON snapshot с версией схемы, checksum, инвариантами сумм/количеств и генерацией MD/операторского отчёта;
+5. добавить SQLite migrations/store для задач, фактов, snapshot, source artifacts, audit events, approvals и idempotency keys;
+6. реализовать job state machine с lease, bounded retry/backoff, dead-letter, correlation id и structured event logging;
+7. реализовать Notion dry-run plan: diff ожидаемых свойств, запрет изменения immutable-полей, идемпотентное применение, повторное чтение и rollback snapshot при частичном сбое;
+8. разделить supplier lead, product observation, supplier quote и purchase-ready candidate; заменить голую цель `5 строк` на quality coverage policy;
+9. добавить freshness policy, search route planner, stop reasons и явный exhausted-route результат;
+10. добавить intake evidence model: artifact hash, page/crop coordinates, OCR value, confidence и completeness gate;
+11. добавить supplier/route history и фактические наблюдения логистики без смешивания с прогнозами;
+12. добавить provider-neutral messaging drafts/approvals/idempotent send contract, но не реальный sender;
+13. покрыть golden tests конфликтами `Караганда_1`, включая известь, клей, 100/120 колеров, №6/№40 и светильники-замену;
+14. расширить CLI командами validate/reconcile/report/store/jobs/notion-plan/coverage и сохранить прежние команды;
+15. описать runtime flow, recovery, observability, local/CI commands и будущую миграцию к Postgres/Telegram/WhatsApp;
+16. прогнать полный regression suite, golden/integration tests, CLI smoke, diff-check и сделать reviewer-friendly коммит в отдельной ветке.
+
+Критерий завершения 3.0: один и тот же набор фактов детерминированно создаёт одинаковый checksum и состояние строк; конфликтующие факты не теряются; неправильное объединение №6/№40 ловится тестом; Notion-изменения доступны как проверяемый dry-run; отчёты генерируются только из snapshot; незрелые лиды не считаются коммерческими предложениями; перезапуск worker не теряет задачу и не дублирует побочные эффекты.
+
+Статус реализации: выполнено в ветке `codex/pipeline-v3-event-core`. Реализованы append-only facts, reconciliation, snapshot/checksum, evidence intake, SQLite store, lease/retry/dead-letter worker, audit/approval/idempotency, Notion diff/verify/rollback contract, sourcing maturity/freshness/coverage, operator reports, CLI и golden fixture `Караганда_1`. Детальный отчёт: `docs/pipeline-v3-implementation-report.md`.
+
 ### 2026-07-18 — версия 2.8
 
 - пользователь повторно и явно установил прямой факт поставки для `Караганда_1`, который имеет приоритет над фотографиями, школьной ведомостью и прежними выводами: известь негашёная поставлена полностью, кафельный клей поставлен полностью, хозяйственные резиновые перчатки поставлены, светильники поставлены, колеры поставлены 100 из 120;

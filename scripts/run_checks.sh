@@ -19,6 +19,20 @@ PYTHONPATH=src python3 -m tender_agent compare-scenarios \
   tests/fixtures/scenarios.json >/dev/null
 PYTHONPATH=src python3 -m tender_agent trip-economics \
   tests/fixtures/trip.json >/dev/null
+PYTHONPATH=src python3 -m tender_agent snapshot-validate \
+  tests/fixtures/karaganda_reconciliation.json >/dev/null
+PYTHONPATH=src python3 -m tender_agent reconcile \
+  tests/fixtures/karaganda_reconciliation.json >/dev/null
+PYTHONPATH=src python3 -m tender_agent report \
+  tests/fixtures/karaganda_reconciliation.json --format md >/dev/null
+PYTHONPATH=src python3 -m tender_agent notion-plan \
+  tests/fixtures/notion_current.json tests/fixtures/notion_desired.json >/dev/null
+PYTHONPATH=src python3 -m tender_agent coverage \
+  tests/fixtures/coverage.json --minimum-leads 2 --minimum-actionable 2 >/dev/null
+STATE_DB=$(mktemp "${TMPDIR:-/tmp}/tender-agent-state.XXXXXX.sqlite")
+trap 'rm -f "$STATE_DB"' EXIT HUP INT TERM
+PYTHONPATH=src python3 -m tender_agent store-init "$STATE_DB" >/dev/null
+PYTHONPATH=src python3 -m tender_agent job-status "$STATE_DB" >/dev/null
 ./scripts/validate_skill.sh
 
-echo "All deterministic core checks passed."
+echo "All procurement core checks passed."

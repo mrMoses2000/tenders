@@ -1,0 +1,27 @@
+[
+  {
+    "candidate_id": "c1",
+    "line_id": "request:1",
+    "supplier_id": "supplier:1",
+    "maturity": "supplier_quote",
+    "checked_at": "2026-07-19T08:00:00+06:00",
+    "city": "Караганда",
+    "is_local": true,
+    "technical_match_proven": true,
+    "price_confirmed": true,
+    "contact_available": true
+  },
+  {
+    "candidate_id": "c2",
+    "line_id": "request:1",
+    "supplier_id": "supplier:2",
+    "maturity": "purchase_ready",
+    "checked_at": "2026-07-19T08:00:00+06:00",
+    "city": "Алматы",
+    "technical_match_proven": true,
+    "price_confirmed": true,
+    "stock_confirmed": true,
+    "contact_available": true,
+    "is_reserve": true
+  }
+]

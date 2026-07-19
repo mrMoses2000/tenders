@@ -17,6 +17,8 @@ The product is not limited to Nazarbayev Intellectual Schools. NIS requests are 
 Key docs:
 
 - `docs/tender-agent-master-implementation-plan.md` - active master plan; update it before changing the architecture, workflow, skill, Notion schema, or implementation.
+- `docs/pipeline-v3-architecture.md` - architecture and failure boundaries of the durable procurement core.
+- `docs/pipeline-v3-implementation-report.md` - implemented contracts, tests, commands and remaining adapter work.
 - `docs/tender-agent-pipeline.md` - operational procurement pipeline.
 - `docs/automation-roadmap.md` - next helper scripts and guardrails.
 - `docs/github-repo-scout.md` - decision on external GitHub projects.
@@ -52,9 +54,26 @@ PYTHONPATH=src python3 -m tender_agent source-plan \
 
 PYTHONPATH=src python3 -m tender_agent compare-scenarios tests/fixtures/scenarios.json
 PYTHONPATH=src python3 -m tender_agent trip-economics tests/fixtures/trip.json
+
+PYTHONPATH=src python3 -m tender_agent snapshot-validate \
+  tests/fixtures/karaganda_reconciliation.json
+PYTHONPATH=src python3 -m tender_agent reconcile \
+  tests/fixtures/karaganda_reconciliation.json
+PYTHONPATH=src python3 -m tender_agent report \
+  tests/fixtures/karaganda_reconciliation.json --format md
+
+PYTHONPATH=src python3 -m tender_agent store-init var/tender-agent.sqlite
+PYTHONPATH=src python3 -m tender_agent job-status var/tender-agent.sqlite
+
+PYTHONPATH=src python3 -m tender_agent notion-plan \
+  tests/fixtures/notion_current.json tests/fixtures/notion_desired.json
+PYTHONPATH=src python3 -m tender_agent coverage tests/fixtures/coverage.json \
+  --minimum-leads 2 --minimum-actionable 2
 ```
 
 `extract-url` accepts only public HTTP(S) HTML pages, limits redirects, response size and timeout, and does not bypass login or anti-bot protection. A public stock signal is never converted into supplier-confirmed stock automatically.
+
+Pipeline v3 stores source assertions as append-only facts, calculates line state on independent procurement/delivery/location/acceptance/replacement axes, and emits deterministic snapshots. Notion is a projection: `notion-plan` is always read-only, and runtime application must use the verified adapter contract from `tender_agent.notion_sync`. Five URLs are no longer treated as five actionable offers; `coverage` checks maturity, freshness, technical proof, confirmed price, contactability, local coverage and a reserve option.
 
 ## Install In Codex
 

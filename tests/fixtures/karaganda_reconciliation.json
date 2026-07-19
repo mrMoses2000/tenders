@@ -1,0 +1,160 @@
+{
+  "request_id": "Караганда_1",
+  "generated_at": "2026-07-19T00:00:00+06:00",
+  "lines": [
+    {
+      "line_id": "karaganda_1:6",
+      "request_id": "Караганда_1",
+      "number": "6",
+      "name": "Перчатки хозяйственные резиновые",
+      "technical_spec": "Хозяйственные резиновые перчатки",
+      "required_quantity": "50",
+      "unit": "пара",
+      "tender_unit_price": "450"
+    },
+    {
+      "line_id": "karaganda_1:7",
+      "request_id": "Караганда_1",
+      "number": "7",
+      "name": "Известь негашёная",
+      "technical_spec": "Известь негашёная",
+      "required_quantity": "200",
+      "unit": "кг",
+      "tender_unit_price": "140"
+    },
+    {
+      "line_id": "karaganda_1:11",
+      "request_id": "Караганда_1",
+      "number": "11",
+      "name": "Клей кафельный",
+      "technical_spec": "Клей кафельный, мешок 25 кг",
+      "required_quantity": "9",
+      "unit": "шт",
+      "tender_unit_price": "2000"
+    },
+    {
+      "line_id": "karaganda_1:14",
+      "request_id": "Караганда_1",
+      "number": "14",
+      "name": "Колер",
+      "technical_spec": "Колер цветной, 140 мл; цвет №3",
+      "required_quantity": "120",
+      "unit": "шт",
+      "tender_unit_price": "400"
+    },
+    {
+      "line_id": "karaganda_1:18",
+      "request_id": "Караганда_1",
+      "number": "18",
+      "name": "Лампа светодиодная",
+      "technical_spec": "E40 70W, белый холодный",
+      "required_quantity": "20",
+      "unit": "шт",
+      "tender_unit_price": "1800"
+    },
+    {
+      "line_id": "karaganda_1:40",
+      "request_id": "Караганда_1",
+      "number": "40",
+      "name": "Перчатки лабораторные",
+      "technical_spec": "До локтя, устойчивые к кислотам, щелочам, химически стойкие",
+      "required_quantity": "1",
+      "unit": "пара",
+      "tender_unit_price": "3100"
+    }
+  ],
+  "facts": [
+    {
+      "fact_id": "kg:6:delivered:user",
+      "line_id": "karaganda_1:6",
+      "kind": "delivered",
+      "source_type": "operator",
+      "source_ref": "user-direct-2026-07-18",
+      "observed_at": "2026-07-18T12:00:00+06:00",
+      "quantity": "50",
+      "unit": "пара",
+      "confidence": 5,
+      "note": "Пользователь прямо подтвердил поставку хозяйственных перчаток"
+    },
+    {
+      "fact_id": "kg:7:notfound:school",
+      "line_id": "karaganda_1:7",
+      "kind": "not_found_at_school",
+      "source_type": "school_sheet",
+      "source_ref": "Karaganda/second",
+      "observed_at": "2026-07-17T10:00:00+06:00",
+      "quantity": "200",
+      "unit": "кг",
+      "confidence": 4
+    },
+    {
+      "fact_id": "kg:7:delivered:user",
+      "line_id": "karaganda_1:7",
+      "kind": "delivered",
+      "source_type": "operator",
+      "source_ref": "user-direct-2026-07-18",
+      "observed_at": "2026-07-18T12:01:00+06:00",
+      "quantity": "200",
+      "unit": "кг",
+      "confidence": 5,
+      "note": "Известь поставлена полностью вопреки школьной отметке"
+    },
+    {
+      "fact_id": "kg:11:delivered:user",
+      "line_id": "karaganda_1:11",
+      "kind": "delivered",
+      "source_type": "operator",
+      "source_ref": "user-direct-2026-07-18",
+      "observed_at": "2026-07-18T12:02:00+06:00",
+      "quantity": "9",
+      "unit": "шт",
+      "confidence": 5
+    },
+    {
+      "fact_id": "kg:14:delivered:user",
+      "line_id": "karaganda_1:14",
+      "kind": "delivered",
+      "source_type": "operator",
+      "source_ref": "user-direct-2026-07-18",
+      "observed_at": "2026-07-18T12:03:00+06:00",
+      "quantity": "100",
+      "unit": "шт",
+      "confidence": 5,
+      "note": "Остаток — цвет №3, 20 шт"
+    },
+    {
+      "fact_id": "kg:18:replace",
+      "line_id": "karaganda_1:18",
+      "kind": "replacement_required",
+      "source_type": "school_sheet",
+      "source_ref": "Karaganda/second",
+      "observed_at": "2026-07-17T10:05:00+06:00",
+      "quantity": "20",
+      "unit": "шт",
+      "confidence": 4,
+      "note": "ЗФО сказал, что исходный товар не подходит; без уточнения причины"
+    },
+    {
+      "fact_id": "kg:18:replace-delivered:user",
+      "line_id": "karaganda_1:18",
+      "kind": "replacement_delivered",
+      "source_type": "operator",
+      "source_ref": "user-direct-2026-07-18",
+      "observed_at": "2026-07-18T12:04:00+06:00",
+      "quantity": "20",
+      "unit": "шт",
+      "confidence": 5
+    },
+    {
+      "fact_id": "kg:40:notfound:school",
+      "line_id": "karaganda_1:40",
+      "kind": "not_found_at_school",
+      "source_type": "school_sheet",
+      "source_ref": "Karaganda/second",
+      "observed_at": "2026-07-17T10:06:00+06:00",
+      "quantity": "1",
+      "unit": "пара",
+      "confidence": 4
+    }
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +11,11 @@ from .economics import allocate_delivery_cost, calculate_landed_cost
 from .adapters import plan_source_escalation
 from .extractor import extract_public_product, parse_product_html
 from .logistics import ProcurementScenario, compare_procurement_scenarios
+from .notion_sync import plan_notion_sync
+from .persistence import StateStore
+from .reports import render_operator_markdown
+from .snapshot import snapshot_from_dict
+from .sourcing import CoveragePolicy, SourcingCandidate, evaluate_coverage
 from .trips import MarketItemHypothesis, evaluate_market_trip
 
 
@@ -62,6 +68,35 @@ def _parser() -> argparse.ArgumentParser:
 
     trip = commands.add_parser("trip-economics", help="Evaluate an offline market trip from JSON")
     trip.add_argument("path", type=Path)
+
+    snapshot_validate = commands.add_parser(
+        "snapshot-validate", help="Validate a canonical procurement snapshot"
+    )
+    snapshot_validate.add_argument("path", type=Path)
+
+    reconcile = commands.add_parser(
+        "reconcile", help="Reconcile line definitions and facts into a canonical snapshot"
+    )
+    reconcile.add_argument("path", type=Path)
+
+    report = commands.add_parser("report", help="Render an operator report from a snapshot")
+    report.add_argument("path", type=Path)
+    report.add_argument("--format", choices=("md", "json"), default="md")
+
+    store_init = commands.add_parser("store-init", help="Initialize or validate the SQLite state store")
+    store_init.add_argument("path", type=Path)
+
+    jobs = commands.add_parser("job-status", help="Show durable job counts")
+    jobs.add_argument("path", type=Path)
+
+    notion_plan = commands.add_parser("notion-plan", help="Create a no-write Notion property diff")
+    notion_plan.add_argument("current", type=Path)
+    notion_plan.add_argument("desired", type=Path)
+
+    coverage = commands.add_parser("coverage", help="Evaluate sourcing quality coverage")
+    coverage.add_argument("path", type=Path)
+    coverage.add_argument("--minimum-leads", type=int, default=5)
+    coverage.add_argument("--minimum-actionable", type=int, default=2)
     return parser
 
 
@@ -101,12 +136,58 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "compare-scenarios":
         data = json.loads(args.path.read_text(encoding="utf-8"))
         output = compare_procurement_scenarios(ProcurementScenario(**item) for item in data)
-    else:
+    elif args.command == "trip-economics":
         data = json.loads(args.path.read_text(encoding="utf-8"))
         items = [MarketItemHypothesis(**item) for item in data["items"]]
         output = evaluate_market_trip(
             market_name=data["market_name"], city=data["city"], trip_cost=data["trip_cost"],
             minimum_net_savings=data.get("minimum_net_savings", 0), items=items,
+        )
+    elif args.command in {"snapshot-validate", "reconcile", "report"}:
+        data = json.loads(args.path.read_text(encoding="utf-8"))
+        snapshot = snapshot_from_dict(data)
+        if args.command == "snapshot-validate":
+            output = {
+                "valid": True, "request_id": snapshot.request_id,
+                "lines": len(snapshot.lines), "facts": len(snapshot.facts),
+                "checksum": snapshot.checksum,
+            }
+        elif args.command == "reconcile":
+            output = snapshot.as_dict()
+        elif args.format == "md":
+            print(render_operator_markdown(snapshot), end="")
+            return 0
+        else:
+            output = {
+                "request_id": snapshot.request_id,
+                "checksum": snapshot.checksum,
+                "states": snapshot.states,
+            }
+    elif args.command in {"store-init", "job-status"}:
+        with StateStore(args.path) as store:
+            store.migrate()
+            output = {
+                "database": str(args.path.resolve()), "schema_version": 1,
+                "jobs": store.job_counts(),
+            }
+    elif args.command == "notion-plan":
+        current = json.loads(args.current.read_text(encoding="utf-8"))
+        desired = json.loads(args.desired.read_text(encoding="utf-8"))
+        output = plan_notion_sync(current, desired)
+    else:
+        data = json.loads(args.path.read_text(encoding="utf-8"))
+        candidates = [
+            SourcingCandidate(
+                **{**item, "checked_at": datetime.fromisoformat(item["checked_at"])}
+            )
+            for item in data
+        ]
+        output = evaluate_coverage(
+            candidates,
+            CoveragePolicy(
+                minimum_leads=args.minimum_leads,
+                minimum_actionable=args.minimum_actionable,
+            ),
         )
     print(json.dumps(_json_ready(output), ensure_ascii=False, indent=2, sort_keys=True))
     return 0
