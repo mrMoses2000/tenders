@@ -1,6 +1,6 @@
 # Notion structure: Максим
 
-Observed: 2026-07-13
+Observed: 2026-07-13. Working views rechecked: 2026-07-20.
 
 This document maps the working Notion area used for procurement requests.
 
@@ -44,6 +44,7 @@ Migration state on 2026-07-11:
 Important views:
 
 - `Караганда_1`: filtered by `Город = Караганда`, sorted by `№` ascending.
+- `Караганда_1 — к работе`: filtered by `Город = Караганда` and `Остаток к закупке > 0`; shows only rows that require purchase, additional delivery or replacement, together with tender price, offer relations, market price and selected economics.
 - `Туркестан`
 - `Актюбинск`
 - `НИШ Туркестан — 2026`
