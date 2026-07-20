@@ -7,7 +7,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
@@ -19,7 +19,6 @@ from reportlab.platypus import (
     PageBreak,
     PageTemplate,
     Paragraph,
-    Spacer,
     Table,
     TableStyle,
 )
@@ -100,30 +99,12 @@ CELL = ParagraphStyle(
     leading=9.4, textColor=colors.HexColor("#18222C"), alignment=TA_LEFT,
 )
 CELL_CENTER = ParagraphStyle("CellCenterRU", parent=CELL, alignment=TA_CENTER)
-CELL_RIGHT = ParagraphStyle("CellRightRU", parent=CELL, alignment=TA_RIGHT)
 HEADER = ParagraphStyle(
     "HeaderRU", parent=CELL, fontName="DocSans-Bold", textColor=colors.white,
     alignment=TA_LEFT,
 )
-FOOT = ParagraphStyle(
-    "FootRU", parent=CELL, fontSize=7.1, leading=9, textColor=colors.HexColor("#415466"),
-)
-
-
 def text(value: object, style: ParagraphStyle = CELL) -> Paragraph:
     return Paragraph(escape(str(value)), style)
-
-
-def money(value: int) -> str:
-    return f"{value:,}".replace(",", " ")
-
-
-def price_cell(unit_price: int, quantity: int) -> Paragraph:
-    total = unit_price * quantity
-    return Paragraph(
-        f"{money(unit_price)} / ед.<br/><b>{money(total)}</b> на остаток",
-        CELL_RIGHT,
-    )
 
 
 def work_table(rows: list[tuple[int, str, str, int, str, int]], color: str) -> Table:
@@ -132,19 +113,17 @@ def work_table(rows: list[tuple[int, str, str, int, str, int]], color: str) -> T
         text("Товар", HEADER),
         text("Техническая спецификация", HEADER),
         text("Остаток", HEADER),
-        text("Тендерный лимит, ₸", HEADER),
     ]]
-    for number, name, specification, quantity, unit, unit_price in rows:
+    for number, name, specification, quantity, unit, _unit_price in rows:
         data.append([
             text(number, CELL_CENTER),
             text(name),
             text(specification),
             text(f"{quantity:g} {unit}", CELL_CENTER),
-            price_cell(unit_price, quantity),
         ])
     result = Table(
         data,
-        colWidths=[9 * mm, 37 * mm, 86 * mm, 21 * mm, 29 * mm],
+        colWidths=[10 * mm, 43 * mm, 101 * mm, 28 * mm],
         repeatRows=1,
         hAlign="LEFT",
     )
@@ -183,18 +162,14 @@ def build_pdf() -> None:
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal")
     doc.addPageTemplates([PageTemplate(id="main", frames=frame, onPage=footer)])
 
-    buy_total = sum(quantity * price for _, _, _, quantity, _, price in BUY)
-    replace_total = sum(quantity * price for _, _, _, quantity, _, price in REPLACE)
     story = [
         Paragraph("Караганда_1 - позиции в работе", TITLE),
         Paragraph(
-            "19 позиций. Тендерный лимит указан для ориентира и не является ценой поставщика.",
+            "19 позиций для закупки и подбора замены.",
             SUBTITLE,
         ),
         Paragraph("1. Купить / допоставить", H1),
         work_table(BUY, "#1D6B4F"),
-        Spacer(1, 3 * mm),
-        Paragraph(f"Лимит на остаток раздела: <b>{money(buy_total)} ₸</b>", FOOT),
         PageBreak(),
         Paragraph("2. Подобрать согласованную замену", H1),
         Paragraph(
@@ -202,13 +177,6 @@ def build_pdf() -> None:
             SUBTITLE,
         ),
         work_table(REPLACE, "#A35A1F"),
-        Spacer(1, 3 * mm),
-        Paragraph(f"Лимит на остаток раздела: <b>{money(replace_total)} ₸</b>", FOOT),
-        Spacer(1, 4 * mm),
-        Paragraph(
-            f"Общий тендерный лимит на 19 позиций: <b>{money(buy_total + replace_total)} ₸</b>",
-            FOOT,
-        ),
     ]
     doc.build(story)
 
