@@ -1,0 +1,4 @@
+supplier,product,unit,unit_price,available_qty,delivery,status,source_url,checked_at
+Армоснаб,PalafleX-103,25 кг мешок,1011,20,нужно подтвердить,требует подтверждения,https://karaganda.pulscen.kz/price/110602-plitochnyj-klej,2026-07-03
+Kaspi,Ceresit CM 9,25 кг мешок,3300,10,доставка Kaspi,expensive reserve,https://kaspi.kz/shop/,2026-07-03
+OLX Али,Клей для кафеля универсал,25 кг мешок,1200,9,нужно подтвердить,требует подтверждения,https://www.olx.kz/,2026-07-03
