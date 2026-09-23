@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#f5f6f3">
-  <title>Закупки · Мои заявки</title>
+  <meta name="theme-color" content="#191d1b">
+  <title>Tender — рабочее пространство</title>
   <link rel="stylesheet" href="./app.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script defer src="./app.js"></script>
@@ -12,52 +12,62 @@
 <body>
   <div class="shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">Z</span><span>Закупки</span></div>
+      <div class="brand" aria-label="Tender">
+        <span class="brand-mark">T<span>.</span></span>
+        <span class="brand-name">TENDER<small>WORKSPACE</small></span>
+      </div>
       <div class="account"><span class="online-dot"></span><span id="account-name">Рабочее пространство</span></div>
     </header>
     <main>
       <section class="hero">
-        <p class="eyebrow">РАБОЧИЙ ОБЗОР</p>
-        <h1 id="page-title">Мои заявки</h1>
-        <p id="page-subtitle" class="subtitle">Все закупки и предложения в одном месте</p>
-      </section>
-      <section class="stats" aria-label="Сводка">
-        <div class="stat"><span>Активные</span><strong id="active-count">—</strong></div>
-        <div class="stat"><span>Позиций</span><strong id="items-count">—</strong></div>
-        <div class="stat"><span>Нужно уточнить</span><strong id="attention-count">—</strong></div>
-      </section>
-      <section id="controls" class="controls">
-        <label class="search"><span class="search-icon" aria-hidden="true"></span><input id="search" type="search" placeholder="Найти заявку или город" autocomplete="off" aria-label="Поиск"></label>
-        <div class="filter-row">
-          <select id="status-filter" aria-label="Статус заявки">
-            <option value="">Все статусы</option>
-            <option value="draft">Черновик</option>
-            <option value="needs_clarification">Нужно уточнить</option>
-            <option value="ready">Готова к поиску</option>
-            <option value="researching">Поиск</option>
-            <option value="contacting">Поставщики</option>
-            <option value="evaluating">Оценка</option>
-            <option value="report_ready">Отчёт готов</option>
-            <option value="selected">Выбрана</option>
-            <option value="closed">Закрыта</option>
-            <option value="cancelled">Отменена</option>
-          </select>
-          <select id="city-filter" aria-label="Город"><option value="">Все города</option></select>
+        <div class="hero-top"><span>ОПЕРАЦИОННАЯ ПАНЕЛЬ</span><span id="page-index">01 / 02</span></div>
+        <div class="hero-copy">
+          <p class="eyebrow">ЗАКУПКИ В ОДНОМ МЕСТЕ</p>
+          <h1><span id="page-title">Мои заявки</span><span class="hero-dot">.</span></h1>
+          <p id="page-subtitle" class="subtitle">Текущий статус, позиции и предложения — без потери контекста.</p>
+        </div>
+        <div class="stats" aria-label="Сводка">
+          <div class="stat"><span>01 / АКТИВНЫЕ</span><strong id="active-count">—</strong></div>
+          <div class="stat"><span>02 / ПОЗИЦИИ</span><strong id="items-count">—</strong></div>
+          <div class="stat stat-alert"><span>03 / УТОЧНИТЬ</span><strong id="attention-count">—</strong></div>
         </div>
       </section>
-      <section id="list-section" class="list-section">
-        <div class="section-head"><h2 id="list-title">Заявки</h2><span id="result-count"></span></div>
+      <section class="registry">
+        <div class="section-head">
+          <div><p id="section-kicker" class="section-kicker">РЕЕСТР / 01</p><h2 id="list-title">Заявки</h2></div>
+          <div class="section-actions"><span id="result-count"></span><button id="refresh" class="refresh" type="button" aria-label="Обновить данные" title="Обновить данные">↻</button></div>
+        </div>
+        <div id="controls" class="controls">
+          <label class="search"><span class="search-icon" aria-hidden="true"></span><input id="search" type="search" placeholder="Поиск по заявкам и городам" autocomplete="off" aria-label="Поиск"></label>
+          <div class="filter-row">
+            <select id="status-filter" aria-label="Статус заявки">
+              <option value="">Все статусы</option>
+              <option value="draft">Черновик</option>
+              <option value="needs_clarification">Нужно уточнить</option>
+              <option value="ready">Готова к поиску</option>
+              <option value="researching">Поиск</option>
+              <option value="contacting">Поставщики</option>
+              <option value="evaluating">Оценка</option>
+              <option value="report_ready">Отчёт готов</option>
+              <option value="selected">Выбрана</option>
+              <option value="closed">Закрыта</option>
+              <option value="cancelled">Отменена</option>
+            </select>
+            <select id="city-filter" aria-label="Город"><option value="">Все города</option></select>
+          </div>
+        </div>
         <div id="list" class="list" aria-live="polite"></div>
-        <button id="load-more" class="load-more" hidden>Показать ещё</button>
+        <button id="load-more" class="load-more" type="button" hidden>ПОКАЗАТЬ ЕЩЁ <span>↓</span></button>
       </section>
+      <footer class="page-foot"><span>TENDER / WORKSPACE</span><span>ДАННЫЕ ОБНОВЛЯЮТСЯ ИЗ БАЗЫ</span></footer>
     </main>
     <nav class="bottom-nav" aria-label="Разделы">
-      <button class="nav-item active" data-tab="cases"><span class="nav-symbol">▤</span><span>Заявки</span></button>
-      <button class="nav-item" data-tab="suppliers"><span class="nav-symbol">◎</span><span>Поставщики</span></button>
+      <button class="nav-item active" data-tab="cases" type="button" aria-pressed="true"><span class="nav-symbol">▤</span><span>Заявки</span></button>
+      <button class="nav-item" data-tab="suppliers" type="button" aria-pressed="false"><span class="nav-symbol">◎</span><span>Поставщики</span></button>
     </nav>
   </div>
   <dialog id="detail" class="detail">
-    <div class="detail-top"><button id="close-detail" class="back" aria-label="Назад">←</button><span>Заявка</span></div>
+    <div class="detail-top"><button id="close-detail" class="back" type="button" aria-label="Назад">←</button><span>КАРТОЧКА ЗАЯВКИ</span><span class="detail-top-mark">T.</span></div>
     <div id="detail-content"></div>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>

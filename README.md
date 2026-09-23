@@ -1,6 +1,7 @@
 # Procurement Agent Bot — durable procurement workflow foundation
 
 Передача следующему агенту: [история работы и оставшиеся задачи](docs/AGENT_HANDOFF_2026-09-23.md).
+Текущая оценка готовности: [production readiness, 24.09.2026](docs/PRODUCTION_READINESS_2026-09-24.md).
 
 Рабочее ядро агента закупок:
 
