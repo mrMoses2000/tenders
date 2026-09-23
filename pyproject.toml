@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.46.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "procurement-agent-bot"
+version = "0.1.0"
+description = "Approval-gated Telegram procurement agent with PostgreSQL, AGY and WhatsApp boundaries"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram==3.30.0",
+  "aiohttp==3.14.3",
+  "asyncpg==0.31.0",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.15.0",
+  "PyMuPDF==1.26.4",
+  "python-docx==1.2.0",
+  "httpx==0.28.1",
+  "python-dotenv==1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.13.0",
+]
+
+[project.scripts]
+procurement-bot = "procurement_bot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "postgres: requires a disposable PostgreSQL database",
+  "external: invokes Telegram, AGY, browser, WhatsApp, or another external provider",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+ignore = ["S101"]

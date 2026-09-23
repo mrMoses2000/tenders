@@ -1,0 +1,24 @@
+[Unit]
+Description=Procurement Agent Telegram Bot and Workers
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moses
+Group=moses
+WorkingDirectory=/home/moses/tenders
+EnvironmentFile=/home/moses/tenders/.env
+ExecStart=/home/moses/tenders/.venv/bin/procurement-bot run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/moses/tenders/var
+
+[Install]
+WantedBy=multi-user.target

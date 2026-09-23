@@ -1,0 +1,20 @@
+[Unit]
+Description=Procurement WAHA Core NOWEB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moses/tenders/var/runtime/waha-rootfs/app
+EnvironmentFile=/home/moses/tenders/var/secrets/waha.env
+Environment=PATH=/home/moses/tenders/var/runtime/waha-rootfs/usr/local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/sh /home/moses/tenders/var/runtime/waha-rootfs/entrypoint.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
