@@ -1,0 +1,18 @@
+[Unit]
+Description=Procurement Telegram Mini App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moses/tenders
+EnvironmentFile=/home/moses/tenders/.env
+ExecStart=/home/moses/tenders/.venv/bin/procurement-bot miniapp
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

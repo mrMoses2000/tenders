@@ -1,7 +1,14 @@
-.DS_Store
-__pycache__/
-*.pyc
+.env
 .venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+var/
+node_modules/
+.spreadsheet_qc_*/node_modules
+.DS_Store
 tmp/
 output/
 *.log

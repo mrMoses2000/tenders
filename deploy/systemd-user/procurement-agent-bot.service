@@ -1,0 +1,19 @@
+[Unit]
+Description=Procurement Telegram Bot, Workers and WAHA Webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moses/tenders
+EnvironmentFile=/home/moses/tenders/.env
+ExecStart=/home/moses/tenders/.venv/bin/procurement-bot run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
