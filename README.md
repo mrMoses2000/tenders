@@ -1,5 +1,7 @@
 # Procurement Agent Bot — durable procurement workflow foundation
 
+Передача следующему агенту: [история работы и оставшиеся задачи](docs/AGENT_HANDOFF_2026-09-23.md).
+
 Рабочее ядро агента закупок:
 
 `Telegram → durable PostgreSQL ingress → PDF/DOCX/voice → safe AGY intake → clarification → research plan/evidence → supplier/offers registry → approval-gated WhatsApp boundary → evaluation/HTML report`.
