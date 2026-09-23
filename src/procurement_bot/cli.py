@@ -12,7 +12,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.types import Update
+from aiogram.types import MenuButtonWebApp, Update, WebAppInfo
 from aiohttp import web
 
 from procurement_bot.config import Settings, get_settings
@@ -21,6 +21,7 @@ from procurement_bot.dialogue import SearchScopePolicy
 from procurement_bot.health import health_snapshot
 from procurement_bot.intake import IntakeService
 from procurement_bot.logging import configure_logging
+from procurement_bot.mini_app import create_mini_app, validate_public_url
 from procurement_bot.outbox import TelegramOutboxWorker, WhatsAppOutboxWorker
 from procurement_bot.providers.agy import AgyExtractor
 from procurement_bot.providers.agy_browser import AgyBrowserMcpExecutor
@@ -46,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="procurement-bot")
     parser.add_argument(
         "command",
-        choices=("migrate", "health", "bot", "worker", "webhook", "run"),
+        choices=("migrate", "health", "bot", "worker", "webhook", "miniapp", "run"),
         help="run migrations, inspect health, or start a process",
     )
     return parser
@@ -128,6 +129,11 @@ async def _run_bot(settings: Settings, *, with_workers: bool) -> None:
         raise _PollingStopped
 
     try:
+        public_url = validate_public_url(settings.mini_app_public_url)
+        if public_url:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Заявки", web_app=WebAppInfo(url=public_url))
+            )
         try:
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(poll_until_stopped())
@@ -202,6 +208,21 @@ async def _run_webhook(settings: Settings) -> None:
     try:
         await _serve_waha_webhook(settings, pool, worker_id=f"{process}:waha-webhook")
     finally:
+        await pool.close()
+
+
+async def _run_mini_app(settings: Settings) -> None:
+    pool = await create_pool(settings.postgres_dsn, min_size=1, max_size=5)
+    app = create_mini_app(pool, settings)
+    runner = web.AppRunner(app, access_log=None)
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, host=settings.mini_app_bind_host, port=settings.mini_app_port)
+        await site.start()
+        LOGGER.info("Mini App listening", extra={"port": settings.mini_app_port})
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
         await pool.close()
 
 
@@ -321,6 +342,8 @@ async def _async_main(command: str) -> None:
         await _run_workers(settings)
     elif command == "webhook":
         await _run_webhook(settings)
+    elif command == "miniapp":
+        await _run_mini_app(settings)
     else:
         await _run_bot(settings, with_workers=True)
 

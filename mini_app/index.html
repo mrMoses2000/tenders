@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f5f6f3">
+  <title>Закупки · Мои заявки</title>
+  <link rel="stylesheet" href="./app.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">Z</span><span>Закупки</span></div>
+      <div class="account"><span class="online-dot"></span><span id="account-name">Рабочее пространство</span></div>
+    </header>
+    <main>
+      <section class="hero">
+        <p class="eyebrow">РАБОЧИЙ ОБЗОР</p>
+        <h1 id="page-title">Мои заявки</h1>
+        <p id="page-subtitle" class="subtitle">Все закупки и предложения в одном месте</p>
+      </section>
+      <section class="stats" aria-label="Сводка">
+        <div class="stat"><span>Активные</span><strong id="active-count">—</strong></div>
+        <div class="stat"><span>Позиций</span><strong id="items-count">—</strong></div>
+        <div class="stat"><span>Нужно уточнить</span><strong id="attention-count">—</strong></div>
+      </section>
+      <section id="controls" class="controls">
+        <label class="search"><span class="search-icon" aria-hidden="true"></span><input id="search" type="search" placeholder="Найти заявку или город" autocomplete="off" aria-label="Поиск"></label>
+        <div class="filter-row">
+          <select id="status-filter" aria-label="Статус заявки">
+            <option value="">Все статусы</option>
+            <option value="draft">Черновик</option>
+            <option value="needs_clarification">Нужно уточнить</option>
+            <option value="ready">Готова к поиску</option>
+            <option value="researching">Поиск</option>
+            <option value="contacting">Поставщики</option>
+            <option value="evaluating">Оценка</option>
+            <option value="report_ready">Отчёт готов</option>
+            <option value="selected">Выбрана</option>
+            <option value="closed">Закрыта</option>
+            <option value="cancelled">Отменена</option>
+          </select>
+          <select id="city-filter" aria-label="Город"><option value="">Все города</option></select>
+        </div>
+      </section>
+      <section id="list-section" class="list-section">
+        <div class="section-head"><h2 id="list-title">Заявки</h2><span id="result-count"></span></div>
+        <div id="list" class="list" aria-live="polite"></div>
+        <button id="load-more" class="load-more" hidden>Показать ещё</button>
+      </section>
+    </main>
+    <nav class="bottom-nav" aria-label="Разделы">
+      <button class="nav-item active" data-tab="cases"><span class="nav-symbol">▤</span><span>Заявки</span></button>
+      <button class="nav-item" data-tab="suppliers"><span class="nav-symbol">◎</span><span>Поставщики</span></button>
+    </nav>
+  </div>
+  <dialog id="detail" class="detail">
+    <div class="detail-top"><button id="close-detail" class="back" aria-label="Назад">←</button><span>Заявка</span></div>
+    <div id="detail-content"></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

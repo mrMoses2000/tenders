@@ -69,6 +69,18 @@ payload, который был отдельно одобрен и атомарн
 
 ## Локальный запуск
 
+### Telegram Mini App
+
+Мобильный read-only кабинет заявок, позиций и связанных поставщиков работает
+поверх той же PostgreSQL. Текущий HTTPS-адрес:
+[открыть Mini App](https://moses-cv.tail55e85c.ts.net/tenders-miniapp/).
+Данные открываются через кнопку «Заявки» в меню бота. Запуск: `.venv/bin/procurement-bot miniapp`;
+локальная проверка: `http://127.0.0.1:8082/api/health`. Для открытия внутри
+Telegram настройте HTTPS reverse proxy к `127.0.0.1:8082`, запишите его URL
+в `MINI_APP_PUBLIC_URL` и перезапустите бот. Интерфейс фильтрует заявки по
+статусу, городу и тексту, а поставщиков — по названию. Подробности и модель
+связи с Notion: [docs/mini-app-architecture.md](docs/mini-app-architecture.md).
+
 Требуются Python 3.12+, PostgreSQL, Docker Compose, авторизованный `agy`, Telegram bot token,
 `ffmpeg` и AssemblyAI API key во внешнем приватном `.env`.
 

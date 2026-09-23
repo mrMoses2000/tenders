@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     telegram_allowed_user_ids: str = ""
     telegram_bootstrap_usernames: str = ""
     telegram_api_base_url: str = ""
+    mini_app_bind_host: str = "127.0.0.1"
+    mini_app_port: int = Field(default=8082, ge=1, le=65535)
+    mini_app_public_url: str = ""
 
     log_level: str = "INFO"
     poll_timeout_seconds: int = Field(default=30, ge=1, le=60)
@@ -126,6 +129,20 @@ class Settings(BaseSettings):
             raise ValueError("WAHA webhook bind host must be an IP or localhost") from exc
         if address.is_unspecified or not (address.is_loopback or address.is_private):
             raise ValueError("WAHA webhook bind host must be loopback or private unicast")
+        return normalized
+
+    @field_validator("mini_app_bind_host")
+    @classmethod
+    def mini_app_must_bind_loopback(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized == "localhost":
+            return normalized
+        try:
+            address = ip_address(normalized)
+        except ValueError as exc:
+            raise ValueError("Mini App bind host must be loopback") from exc
+        if not address.is_loopback:
+            raise ValueError("Mini App bind host must be loopback")
         return normalized
 
     @model_validator(mode="after")
