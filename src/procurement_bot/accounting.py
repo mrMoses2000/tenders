@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
@@ -57,6 +57,7 @@ class FinancialSnapshot:
     delivery_cost_known: Decimal
     unknown_purchase_lines: int
     provisional_margin: Decimal | None
+    additional_cost_known: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,181 @@ def allocate_equal_delivery(
     if sum((item.amount for item in allocations), Decimal(0)) != quantized:
         raise AssertionError("delivery allocation lost money")
     return allocations
+
+
+def allocate_weighted_cost(
+    total_cost: Decimal,
+    item_weights: Sequence[tuple[UUID, Decimal]],
+) -> tuple[DeliveryAllocation, ...]:
+    """Allocate cents by positive weights, assigning remainder deterministically."""
+
+    if not total_cost.is_finite() or total_cost < 0 or total_cost.quantize(_CENT) != total_cost:
+        raise ValueError("total_cost must be nonnegative with at most two decimals")
+    if not item_weights or len({item_id for item_id, _ in item_weights}) != len(item_weights):
+        raise ValueError("item_weights must be a non-empty unique sequence")
+    if any(not weight.is_finite() or weight <= 0 for _, weight in item_weights):
+        raise ValueError("allocation weights must be positive")
+    total_weight = sum((weight for _, weight in item_weights), Decimal(0))
+    exact = [total_cost * weight / total_weight for _, weight in item_weights]
+    floored = [value.quantize(_CENT, rounding=ROUND_DOWN) for value in exact]
+    remaining = int((total_cost - sum(floored, Decimal(0))) / _CENT)
+    order = sorted(range(len(item_weights)), key=lambda i: (exact[i] - floored[i], -i),
+                   reverse=True)
+    for index in order[:remaining]:
+        floored[index] += _CENT
+    return tuple(DeliveryAllocation(item_id, floored[index])
+                 for index, (item_id, _) in enumerate(item_weights))
+
+
+async def record_case_expense(
+    connection: asyncpg.Connection,
+    *,
+    case_id: UUID,
+    owner_user_id: UUID,
+    category: Literal["delivery", "handling", "packaging", "commission", "travel",
+                      "storage", "other"],
+    cost_kind: Literal["planned", "actual"],
+    total_cost: Decimal,
+    request_item_ids: Sequence[UUID],
+    allocation_method: Literal["equal", "quantity", "manual"],
+    idempotency_key: str,
+    manual_amounts: Mapping[UUID, Decimal] | None = None,
+    source_artifact_id: UUID | None = None,
+    note: str = "",
+    incurred_at: datetime | None = None,
+    currency: str = "KZT",
+) -> UUID:
+    """Record an expense and exact item shares in one transaction."""
+
+    if category not in {"delivery", "handling", "packaging", "commission", "travel",
+                        "storage", "other"}:
+        raise ValueError("unsupported expense category")
+    if cost_kind not in {"planned", "actual"}:
+        raise ValueError("unsupported cost_kind")
+    if allocation_method not in {"equal", "quantity", "manual"}:
+        raise ValueError("unsupported allocation_method")
+    if not idempotency_key.strip():
+        raise ValueError("idempotency_key must be non-empty")
+    if not total_cost.is_finite() or total_cost < 0 or total_cost.quantize(_CENT) != total_cost:
+        raise ValueError("total_cost must be nonnegative with at most two decimals")
+    unique_ids = tuple(sorted(set(request_item_ids)))
+    if not unique_ids or len(unique_ids) != len(request_item_ids):
+        raise ValueError("request_item_ids must be non-empty and unique")
+    normalized_currency = _currency(currency)
+    if allocation_method == "manual":
+        if manual_amounts is None or set(manual_amounts) != set(unique_ids):
+            raise ValueError("manual_amounts must cover exactly the selected items")
+        if any(not amount.is_finite() or amount < 0 or amount.quantize(_CENT) != amount
+               for amount in manual_amounts.values()):
+            raise ValueError("manual amounts must be nonnegative cents")
+        if sum(manual_amounts.values(), Decimal(0)) != total_cost:
+            raise ValueError("manual amounts do not sum to total_cost")
+    elif manual_amounts is not None:
+        raise ValueError("manual_amounts requires manual allocation")
+
+    async with connection.transaction():
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"case-expense:{idempotency_key}",
+        )
+        existing = await connection.fetchrow(
+            "SELECT * FROM case_expenses WHERE idempotency_key=$1", idempotency_key
+        )
+        if existing is not None:
+            expected = {
+                "case_id": case_id, "category": category, "cost_kind": cost_kind,
+                "amount": total_cost, "allocation_method": allocation_method,
+                "currency": normalized_currency, "source_artifact_id": source_artifact_id,
+                "note": note.strip(), "recorded_by": owner_user_id,
+                "incurred_at": incurred_at,
+            }
+            if any(existing[key] != value for key, value in expected.items()):
+                raise AccountingConflict("expense idempotency key has different facts")
+            old_allocations = await connection.fetch(
+                "SELECT request_item_id,allocated_amount FROM case_expense_allocations "
+                "WHERE expense_id=$1", existing["id"],
+            )
+            if {row["request_item_id"] for row in old_allocations} != set(unique_ids):
+                raise AccountingConflict("expense idempotency key has different items")
+            if allocation_method == "manual" and any(
+                row["allocated_amount"] != manual_amounts[row["request_item_id"]]
+                for row in old_allocations
+            ):
+                raise AccountingConflict("expense idempotency key has different allocations")
+            return existing["id"]
+        case_currency = await connection.fetchval(
+            """
+            SELECT COALESCE(f.currency,'KZT') FROM procurement_cases c
+            LEFT JOIN case_financials f ON f.case_id=c.id
+            WHERE c.id=$1 AND c.owner_user_id=$2 FOR UPDATE OF c
+            """,
+            case_id, owner_user_id,
+        )
+        if case_currency is None:
+            raise AccountingConflict("case is absent or belongs to another owner")
+        if normalized_currency != case_currency:
+            raise AccountingConflict("expense currency differs from case currency")
+        rows = await connection.fetch(
+            "SELECT id,quantity FROM request_items "
+            "WHERE case_id=$1 AND id=ANY($2::uuid[]) FOR SHARE",
+            case_id, list(unique_ids),
+        )
+        by_id = {row["id"]: row for row in rows}
+        if set(by_id) != set(unique_ids):
+            raise AccountingConflict("expense contains an item from another case")
+        if source_artifact_id is not None:
+            valid_artifact = await connection.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM source_artifacts a
+                    JOIN incoming_attachments ia ON ia.id=a.attachment_id
+                    JOIN messages m ON m.id=ia.message_id
+                    WHERE a.id=$1 AND m.user_id=$2
+                )
+                """,
+                source_artifact_id, owner_user_id,
+            )
+            if valid_artifact is not True:
+                raise AccountingConflict("expense evidence belongs to another user")
+        if allocation_method == "manual":
+            assert manual_amounts is not None
+            allocations = tuple(DeliveryAllocation(item_id, manual_amounts[item_id])
+                                for item_id in unique_ids)
+            weights = {item_id: Decimal(1) for item_id in unique_ids}
+        else:
+            weights = {
+                item_id: (Decimal(1) if allocation_method == "equal"
+                          else by_id[item_id]["quantity"])
+                for item_id in unique_ids
+            }
+            if any(value is None or value <= 0 for value in weights.values()):
+                raise AccountingConflict("quantity allocation requires known quantities")
+            allocations = allocate_weighted_cost(
+                total_cost, [(item_id, weight) for item_id, weight in weights.items()]
+            )
+        expense_id = uuid4()
+        await connection.execute(
+            """
+            INSERT INTO case_expenses(
+                id,case_id,category,cost_kind,amount,currency,allocation_method,
+                provenance,source_artifact_id,note,incurred_at,idempotency_key,recorded_by
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            """,
+            expense_id, case_id, category, cost_kind, total_cost, normalized_currency,
+            allocation_method, "documented" if source_artifact_id else "user_reported",
+            source_artifact_id, note.strip(), incurred_at, idempotency_key, owner_user_id,
+        )
+        for allocation in allocations:
+            await connection.execute(
+                """
+                INSERT INTO case_expense_allocations(
+                    expense_id,case_id,request_item_id,allocated_amount,allocation_weight
+                ) VALUES ($1,$2,$3,$4,$5)
+                """,
+                expense_id, case_id, allocation.request_item_id, allocation.amount,
+                weights[allocation.request_item_id],
+            )
+        return expense_id
 
 
 async def record_evidenced_purchase(
@@ -373,6 +549,7 @@ async def record_customer_acceptance(
                 "event_type": event_type,
                 "accepted_quantity": accepted_quantity,
                 "source_artifact_id": source_artifact_id,
+                "recorded_by": owner_user_id,
             }
             if any(existing[key] != value for key, value in expected.items()):
                 raise AccountingConflict("acceptance idempotency key has different facts")
@@ -461,6 +638,13 @@ async def record_customer_acceptance(
             raise AccountingConflict("acceptance revocation exceeds accepted quantity")
         if item["quantity"] is not None and net > Decimal(item["quantity"]):
             raise AccountingConflict("accepted quantity exceeds the requested quantity")
+        cancelled = await connection.fetchval(
+            "SELECT COALESCE(cancelled_quantity,0) FROM request_item_execution_totals "
+            "WHERE request_item_id=$1", request_item_id,
+        )
+        if (item["quantity"] is not None
+                and net + Decimal(cancelled or 0) > Decimal(item["quantity"])):
+            raise AccountingConflict("accepted and cancelled exceed the requested quantity")
         return CustomerAcceptanceResult(
             event_id,
             customer_id,
@@ -517,7 +701,15 @@ async def load_financial_snapshot(
                count(*) FILTER (WHERE purchase.id IS NOT NULL AND purchase.unit_cost IS NULL)
                    AS unknown_lines,
                COALESCE((SELECT sum(run.total_cost) FROM delivery_runs AS run
-                         WHERE run.case_id=procurement_case.id),0) AS delivery_cost
+                         WHERE run.case_id=procurement_case.id),0)
+               + COALESCE((SELECT sum(expense.amount) FROM case_expenses AS expense
+                           WHERE expense.case_id=procurement_case.id
+                             AND expense.cost_kind='actual'
+                             AND expense.category='delivery'),0) AS delivery_cost,
+               COALESCE((SELECT sum(expense.amount) FROM case_expenses AS expense
+                         WHERE expense.case_id=procurement_case.id
+                           AND expense.cost_kind='actual'
+                           AND expense.category<>'delivery'),0) AS additional_cost
         FROM procurement_cases AS procurement_case
         LEFT JOIN case_financials AS financial ON financial.case_id=procurement_case.id
         LEFT JOIN request_items AS item ON item.case_id=procurement_case.id
@@ -533,8 +725,10 @@ async def load_financial_snapshot(
     revenue = row["tender_revenue_private"]
     product = Decimal(row["product_cost"])
     delivery = Decimal(row["delivery_cost"])
+    additional = Decimal(row["additional_cost"])
     unknown = int(row["unknown_lines"])
-    margin = None if revenue is None or unknown else Decimal(revenue) - product - delivery
+    margin = (None if revenue is None or unknown
+              else Decimal(revenue) - product - delivery - additional)
     return FinancialSnapshot(
         case_id=case_id,
         currency=row["currency"],
@@ -543,6 +737,7 @@ async def load_financial_snapshot(
         delivery_cost_known=delivery,
         unknown_purchase_lines=unknown,
         provisional_margin=margin,
+        additional_cost_known=additional,
     )
 
 

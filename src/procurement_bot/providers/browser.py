@@ -117,6 +117,13 @@ def _assert_2gis_url(url: str) -> None:
         raise UnsafeBrowserResult("2GIS evidence must use an official 2gis.kz URL")
 
 
+def _assert_olx_url(url: str) -> None:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").casefold()
+    if parsed.scheme != "https" or hostname not in {"olx.kz", "www.olx.kz"}:
+        raise UnsafeBrowserResult("OLX evidence must use an official HTTPS olx.kz URL")
+
+
 class StructuredBrowserProvider:
     """Hash-pinned adapter between trusted domain tasks and untrusted browser output."""
 
@@ -181,6 +188,8 @@ class StructuredBrowserProvider:
         if call.operation != BrowserOperation.SEARCH_SUPPLIERS:
             raise ValueError("browser call is not a supplier-search operation")
         result = self._validate_envelope(call, raw, SupplierBrowserResult)
+        if result.pages_examined == 0:
+            raise UnsafeBrowserResult("supplier search inspected no pages")
         if len(result.candidates) > plan.minimum_unique_candidates * 5:
             raise UnsafeBrowserResult("browser returned an unexpectedly large candidate set")
         for candidate in result.candidates:
@@ -188,11 +197,19 @@ class StructuredBrowserProvider:
                 raise UnsafeBrowserResult("candidate source does not match the research branch")
             if plan.source == ResearchSource.TWO_GIS and not candidate.external_id:
                 raise UnsafeBrowserResult("2GIS candidate must include its provider firm id")
+            if plan.source == ResearchSource.OLX:
+                if not candidate.external_id:
+                    raise UnsafeBrowserResult("OLX candidate must include a stable listing id")
+                _assert_olx_url(candidate.evidence[0].source_url)
+            elif candidate.seller_profile_id is not None:
+                raise UnsafeBrowserResult("seller profile id is only valid for OLX")
             for evidence in candidate.evidence:
                 if evidence.source != plan.source:
                     raise UnsafeBrowserResult("evidence source does not match the research branch")
                 if plan.source == ResearchSource.TWO_GIS:
                     _assert_2gis_url(evidence.source_url)
+                if plan.source == ResearchSource.OLX:
+                    _assert_olx_url(evidence.source_url)
                 if evidence.evidence_type == EvidenceType.SUPPLIER_STATEMENT:
                     raise UnsafeBrowserResult(
                         "browser research cannot manufacture a supplier statement"
@@ -221,6 +238,10 @@ class StructuredBrowserProvider:
             "or disclose a budget/tender price. A business directory card proves only the "
             "business fields visible there; it never proves product match, price, or stock. "
             "A public product page may report advertised availability, never confirmed stock. "
+            "For an OLX source use only HTTPS olx.kz listing pages, include a stable "
+            "listing ID, and capture the seller profile ID, product name, minimum order "
+            "quantity and pack size when visible; treat advertised price and stock as "
+            "unconfirmed. Keep listing and seller identifiers separate. "
             "Return only JSON matching the supplied schema and echo both hashes exactly.\n"
             f"SPEC_SHA256: {BROWSER_SPEC_SHA256}\n"
             f"REQUEST_SHA256: {request_hash}"

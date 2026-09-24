@@ -732,6 +732,7 @@ class JobWorker:
         plan = build_research_plan(
             request,
             locality_resolution=locality_resolution,
+            include_olx=True,
         )
         async with self.pool.acquire() as connection, connection.transaction():
             persisted = await persist_research_plan(
@@ -811,7 +812,7 @@ class JobWorker:
                     expires_at=datetime.now(UTC) + timedelta(hours=24),
                 )
                 text = (
-                    "Всё готово к поиску. Проверю свою базу, 2GIS и интернет, "
+                    "Всё готово к поиску. Проверю свою базу, 2GIS, OLX и интернет, "
                     "затем соберу лучшие варианты. Начать?"
                 )
             else:

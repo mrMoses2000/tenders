@@ -1,4 +1,4 @@
-"""Read-only Telegram Mini App backed by the procurement PostgreSQL database."""
+"""Telegram Mini App backed by the procurement PostgreSQL database."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import hmac
 import json
 import time
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 from uuid import UUID
@@ -15,7 +15,13 @@ from uuid import UUID
 import asyncpg
 from aiohttp import web
 
+from procurement_bot.accounting import (
+    AccountingConflict,
+    record_case_expense,
+    record_customer_acceptance,
+)
 from procurement_bot.config import Settings
+from procurement_bot.item_execution import ItemExecutionConflict, record_item_execution_event
 
 STATIC = Path(__file__).resolve().parents[2] / "mini_app"
 MAX_AGE_SECONDS = 24 * 60 * 60
@@ -239,36 +245,216 @@ async def case_detail(request: web.Request) -> web.Response:
         items = await connection.fetch(
             """
             SELECT i.id,i.line_number,i.name,i.specification_text,i.quantity,
-                   i.unit,i.status,
+                   i.unit,i.status,f.tender_unit_price_private,
+                   snap.reported_delivered_quantity,snap.reported_accepted_quantity,
+                   snap.reported_rejected_quantity,snap.reported_remaining_quantity,
+                   snap.movement_label,snap.reconciliation_label,snap.location_label,
+                   snap.source_url AS source_record_url,
+                   purchased.purchased_quantity,accepted.accepted_quantity,
+                   delivery.delivery_cost,expenses.actual_cost,expenses.planned_cost,
+                   execution.event_count,execution.warehouse_received_quantity,
+                   execution.delivered_quantity,execution.rejected_quantity,
+                   execution.returned_quantity,execution.cancelled_quantity,
                    count(o.id)::int AS offer_count
             FROM request_items i LEFT JOIN offers o ON o.request_item_id=i.id
+            LEFT JOIN request_item_financials f ON f.request_item_id=i.id
+            LEFT JOIN LATERAL (
+                SELECT reported_delivered_quantity,reported_accepted_quantity,
+                       reported_rejected_quantity,reported_remaining_quantity,
+                       movement_label,reconciliation_label,location_label,source_url
+                FROM request_item_source_snapshots
+                WHERE request_item_id=i.id ORDER BY captured_at DESC,imported_at DESC LIMIT 1
+            ) snap ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT sum(purchased_quantity) AS purchased_quantity FROM purchase_items
+                WHERE request_item_id=i.id
+            ) purchased ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT sum(CASE WHEN event_type='accepted' THEN accepted_quantity
+                                ELSE -accepted_quantity END) AS accepted_quantity
+                FROM customer_acceptance_events WHERE request_item_id=i.id
+            ) accepted ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT sum(allocated_amount) AS delivery_cost FROM delivery_allocations
+                WHERE request_item_id=i.id
+            ) delivery ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT sum(a.allocated_amount) FILTER (WHERE e.cost_kind='actual')
+                           AS actual_cost,
+                       sum(a.allocated_amount) FILTER (WHERE e.cost_kind='planned')
+                           AS planned_cost
+                FROM case_expense_allocations a
+                JOIN case_expenses e ON e.id=a.expense_id
+                WHERE a.request_item_id=i.id
+            ) expenses ON TRUE
+            LEFT JOIN request_item_execution_totals execution
+              ON execution.request_item_id=i.id
             WHERE i.case_id=$1
-            GROUP BY i.id ORDER BY i.line_number
+            GROUP BY i.id,f.tender_unit_price_private,
+                     snap.reported_delivered_quantity,snap.reported_accepted_quantity,
+                     snap.reported_rejected_quantity,snap.reported_remaining_quantity,
+                     snap.movement_label,snap.reconciliation_label,snap.location_label,
+                     snap.source_url,purchased.purchased_quantity,
+                     accepted.accepted_quantity,delivery.delivery_cost,
+                     expenses.actual_cost,expenses.planned_cost,
+                     execution.event_count,execution.warehouse_received_quantity,
+                     execution.delivered_quantity,execution.rejected_quantity,
+                     execution.returned_quantity,execution.cancelled_quantity
+            ORDER BY i.line_number
             """,
             case_id,
         )
         offers = await connection.fetch(
             """
-            SELECT o.id,o.request_item_id,o.status,o.supplier_product_name,
+            SELECT o.id,o.request_item_id,o.status,o.supplier_product_name,o.model_sku,
                    s.display_name AS supplier_name,sl.city AS supplier_city,
-                   obs.price_amount,obs.currency,obs.availability_status,
-                   obs.observed_at
+                   obs.price_amount,obs.currency,obs.price_unit,obs.pack_qty,obs.moq,
+                   obs.availability_status,
+                   obs.observed_at,obs.evidence_level,obs.document_status,
+                   obs.delivery_status,obs.vat_status,obs.source_type,obs.source_url
             FROM offers o
             JOIN request_items i ON i.id=o.request_item_id
             JOIN suppliers s ON s.id=o.supplier_id
             LEFT JOIN supplier_locations sl ON sl.id=o.supplier_location_id
             LEFT JOIN LATERAL (
-                SELECT price_amount,currency,availability_status,observed_at
-                FROM offer_observations
-                WHERE offer_id=o.id ORDER BY observed_at DESC,id DESC LIMIT 1
+                SELECT ob.price_amount,ob.currency,ob.price_unit,ob.pack_qty,ob.moq,
+                       ob.availability_status,ob.source_type,
+                       ob.observed_at,ob.evidence_level,ob.document_status,
+                       ob.delivery_status,ob.vat_status,se.source_url
+                FROM offer_observations ob
+                JOIN source_evidence se ON se.id=ob.source_evidence_id
+                WHERE ob.offer_id=o.id ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
             ) obs ON TRUE
             WHERE i.case_id=$1 ORDER BY i.line_number,o.updated_at DESC
-            LIMIT 200
+            LIMIT 1001
+            """,
+            case_id,
+        )
+        expense_rows = await connection.fetch(
+            """
+            SELECT a.request_item_id,a.allocated_amount,e.category,e.cost_kind,
+                   e.amount AS expense_total,e.currency,e.allocation_method,
+                   e.provenance,e.note,e.incurred_at
+            FROM case_expense_allocations a
+            JOIN case_expenses e ON e.id=a.expense_id
+            WHERE e.case_id=$1
+            ORDER BY e.created_at DESC,a.request_item_id
             """,
             case_id,
         )
     return _json(request, {"case": dict(case), "items": [dict(row) for row in items],
-                           "offers": [dict(row) for row in offers]})
+                           "offers": [dict(row) for row in offers[:1000]],
+                           "offers_truncated": len(offers) > 1000,
+                           "expenses": [dict(row) for row in expense_rows]})
+
+
+def _uuid(value: object) -> UUID:
+    if not isinstance(value, str):
+        raise ValueError("Неверный идентификатор")
+    return UUID(value)
+
+
+def _decimal(value: object) -> Decimal:
+    if not isinstance(value, str) or len(value) > 40:
+        raise ValueError("Укажите число")
+    try:
+        result = Decimal(value.replace(",", "."))
+    except InvalidOperation as exc:
+        raise ValueError("Укажите число") from exc
+    if not result.is_finite():
+        raise ValueError("Укажите конечное число")
+    if result.copy_abs() >= Decimal("1000000000000") or result.as_tuple().exponent < -6:
+        raise ValueError("Число вне допустимого диапазона")
+    return result
+
+
+async def _body(request: web.Request) -> dict[str, object]:
+    try:
+        value = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise web.HTTPBadRequest(text="Неверный JSON") from exc
+    if not isinstance(value, dict):
+        raise web.HTTPBadRequest(text="Ожидается объект JSON")
+    return value
+
+
+async def add_item_event(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        item_id = _uuid(request.match_info["item_id"])
+        body = await _body(request)
+        key = str(_uuid(body.get("idempotency_key")))
+        kind = body.get("event_kind")
+        if not isinstance(kind, str):
+            raise ValueError("Выберите тип события")
+        quantity = _decimal(body.get("quantity_delta"))
+        reason = body.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > 1000:
+            raise ValueError("Причина слишком длинная")
+        pool: asyncpg.Pool = request.app["pool"]
+        async with pool.acquire() as connection:
+            if kind == "customer_accepted":
+                if quantity <= 0:
+                    raise ValueError("Укажите положительное принятое количество")
+                customer_name = await connection.fetchval(
+                    "SELECT customer.display_name FROM procurement_cases c "
+                    "JOIN customers customer ON customer.id=c.customer_id "
+                    "WHERE c.id=$1 AND c.owner_user_id=$2", case_id, request["owner_id"],
+                )
+                if customer_name is None:
+                    raise AccountingConflict("У заявки не указан заказчик")
+                result = await record_customer_acceptance(
+                    connection, case_id=case_id, request_item_id=item_id,
+                    owner_user_id=request["owner_id"], customer_name=customer_name,
+                    accepted_quantity=quantity, event_type="accepted", idempotency_key=key,
+                )
+                event_id = result.event_id
+            else:
+                event_id = await record_item_execution_event(
+                    connection, case_id=case_id, request_item_id=item_id,
+                    owner_user_id=request["owner_id"], event_kind=kind,
+                    quantity_delta=quantity, idempotency_key=key, reason=reason,
+                )
+        return _json(request, {"id": event_id}, status=201)
+    except (ValueError, ItemExecutionConflict, AccountingConflict) as exc:
+        return _json(request, {"error": str(exc)}, status=400)
+
+
+async def add_case_expense(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        body = await _body(request)
+        key = str(_uuid(body.get("idempotency_key")))
+        category = body.get("category")
+        cost_kind = body.get("cost_kind")
+        method = body.get("allocation_method")
+        item_values = body.get("request_item_ids")
+        if not isinstance(category, str) or not isinstance(cost_kind, str) \
+                or not isinstance(method, str) or not isinstance(item_values, list) \
+                or len(item_values) > 200:
+            raise ValueError("Проверьте категорию, тип и позиции расхода")
+        item_ids = [_uuid(value) for value in item_values]
+        manual_values = body.get("manual_amounts")
+        manual = None
+        if manual_values is not None:
+            if not isinstance(manual_values, dict):
+                raise ValueError("Ручные доли должны быть объектом")
+            manual = {_uuid(key): _decimal(value) for key, value in manual_values.items()}
+        note = body.get("note", "")
+        if not isinstance(note, str) or len(note) > 1000:
+            raise ValueError("Примечание слишком длинное")
+        pool: asyncpg.Pool = request.app["pool"]
+        async with pool.acquire() as connection:
+            expense_id = await record_case_expense(
+                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                category=category, cost_kind=cost_kind,
+                total_cost=_decimal(body.get("total_cost")),
+                request_item_ids=item_ids, allocation_method=method,
+                idempotency_key=key, manual_amounts=manual, note=note,
+            )
+        return _json(request, {"id": expense_id}, status=201)
+    except (ValueError, AccountingConflict) as exc:
+        return _json(request, {"error": str(exc)}, status=400)
 
 
 async def suppliers(request: web.Request) -> web.Response:
@@ -317,5 +503,7 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_get("/api/summary", summary)
     app.router.add_get("/api/cases", cases)
     app.router.add_get("/api/cases/{case_id}", case_detail)
+    app.router.add_post("/api/cases/{case_id}/items/{item_id}/events", add_item_event)
+    app.router.add_post("/api/cases/{case_id}/expenses", add_case_expense)
     app.router.add_get("/api/suppliers", suppliers)
     return app

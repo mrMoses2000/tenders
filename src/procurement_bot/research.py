@@ -22,6 +22,7 @@ from procurement_bot.intake import (
 class ResearchSource(StrEnum):
     OWN_DATABASE = "own_database"
     TWO_GIS = "2gis"
+    OLX = "olx"
     WEB = "web"
 
 
@@ -283,7 +284,8 @@ class LocalityResearchTask(StrictModel):
     @field_validator("sources")
     @classmethod
     def supported_sources(cls, value: list[ResearchSource]) -> list[ResearchSource]:
-        if ResearchSource.OWN_DATABASE in value:
+        if any(source not in {ResearchSource.TWO_GIS, ResearchSource.WEB}
+               for source in value):
             raise ValueError("locality browser lookup supports only 2GIS and web")
         return list(dict.fromkeys(value))
 
@@ -293,7 +295,7 @@ class ResearchPlan(StrictModel):
     scope: SearchScope
     locality_resolution: LocalityResolution | None = None
     locality_task: LocalityResearchTask | None = None
-    source_plans: list[SourcePlan] = Field(min_length=1, max_length=600)
+    source_plans: list[SourcePlan] = Field(min_length=1, max_length=800)
     plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -362,6 +364,7 @@ def build_research_plan(
     synonyms_by_item: dict[int, list[str]] | None = None,
     locality_resolution: LocalityResolution | None = None,
     minimum_unique_candidates: int = 10,
+    include_olx: bool = False,
 ) -> ResearchPlan:
     """Build reproducible source branches from the approved intake projection.
 
@@ -384,7 +387,7 @@ def build_research_plan(
         request, locality_resolution
     )
     branches: list[SourcePlan] = []
-    source_settings = (
+    source_settings = [
         (
             ResearchSource.OWN_DATABASE,
             ResearchPurpose.KNOWN_SUPPLIER_LOOKUP,
@@ -393,8 +396,13 @@ def build_research_plan(
         ),
         (ResearchSource.TWO_GIS, ResearchPurpose.BUSINESS_DISCOVERY, 24, 2),
         (ResearchSource.WEB, ResearchPurpose.PRODUCT_EVIDENCE, 24, 3),
+    ]
+    if include_olx:
+        source_settings.insert(2, (ResearchSource.OLX, ResearchPurpose.PRODUCT_EVIDENCE,
+                                   12, 3))
+    per_branch_minimum = max(
+        1, (minimum_unique_candidates + len(source_settings) - 1) // len(source_settings)
     )
-    per_branch_minimum = max(1, (minimum_unique_candidates + 2) // 3)
     for index, item in enumerate(request.items):
         if item.name is None:
             raise ValueError(f"item {index} has no product name")
@@ -405,6 +413,8 @@ def build_research_plan(
                 query_parts.append(locality.canonical_place_name)
             elif request.search_scope == SearchScope.ONLINE_WITH_DELIVERY:
                 query_parts.append("доставка")
+            if source == ResearchSource.OLX:
+                query_parts.insert(0, "site:olx.kz")
             branches.append(
                 SourcePlan(
                     item_index=index,
@@ -456,6 +466,8 @@ class SupplierEvidence(StrictModel):
     availability: AvailabilityStatus = AvailabilityStatus.UNKNOWN
     price_amount: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
     currency: CleanText | None = Field(default=None, max_length=3)
+    pack_qty: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+    moq: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
 
     _source_url = field_validator("source_url")(_validate_source_url)
 
@@ -508,6 +520,10 @@ class SupplierCandidate(StrictModel):
     source: ResearchSource
     external_id: CleanText | None = Field(default=None, max_length=300)
     name: CleanText = Field(max_length=500)
+    seller_profile_id: CleanText | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9]{1,30}$"
+    )
+    product_name: CleanText | None = Field(default=None, max_length=500)
     categories: list[CleanText] = Field(default_factory=list, max_length=50)
     address: CleanText | None = Field(default=None, max_length=500)
     point: GeoPoint | None = None
@@ -515,6 +531,11 @@ class SupplierCandidate(StrictModel):
     evidence: list[SupplierEvidence] = Field(min_length=1, max_length=100)
     product_availability: AvailabilityStatus = AvailabilityStatus.UNKNOWN
     field_confidence: dict[str, float] = Field(default_factory=dict, max_length=50)
+
+    @field_validator("field_confidence", mode="before")
+    @classmethod
+    def empty_confidences(cls, value: object) -> object:
+        return {} if value is None else value
 
     @field_validator("field_confidence")
     @classmethod

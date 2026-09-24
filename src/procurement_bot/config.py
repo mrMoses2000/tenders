@@ -7,6 +7,7 @@ import shutil
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 
 from dotenv import dotenv_values
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -61,6 +62,8 @@ class Settings(BaseSettings):
     agy_browser_home: Path = Path("./var/agy-browser-home")
     agy_browser_mcp_server_name: str = "playwright"
     agy_browser_mcp_server_json: str = ""
+    agy_browser_model: str = ""
+    agy_browser_effort: Literal["low", "medium", "high"] = "high"
     agy_browser_timeout_seconds: int = Field(default=240, ge=30, le=1800)
     agy_browser_concurrency: int = Field(default=1, ge=1, le=4)
 

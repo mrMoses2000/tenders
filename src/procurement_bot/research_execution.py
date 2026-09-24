@@ -14,6 +14,7 @@ from uuid import UUID
 import asyncpg
 from pydantic import ValidationError
 
+from procurement_bot.errors import PermanentProviderError, RetryableProviderError
 from procurement_bot.providers.browser import (
     BROWSER_SPEC_SHA256,
     BrowserProviderError,
@@ -52,10 +53,12 @@ TerminalStatus = Literal["succeeded", "partial", "failed"]
 _PROVIDER_BY_SOURCE = {
     ResearchSource.OWN_DATABASE: "own_database",
     ResearchSource.TWO_GIS: "2gis_web",
+    ResearchSource.OLX: "marketplace",
     ResearchSource.WEB: "web",
 }
 _SOURCE_TYPE = {
     ResearchSource.TWO_GIS: "2gis",
+    ResearchSource.OLX: "marketplace",
     ResearchSource.WEB: "web",
 }
 _ADVANCED_CASE_STATUSES = {
@@ -236,14 +239,17 @@ def _validate_browser_result(
         raise ResearchExecutionRejected("browser result uses a stale policy")
     if result.request_sha256 != _request_hash(plan):
         raise ResearchExecutionRejected("browser result belongs to another query")
+    if result.pages_examined == 0:
+        raise ResearchExecutionRejected("browser search inspected no pages")
     if len(result.candidates) > plan.minimum_unique_candidates * 5:
         raise ResearchExecutionRejected("browser returned too many candidates")
     identities: set[tuple[str, str]] = set()
     for candidate in result.candidates:
         if candidate.source != plan.source:
             raise ResearchExecutionRejected("candidate source differs from its branch")
-        if plan.source == ResearchSource.TWO_GIS and not candidate.external_id:
-            raise ResearchExecutionRejected("2GIS candidate has no firm id")
+        if (plan.source in {ResearchSource.TWO_GIS, ResearchSource.OLX}
+                and not candidate.external_id):
+            raise ResearchExecutionRejected("source candidate has no stable id")
         for evidence in candidate.evidence:
             if evidence.source != plan.source:
                 raise ResearchExecutionRejected("evidence source differs from its branch")
@@ -252,6 +258,11 @@ def _validate_browser_result(
                 host == "2gis.kz" or host.endswith(".2gis.kz")
             ):
                 raise ResearchExecutionRejected("2GIS evidence URL is not official")
+            if plan.source == ResearchSource.OLX and (
+                urlparse(evidence.source_url).scheme != "https"
+                or host not in {"olx.kz", "www.olx.kz"}
+            ):
+                raise ResearchExecutionRejected("OLX evidence URL is not official")
             if evidence.evidence_type == EvidenceType.SUPPLIER_STATEMENT:
                 raise ResearchExecutionRejected("browser cannot produce supplier statements")
             if evidence.currency is not None and not re.fullmatch(
@@ -263,7 +274,8 @@ def _validate_browser_result(
             AvailabilityStatus.CONFIRMED_OUT_OF_STOCK,
         }:
             raise ResearchExecutionRejected("browser cannot confirm current stock")
-        identity = _identity(candidate)
+        identity = (_identity(candidate) if plan.source != ResearchSource.OLX
+                    else ("olx_listing", candidate.external_id))
         if identity in identities:
             raise ResearchExecutionRejected("browser returned duplicate supplier identities")
         identities.add(identity)
@@ -274,6 +286,11 @@ def _identity(candidate: SupplierCandidate) -> tuple[str, str]:
     if candidate.source == ResearchSource.TWO_GIS:
         assert candidate.external_id is not None
         return "2gis_firm_id", candidate.external_id
+    if candidate.source == ResearchSource.OLX:
+        assert candidate.external_id is not None
+        if candidate.seller_profile_id:
+            return "source_record", f"olx_seller:{candidate.seller_profile_id}"
+        return "source_record", f"olx:{candidate.external_id}"
     first_host = (urlparse(candidate.evidence[0].source_url).hostname or "").casefold()
     if candidate.external_id:
         return "source_record", f"web:{first_host}:{candidate.external_id}"
@@ -295,8 +312,11 @@ def _evidence_key(query_id: UUID, candidate: SupplierCandidate, evidence: Any) -
     return f"browser-evidence:{_digest(material)}"
 
 
-def _offer_key(query_id: UUID, supplier_id: UUID) -> str:
-    return f"research-offer:{_digest({'query_id': str(query_id), 'supplier_id': str(supplier_id)})}"
+def _offer_key(query_id: UUID, supplier_id: UUID, listing_id: str | None = None) -> str:
+    material = {"query_id": str(query_id), "supplier_id": str(supplier_id)}
+    if listing_id is not None:
+        material["listing_id"] = listing_id
+    return f"research-offer:{_digest(material)}"
 
 
 def _observation_availability(value: AvailabilityStatus) -> str:
@@ -389,7 +409,8 @@ class ResearchRunExecutor:
                 try:
                     raw_result = await self.browser.search_suppliers(branch.plan)
                     result = _validate_browser_result(branch.plan, raw_result)
-                except (BrowserProviderError, ResearchExecutionRejected, ValidationError):
+                except (BrowserProviderError, PermanentProviderError,
+                        RetryableProviderError, ResearchExecutionRejected, ValidationError):
                     # Browser calls are the sole unreliable network boundary. Database
                     # persistence happens outside this catch and therefore remains retryable.
                     failed += 1
@@ -461,11 +482,7 @@ class ResearchRunExecutor:
             """,
             run["case_id"],
         )
-        items: dict[int, UUID] = {}
-        for expected_line, row in enumerate(item_rows, start=1):
-            if row["line_number"] != expected_line:
-                raise ResearchPlanDrift("request item line numbers are not contiguous")
-            items[expected_line - 1] = row["id"]
+        items = {index: row["id"] for index, row in enumerate(item_rows)}
         branches: list[_QueryBranch] = []
         for ordinal, (row, branch) in enumerate(zip(query_rows, plan.source_plans, strict=True)):
             if row["research_run_id"] != run["id"]:
@@ -526,21 +543,42 @@ class ResearchRunExecutor:
                 )
                 evidence_ids.append(stored.id)
             primary_evidence_id = evidence_ids[0]
-            identity_type, identity_value = _identity(candidate)
-            supplier = await upsert_supplier(
-                connection,
-                SupplierInput(
-                    display_name=candidate.name,
-                    identity_type=identity_type,
-                    identity_value=identity_value,
-                    source_evidence_id=primary_evidence_id,
-                    confidence=_confidence(candidate, "name", "0.7"),
-                ),
-            )
+            existing_offer = None
+            if candidate.source == ResearchSource.OLX:
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"olx-offer:{branch.request_item_id}:{candidate.external_id}",
+                )
+                existing_offer = await connection.fetchrow(
+                    """
+                    SELECT o.id,o.supplier_id FROM offers o
+                    JOIN offer_observations observation ON observation.offer_id=o.id
+                    JOIN source_evidence evidence ON evidence.id=observation.source_evidence_id
+                    WHERE o.request_item_id=$1 AND evidence.external_id=$2
+                      AND evidence.source_type='marketplace'
+                    ORDER BY o.created_at LIMIT 1
+                    """,
+                    branch.request_item_id, candidate.external_id,
+                )
+            if existing_offer is not None:
+                supplier_id = existing_offer["supplier_id"]
+            else:
+                identity_type, identity_value = _identity(candidate)
+                supplier = await upsert_supplier(
+                    connection,
+                    SupplierInput(
+                        display_name=candidate.name,
+                        identity_type=identity_type,
+                        identity_value=identity_value,
+                        source_evidence_id=primary_evidence_id,
+                        confidence=_confidence(candidate, "name", "0.7"),
+                    ),
+                )
+                supplier_id = supplier.id
             for contact in candidate.contacts:
                 await upsert_supplier_contact(
                     connection,
-                    supplier.id,
+                    supplier_id,
                     SupplierContactInput(
                         contact_type=contact.kind.value,
                         display_value=contact.value,
@@ -556,7 +594,7 @@ class ResearchRunExecutor:
             ):
                 location = await upsert_supplier_location(
                     connection,
-                    supplier.id,
+                    supplier_id,
                     SupplierLocationInput(
                         source_evidence_id=primary_evidence_id,
                         city=branch.plan.locality.city,
@@ -572,24 +610,34 @@ class ResearchRunExecutor:
                             else None
                         ),
                         source_provider=candidate.source.value,
-                        provider_place_id=candidate.external_id or "",
+                        provider_place_id=("" if candidate.source == ResearchSource.OLX
+                                           else candidate.external_id or ""),
                         confidence=_confidence(candidate, "address", "0.7"),
                     ),
                 )
                 location_id = location.id
-            offer = await upsert_offer(
-                connection,
-                OfferInput(
-                    request_item_id=branch.request_item_id,
-                    supplier_id=supplier.id,
-                    supplier_location_id=location_id,
-                    idempotency_key=_offer_key(branch.id, supplier.id),
-                    status="lead",
-                ),
-            )
+            if existing_offer is None:
+                offer = await upsert_offer(
+                    connection,
+                    OfferInput(
+                        request_item_id=branch.request_item_id,
+                        supplier_id=supplier_id,
+                        supplier_location_id=location_id,
+                        idempotency_key=_offer_key(
+                            branch.id, supplier_id,
+                            candidate.external_id if candidate.source == ResearchSource.OLX
+                            else None,
+                        ),
+                        supplier_product_name=candidate.product_name or "",
+                        status="lead",
+                    ),
+                )
+                offer_id = offer.id
+            else:
+                offer_id = existing_offer["id"]
             for evidence, evidence_id in zip(candidate.evidence, evidence_ids, strict=True):
                 observation_material = {
-                    "offer_id": str(offer.id),
+                    "offer_id": str(offer_id),
                     "evidence_id": str(evidence_id),
                 }
                 observation_key = (
@@ -598,13 +646,15 @@ class ResearchRunExecutor:
                 await upsert_offer_observation(
                     connection,
                     OfferObservationInput(
-                        offer_id=offer.id,
+                        offer_id=offer_id,
                         source_evidence_id=evidence_id,
                         observed_at=evidence.observed_at,
                         observed_by="research-executor",
                         source_type=_SOURCE_TYPE[candidate.source],
                         price_amount=evidence.price_amount,
                         currency=evidence.currency.upper() if evidence.currency else None,
+                        pack_qty=evidence.pack_qty,
+                        moq=evidence.moq,
                         availability_status=_observation_availability(evidence.availability),
                         raw_payload=evidence.model_dump(mode="json"),
                         idempotency_key=observation_key,
