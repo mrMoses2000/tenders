@@ -143,6 +143,8 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
 .entry-field input:focus, .entry-field select:focus { border-color: var(--ink); }
 .entry-submit { min-height: 42px; border: 0; background: var(--dark); color: white; font-size: 11px; font-weight: 700; }
 .entry-submit:disabled { opacity: .6; cursor: wait; }
+.item-research { display: grid; gap: 6px; margin-top: 12px; }
+.item-research .entry-submit { padding: 0 12px; text-align: left; }
 .entry-feedback { margin: 0; color: var(--danger); font-size: 11px; }
 .entry-feedback:empty { display: none; }
 .entry-form .data-note { margin: 0; }

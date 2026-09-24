@@ -489,6 +489,25 @@ async function openDetail(id) {
         offerDetails.append(offerSearch, offerList);
         renderOffers();
       } else offerDetails.append(el("p", "data-note", "Предложений пока нет"));
+      if (c.source_kind === "notion_import" && ["ready", "evaluating", "report_ready"].includes(c.status)) {
+        const search = el("div", "item-research");
+        const button = el("button", "entry-submit", "Искать поставщиков для этой позиции");
+        button.type = "button";
+        const note = el("span", "data-note", "Поиск по названию и городу. Техспек сверьте с найденными предложениями.");
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          note.textContent = "Ставим поиск в очередь…";
+          try {
+            await apiWrite("/api/cases/" + id + "/items/" + item.id + "/research", {});
+            await openDetail(id);
+          } catch (error) {
+            note.textContent = error.message;
+            button.disabled = false;
+          }
+        });
+        search.append(button, note);
+        offerDetails.insertBefore(search, offerDetails.children[1] || null);
+      }
       box.append(offerDetails);
       box.append(eventForm(id, item));
       body.append(box);

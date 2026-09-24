@@ -916,7 +916,11 @@ class JobWorker:
                     },
                     idempotency_key=stable_key("build-report", result.case_id, run_id),
                 )
-                if getattr(self, "whatsapp_enabled", False):
+                source_kind = await connection.fetchval(
+                    "SELECT source_kind FROM procurement_cases WHERE id=$1",
+                    result.case_id,
+                )
+                if getattr(self, "whatsapp_enabled", False) and source_kind != "notion_import":
                     await enqueue_job(
                         connection,
                         kind="prepare_supplier_outreach",

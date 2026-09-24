@@ -21,7 +21,12 @@ from procurement_bot.accounting import (
     record_customer_acceptance,
 )
 from procurement_bot.config import Settings
+from procurement_bot.imported_research import (
+    ImportedResearchConflict,
+    start_imported_item_research,
+)
 from procurement_bot.item_execution import ItemExecutionConflict, record_item_execution_event
+from procurement_bot.research_workflow import ResearchStartDenied
 
 STATIC = Path(__file__).resolve().parents[2] / "mini_app"
 MAX_AGE_SECONDS = 24 * 60 * 60
@@ -231,7 +236,7 @@ async def case_detail(request: web.Request) -> web.Response:
     async with pool.acquire() as connection:
         case = await connection.fetchrow(
             """
-            SELECT c.id,c.title,c.city,c.search_area_text,c.delivery_address,
+            SELECT c.id,c.title,c.city,c.source_kind,c.search_area_text,c.delivery_address,
                    c.status,c.deadline_at,c.created_at,c.updated_at,
                    customer.display_name AS customer_name
             FROM procurement_cases c
@@ -420,6 +425,24 @@ async def add_item_event(request: web.Request) -> web.Response:
         return _json(request, {"error": str(exc)}, status=400)
 
 
+async def start_item_research(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        item_id = _uuid(request.match_info["item_id"])
+        body = await _body(request)
+        if body:
+            raise ValueError("Параметры поиска задаются сохранённой позицией")
+        pool: asyncpg.Pool = request.app["pool"]
+        async with pool.acquire() as connection:
+            run_id = await start_imported_item_research(
+                connection, case_id=case_id, item_id=item_id,
+                owner_user_id=request["owner_id"],
+            )
+        return _json(request, {"research_run_id": run_id, "status": "running"}, status=202)
+    except (ValueError, ImportedResearchConflict, ResearchStartDenied) as exc:
+        return _json(request, {"error": str(exc)}, status=400)
+
+
 async def add_case_expense(request: web.Request) -> web.Response:
     try:
         case_id = _uuid(request.match_info["case_id"])
@@ -503,6 +526,7 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_get("/api/summary", summary)
     app.router.add_get("/api/cases", cases)
     app.router.add_get("/api/cases/{case_id}", case_detail)
+    app.router.add_post("/api/cases/{case_id}/items/{item_id}/research", start_item_research)
     app.router.add_post("/api/cases/{case_id}/items/{item_id}/events", add_item_event)
     app.router.add_post("/api/cases/{case_id}/expenses", add_case_expense)
     app.router.add_get("/api/suppliers", suppliers)
