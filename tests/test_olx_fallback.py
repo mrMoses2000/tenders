@@ -1,5 +1,6 @@
 import json
 import shlex
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,34 @@ def _plan(source: ResearchSource = ResearchSource.OLX) -> SourcePlan:
         result_ttl_hours=1,
         empty_page_limit=1,
     )
+
+
+def _olx_lead(listing_id: str) -> dict:
+    return {
+        "source": "olx",
+        "external_id": listing_id,
+        "name": f"Продавец {listing_id}",
+        "evidence": [{
+            "evidence_type": "product_page",
+            "source": "olx",
+            "source_url": (
+                f"https://www.olx.kz/d/obyavlenie/apparat-ID{listing_id}.html"
+            ),
+            "observed_at": datetime.now(UTC).isoformat(),
+            "raw_snapshot_sha256": "a" * 64,
+            "claims": ["product_match"],
+        }],
+    }
+
+
+def _olx_result(call, ids: list[str], *, exhausted: bool = False) -> dict:
+    return {
+        "spec_sha256": call.spec_sha256,
+        "request_sha256": call.request_sha256,
+        "candidates": [_olx_lead(listing_id) for listing_id in ids],
+        "exhausted": exhausted,
+        "pages_examined": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -105,14 +134,138 @@ async def test_codex_executor_accepts_only_pinned_olx_search(monkeypatch) -> Non
     executor = CodexChromeExecutor(executable=Path("/bin/true"))
     seen = []
 
-    async def fake_invoke(prepared, *, source, direct_firm_card):
-        seen.append((prepared, source, direct_firm_card))
-        return {"spec_sha256": prepared.spec_sha256}
+    async def fake_invoke(prepared, *, source, direct_firm_card, **options):
+        seen.append((prepared, source, direct_firm_card, options))
+        return _olx_result(prepared, ["1"], exhausted=True)
 
     monkeypatch.setattr(executor, "_invoke", fake_invoke)
     result = await executor.execute(call)
-    assert result == {"spec_sha256": call.spec_sha256}
-    assert seen == [(call, "olx", False)]
+    assert result["spec_sha256"] == call.spec_sha256
+    assert len(result["candidates"]) == 1
+    assert len(seen) == 1
+    assert seen[0][:3] == (call, "olx", False)
+    assert seen[0][3]["max_leads"] == 1
+    assert seen[0][3]["excluded_listing_ids"] == ()
+    assert not seen[0][3]["repair_contact_evidence"]
+    assert 0 < seen[0][3]["timeout_seconds"] <= 900
+
+
+@pytest.mark.asyncio
+async def test_codex_olx_collects_small_validated_batches(monkeypatch) -> None:
+    plan = _plan().model_copy(update={"minimum_unique_candidates": 5})
+    call = StructuredBrowserProvider(StaticBrowserExecutor({})).prepare_supplier_search(plan)
+    executor = CodexChromeExecutor(executable=Path("/bin/true"))
+    seen = []
+
+    async def fake_invoke(prepared, *, source, direct_firm_card, **options):
+        seen.append(options)
+        ids = ["1", "2", "3"] if len(seen) == 1 else ["4", "5"]
+        return _olx_result(prepared, ids)
+
+    monkeypatch.setattr(executor, "_invoke", fake_invoke)
+    raw = await executor.execute(call)
+    result = StructuredBrowserProvider(StaticBrowserExecutor({})).accept_supplier_search(
+        call, plan, raw,
+    )
+
+    assert [candidate.external_id for candidate in result.candidates] == [
+        "1", "2", "3", "4", "5",
+    ]
+    assert result.pages_examined == 2
+    assert not result.exhausted
+    assert [(entry["max_leads"], entry["excluded_listing_ids"]) for entry in seen] == [
+        (3, ()), (2, ("1", "2", "3")),
+    ]
+    assert all(0 < entry["timeout_seconds"] <= 900 for entry in seen)
+    assert all(not entry["repair_contact_evidence"] for entry in seen)
+
+
+@pytest.mark.asyncio
+async def test_codex_olx_continues_after_underfilled_batch(monkeypatch) -> None:
+    plan = _plan().model_copy(update={"minimum_unique_candidates": 5})
+    call = StructuredBrowserProvider(StaticBrowserExecutor({})).prepare_supplier_search(plan)
+    executor = CodexChromeExecutor(executable=Path("/bin/true"))
+    batches = [["1"], ["2"], ["3", "4", "5"]]
+
+    async def fake_invoke(prepared, *, source, direct_firm_card, **options):
+        return _olx_result(prepared, batches.pop(0))
+
+    monkeypatch.setattr(executor, "_invoke", fake_invoke)
+    raw = await executor.execute(call)
+
+    assert [item["external_id"] for item in raw["candidates"]] == [
+        "1", "2", "3", "4", "5",
+    ]
+    assert raw["pages_examined"] == 3
+    assert raw["access_issue"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_olx_rejects_batch_over_lead_cap(monkeypatch) -> None:
+    plan = _plan().model_copy(update={"minimum_unique_candidates": 5})
+    call = StructuredBrowserProvider(StaticBrowserExecutor({})).prepare_supplier_search(plan)
+    executor = CodexChromeExecutor(executable=Path("/bin/true"))
+
+    async def fake_invoke(prepared, *, source, direct_firm_card, **options):
+        return _olx_result(prepared, ["1", "2", "3", "4"])
+
+    monkeypatch.setattr(executor, "_invoke", fake_invoke)
+    with pytest.raises(UnsafeBrowserResult, match="exceeded lead cap"):
+        await executor.execute(call)
+
+
+@pytest.mark.asyncio
+async def test_codex_olx_retries_contact_without_listing_claim_once(monkeypatch) -> None:
+    plan = _plan()
+    call = StructuredBrowserProvider(StaticBrowserExecutor({})).prepare_supplier_search(plan)
+    executor = CodexChromeExecutor(executable=Path("/bin/true"))
+    attempts = []
+
+    async def fake_invoke(prepared, *, source, direct_firm_card, **options):
+        attempts.append(options)
+        raw = _olx_result(prepared, ["1"], exhausted=True)
+        raw["candidates"][0]["contacts"] = [{
+            "kind": "phone", "value": "+77000000000", "confidence": 1,
+        }]
+        if options["repair_contact_evidence"]:
+            raw["candidates"][0]["evidence"][0]["claims"].append("contact")
+        return raw
+
+    monkeypatch.setattr(executor, "_invoke", fake_invoke)
+    raw = await executor.execute(call)
+    result = StructuredBrowserProvider(StaticBrowserExecutor({})).accept_supplier_search(
+        call, plan, raw,
+    )
+
+    assert len(result.candidates[0].contacts) == 1
+    assert [attempt["repair_contact_evidence"] for attempt in attempts] == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_codex_olx_preserves_valid_first_batch_after_later_timeout(monkeypatch) -> None:
+    plan = _plan().model_copy(update={"minimum_unique_candidates": 5})
+    call = StructuredBrowserProvider(StaticBrowserExecutor({})).prepare_supplier_search(plan)
+    executor = CodexChromeExecutor(executable=Path("/bin/true"))
+    calls = 0
+
+    async def fake_invoke(prepared, *, source, direct_firm_card, **options):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RetryableProviderError("Codex Chrome fallback timed out")
+        return _olx_result(prepared, ["1", "2", "3"])
+
+    monkeypatch.setattr(executor, "_invoke", fake_invoke)
+    raw = await executor.execute(call)
+    result = StructuredBrowserProvider(StaticBrowserExecutor({})).accept_supplier_search(
+        call, plan, raw,
+    )
+
+    assert calls == 2
+    assert len(result.candidates) == 3
+    assert result.pages_examined == 1
+    assert result.access_issue == "unknown"
+    assert not result.exhausted
 
 
 @pytest.mark.asyncio
@@ -193,14 +346,16 @@ async def test_codex_olx_prompt_requires_visible_signed_in_tab(tmp_path) -> None
         StaticBrowserExecutor({}),
     ).prepare_supplier_search(_plan())
 
-    result = await CodexChromeExecutor(executable=executable).execute(call)
+    with pytest.raises(UnsafeBrowserResult) as blocked:
+        await CodexChromeExecutor(executable=executable).execute(call)
 
-    assert result["access_issue"] == "login_wall"
+    assert blocked.value.access_issue == "login_wall"
     prompt = captured_prompt.read_text()
     assert "Open one fresh tab in the connected Chrome session" in prompt
     assert "not reuse tabs owned by earlier browser sessions" in prompt
     assert "Confirm from its visible UI that an OLX account" in prompt
     assert "access_issue=login_wall" in prompt
+    assert "Return at most 1 distinct listing card(s)" in prompt
 
 
 def test_codex_executor_downgrades_unbacked_stock_claim() -> None:

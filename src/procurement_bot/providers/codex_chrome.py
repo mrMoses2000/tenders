@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import tempfile
 from collections.abc import Mapping
@@ -12,12 +13,19 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
 from procurement_bot.providers.browser import (
     BROWSER_SPEC_SHA256,
     BrowserOperation,
+    BrowserProviderError,
     PreparedBrowserCall,
+    StructuredBrowserProvider,
+    SupplierBrowserResult,
+    UnsafeBrowserResult,
 )
+from procurement_bot.research import SourcePlan
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +34,7 @@ class CodexChromeExecutor:
     """Read-only Chrome research with the server's installed Codex plugin."""
 
     MAX_RESULT_BYTES = 1_048_576
+    MAX_OLX_LEADS_PER_CALL = 3
     _ENV_ALLOWLIST = frozenset({
         "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "DISPLAY", "WAYLAND_DISPLAY",
         "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY",
@@ -72,12 +81,116 @@ class CodexChromeExecutor:
             and "/firm/" in parsed_query.path
         )
         async with self._semaphore:
+            if request["source"] == "olx":
+                try:
+                    plan = SourcePlan.model_validate(request)
+                except ValidationError as exc:
+                    raise PermanentProviderError("Codex OLX request is invalid") from exc
+                return await self._search_olx_batched(call, plan)
             return await self._invoke(
                 call, source=request["source"], direct_firm_card=direct_firm_card,
             )
 
+    async def _search_olx_batched(
+        self, call: PreparedBrowserCall, plan: SourcePlan,
+    ) -> Mapping[str, Any]:
+        validator = StructuredBrowserProvider(self)
+        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+        candidates: dict[str, Any] = {}
+        pages_examined = 0
+        exhausted = False
+        access_issue: str | None = None
+        minimum_batches = (
+            plan.minimum_unique_candidates + self.MAX_OLX_LEADS_PER_CALL - 1
+        ) // self.MAX_OLX_LEADS_PER_CALL
+        max_batches = min(minimum_batches * 2, 12)
+        for _ in range(max_batches):
+            remaining = plan.minimum_unique_candidates - len(candidates)
+            if remaining <= 0:
+                break
+            try:
+                result = await self._validated_olx_batch(
+                    call,
+                    plan,
+                    validator=validator,
+                    deadline=deadline,
+                    max_leads=min(self.MAX_OLX_LEADS_PER_CALL, remaining),
+                    excluded_listing_ids=tuple(candidates),
+                )
+            except (BrowserProviderError, PermanentProviderError,
+                    RetryableProviderError, ValidationError) as exc:
+                if not candidates:
+                    raise
+                access_issue = getattr(exc, "access_issue", None) or "unknown"
+                LOGGER.warning(
+                    "Codex OLX batch stopped after %s accepted leads: %s",
+                    len(candidates), type(exc).__name__,
+                )
+                break
+            pages_examined += result.pages_examined
+            before = len(candidates)
+            for candidate in result.candidates:
+                if candidate.external_id is not None and candidate.external_id not in candidates:
+                    candidates[candidate.external_id] = candidate
+            exhausted = result.exhausted
+            if exhausted or len(candidates) == before:
+                break
+        if not exhausted and len(candidates) < plan.minimum_unique_candidates:
+            access_issue = access_issue or "unknown"
+        return {
+            "spec_sha256": call.spec_sha256,
+            "request_sha256": call.request_sha256,
+            "candidates": [item.model_dump(mode="json") for item in candidates.values()],
+            "exhausted": exhausted,
+            "pages_examined": pages_examined,
+            "access_issue": access_issue,
+        }
+
+    async def _validated_olx_batch(
+        self,
+        call: PreparedBrowserCall,
+        plan: SourcePlan,
+        *,
+        validator: StructuredBrowserProvider,
+        deadline: float,
+        max_leads: int,
+        excluded_listing_ids: tuple[str, ...],
+    ) -> SupplierBrowserResult:
+        for attempt in range(2):
+            remaining_seconds = deadline - asyncio.get_running_loop().time()
+            if remaining_seconds < 30:
+                raise RetryableProviderError("Codex Chrome fallback timed out")
+            raw = await self._invoke(
+                call,
+                source="olx",
+                direct_firm_card=False,
+                max_leads=max_leads,
+                excluded_listing_ids=excluded_listing_ids,
+                timeout_seconds=remaining_seconds,
+                repair_contact_evidence=attempt == 1,
+            )
+            try:
+                result = validator.accept_supplier_search(call, plan, raw)
+                if len(result.candidates) > max_leads:
+                    raise UnsafeBrowserResult(
+                        "OLX batch exceeded lead cap", access_issue="unknown",
+                    )
+                return result
+            except BrowserProviderError as exc:
+                if (
+                    attempt == 1
+                    or str(exc) != "OLX contact must cite its listing and contact evidence"
+                ):
+                    raise
+                LOGGER.warning("Codex OLX omitted listing contact evidence; retrying once")
+        raise AssertionError("unreachable OLX validation state")
+
     async def _invoke(
         self, call: PreparedBrowserCall, *, source: str, direct_firm_card: bool,
+        max_leads: int | None = None,
+        excluded_listing_ids: tuple[str, ...] = (),
+        timeout_seconds: float | None = None,
+        repair_contact_evidence: bool = False,
     ) -> Mapping[str, Any]:
         with tempfile.TemporaryDirectory(prefix=f"procurement-codex-{source}-") as temporary:
             root = Path(temporary)
@@ -146,6 +259,24 @@ class CodexChromeExecutor:
                     "Keep a listing "
                     "without a phone as a lead; never invent its contact. "
                 )
+                if max_leads is not None:
+                    safe_excluded = [
+                        listing_id for listing_id in excluded_listing_ids
+                        if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", listing_id)
+                    ]
+                    source_rules += (
+                        f"Return at most {max_leads} distinct listing card(s) in this "
+                        "batch. Do not return listing IDs already accepted in "
+                        f"earlier batches: {json.dumps(safe_excluded)}. "
+                        "If no further relevant listing exists, set exhausted=true. "
+                    )
+                    if repair_contact_evidence:
+                        source_rules += (
+                            "The previous result was rejected because a phone lacked "
+                            "a CONTACT claim on its exact OLX listing URL. Reopen the "
+                            "listing and verify the revealed number. Include a contact "
+                            "claim on that listing evidence, or omit the phone. "
+                        )
             prompt = (
                 source_intro
                 + "You may read those installed skill "
@@ -199,7 +330,7 @@ class CodexChromeExecutor:
                     try:
                         await asyncio.wait_for(
                             process.communicate(prompt.encode("utf-8")),
-                            timeout=self.timeout_seconds,
+                            timeout=timeout_seconds or self.timeout_seconds,
                         )
                     except (TimeoutError, asyncio.CancelledError):
                         if process.returncode is None:
@@ -207,6 +338,17 @@ class CodexChromeExecutor:
                         await process.wait()
                         raise
             except TimeoutError as exc:
+                try:
+                    log_bytes = output.read_bytes()
+                    LOGGER.warning(
+                        "Codex Chrome timeout source=%s completed_browser_calls=%s "
+                        "log_bytes=%s",
+                        source,
+                        log_bytes.count(b"mcp: node_repl/js (completed)"),
+                        len(log_bytes),
+                    )
+                except OSError:
+                    LOGGER.warning("Codex Chrome timeout source=%s log_unavailable", source)
                 raise RetryableProviderError("Codex Chrome fallback timed out") from exc
             except OSError as exc:
                 raise RetryableProviderError("Codex Chrome fallback could not start") from exc
