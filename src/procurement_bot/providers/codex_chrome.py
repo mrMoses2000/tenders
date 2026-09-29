@@ -25,7 +25,7 @@ from procurement_bot.providers.browser import (
     SupplierBrowserResult,
     UnsafeBrowserResult,
 )
-from procurement_bot.research import SourcePlan
+from procurement_bot.research import LocalityResearchTask, SourcePlan
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,14 +63,21 @@ class CodexChromeExecutor:
     async def execute(self, call: PreparedBrowserCall) -> Mapping[str, Any]:
         if call.spec_sha256 != BROWSER_SPEC_SHA256:
             raise PermanentProviderError("Codex browser policy hash is stale")
-        if call.operation != BrowserOperation.SEARCH_SUPPLIERS:
-            raise PermanentProviderError("Codex fallback supports supplier search only")
         if hashlib.sha256(call.untrusted_request_json.encode()).hexdigest() != call.request_sha256:
             raise PermanentProviderError("Codex browser request hash mismatch")
         try:
             request = json.loads(call.untrusted_request_json)
         except json.JSONDecodeError as exc:
             raise PermanentProviderError("Codex browser request is invalid JSON") from exc
+        if call.operation == BrowserOperation.RESOLVE_LOCALITY:
+            try:
+                LocalityResearchTask.model_validate(request)
+            except ValidationError as exc:
+                raise PermanentProviderError("Codex locality request is invalid") from exc
+            async with self._semaphore:
+                return await self._invoke(call, source="2gis", direct_firm_card=False)
+        if call.operation != BrowserOperation.SEARCH_SUPPLIERS:
+            raise PermanentProviderError("Codex browser operation is unsupported")
         if not isinstance(request, dict) or request.get("source") not in {"2gis", "olx"}:
             raise PermanentProviderError("Codex fallback supports 2GIS and OLX only")
         parsed_query = urlparse(str(request.get("rendered_query", "")))
@@ -277,6 +284,28 @@ class CodexChromeExecutor:
                             "listing and verify the revealed number. Include a contact "
                             "claim on that listing evidence, or omit the phone. "
                         )
+            if call.operation == BrowserOperation.RESOLVE_LOCALITY:
+                source_intro = (
+                    "Use the installed Chrome plugin's control-chrome skill for this "
+                    "read-only 2GIS geography lookup in the connected Chrome profile. "
+                )
+                source_rules = (
+                    "Select the requested city, search the locality phrase, and open "
+                    "the matching geographic result or street detail. A highway or "
+                    "market corridor is a valid locality, not necessarily a district. "
+                    "Record the name, address, official geographic 2GIS URL and geo ID "
+                    "or visible coordinates. Never substitute a firm's ID for a "
+                    "street's geo ID. Do not collect suppliers or contacts here. "
+                    "Hash the visible source text/snapshot. Report pages_examined "
+                    "and access_issue; stop after a relevant geographic match. "
+                )
+            blocked_rule = (
+                "For a blocked page report zero candidates, pages_examined=0 "
+                "and the observed access_issue.\n"
+                if call.operation == BrowserOperation.RESOLVE_LOCALITY else
+                "For a blocked page report zero candidates, pages_examined=0, "
+                "exhausted=false and the observed access_issue.\n"
+            )
             prompt = (
                 source_intro
                 + "You may read those installed skill "
@@ -296,9 +325,8 @@ class CodexChromeExecutor:
                 "request hashes; do not copy them into your result. Put the full result "
                 "object as serialized JSON in the result_json string of the transport "
                 "envelope. Do not put any other text in that string. "
-                "For a blocked page report zero candidates, pages_examined=0, "
-                "exhausted=false and the observed access_issue.\n"
-                f"TRUSTED_POLICY:\n{call.trusted_instruction}\n"
+                + blocked_rule
+                + f"TRUSTED_POLICY:\n{call.trusted_instruction}\n"
                 "TRANSPORT_OVERRIDE: Omit spec_sha256 and request_sha256 from "
                 "result_json. The caller stamps those two fields after this "
                 "single-task process returns.\n"

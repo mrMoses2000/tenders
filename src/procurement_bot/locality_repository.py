@@ -385,6 +385,11 @@ class PostgreSQLLocalityResolutionRepository:
         )
         if changed != "UPDATE 1":
             raise LocalityWorkflowDenied("case changed before locality resolution commit")
+        await connection.execute(
+            "UPDATE clarifications SET status='dismissed' "
+            "WHERE case_id=$1 AND topic='locality_resolution' AND status='open'",
+            context.case_id,
+        )
         payload = {
             "case_id": str(context.case_id),
             "intake_version": context.intake_version,
@@ -422,6 +427,18 @@ class PostgreSQLLocalityResolutionRepository:
         )
         if changed != "UPDATE 1":
             raise LocalityWorkflowDenied("case changed before clarification commit")
+        await connection.execute(
+            """
+            INSERT INTO clarifications(case_id,topic,question)
+            SELECT $1,'locality_resolution',$2
+            WHERE NOT EXISTS (
+                SELECT 1 FROM clarifications
+                WHERE case_id=$1 AND topic='locality_resolution' AND status='open'
+            )
+            """,
+            context.case_id,
+            clarification.question,
+        )
         await enqueue_outbox(
             connection,
             event_type="telegram.send_message",

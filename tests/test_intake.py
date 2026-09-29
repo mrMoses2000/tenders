@@ -82,13 +82,14 @@ async def test_process_can_apply_only_an_explicit_scope_default():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source_type", [SourceType.TEXT, SourceType.VOICE])
-async def test_process_passes_the_one_visible_question_as_context(source_type):
+@pytest.mark.parametrize("topic", ["city_missing", "locality_resolution"])
+async def test_process_passes_the_one_visible_question_as_context(source_type, topic):
     current = ParsedProcurementRequest(items=[ProcurementItem(
         name="Марля", quantity=100, tender_unit_price_private=Decimal("1234"),
         source_reference="table:2:row:3",
     )])
     clarification = IntakeClarificationContext(
-        topic="city_missing",
+        topic=topic,
         question="В каком городе искать товар?",
     )
     narrow_current = current.model_copy(update={"items": []})
@@ -103,6 +104,7 @@ async def test_process_passes_the_one_visible_question_as_context(source_type):
             spec_sha256=context_patch.spec_sha256,
             context_sha256=context_patch.context_sha256,
             city="Алматы",
+            search_area_text="Рынки вдоль шоссе Северное Кольцо",
         )
     )
     result = await IntakeService(fake).process(
@@ -112,12 +114,13 @@ async def test_process_passes_the_one_visible_question_as_context(source_type):
         open_clarification=clarification,
     )
     assert fake.calls[0]["context"]["open_clarification"] == {
-        "topic": "city_missing",
+        "topic": topic,
         "question": "В каком городе искать товар?",
     }
     assert fake.calls[0]["context"]["current_request"]["items"] == []
     assert result.request.items == current.items
     assert result.request.city == "Алматы"
+    assert result.request.search_area_text == "Рынки вдоль шоссе Северное Кольцо"
 
 
 PRICED_TABLE = (

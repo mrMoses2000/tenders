@@ -433,3 +433,55 @@ entry point и минимальные затрагиваемые файлы. П�
   География, реальный поиск, новые evidence и итоговый отчёт ещё не проверены
   для данной заявки. Heartbeat `docx` следит каждые пять минут и сообщает
   только об изменениях; он не одобряет поиск и отправки поставщикам.
+
+## 6. Ответ на уточнение района 29.09 — сценарий восстановлен
+
+- Ответ с ориентиром «Северное Кольцо» сохранён в messages, но locality
+  workflow отправил вопрос без записи в clarifications. Маршрутизатор поэтому
+  выбрал ordinary вместо update_request; finish_dialogue_turn затем упал на
+  PostgreSQL `AmbiguousParameterError` для `$2`. Пять одинаковых попыток,
+  затем ошибочное сообщение про другой файл. Модель этот ответ не получала.
+- Минимальный путь исправления: explicit UUID cast в dialogue_routing;
+  locality_repository сохраняет вопрос и dismiss при разрешении района;
+  intake обрабатывает locality_resolution узкой географической схемой;
+  cases сохраняет существующие ID позиций при неизменившемся списке вместо
+  DELETE (55 цен уже имеют ON DELETE RESTRICT FK); worker выдаёт техническую
+  ошибку сообщения для text input. Миграция схемы не требуется.
+- Однократный recovery: связать исторический locality-вопрос с черновиком,
+  исправить только planned routing этого неуспешного сообщения с событием
+  аудита и идемпотентно повторить его. Поиск и отправки не одобрять.
+- Проверка: targeted regressions, подготовка SQL на PostgreSQL/rollback,
+  живой replay, сохранность всех 55 item ID/цен/техспеков, план/approval.
+- Replay обработан с первой попытки: intake v3 сохранил «шоссе Северное
+  Кольцо» и все 55 существующих позиций/цен. Географический browser снова
+  вернул 0 candidates. При разборе найдены общий supplier prompt для
+  resolve_locality и отсутствие диагностики просмотренных страниц; пустой
+  результат воспринимался как непонятный ориентир. Доработка: отдельный
+  географический prompt, pages_examined/access_issue в locality envelope,
+  отказ принимать пустой результат без просмотра страниц; одна проверка
+  Codex Chrome на gpt-6-luna/high при пустом/ошибочном AGY lookup. Supplier
+  fallback и WhatsApp approvals сохраняют прежний контракт. Старые записи
+  locality не меняются; новый lookup будет новой intake-версией.
+- Факт проверки исправлений: 62 targeted passed; SQL завершения turn с
+  `case_id=None` выполнен на PostgreSQL в rollback-транзакции. В той же
+  транзакции изменение только географии сохранило все 55 ID, цен и техспеков.
+  Полный прогон актуальных tracked tests на staging:
+  `PYTHONPATH=src:. /home/moses/tenders/.venv/bin/python -m pytest -q -m 'not postgres and not external'`
+  — **585 passed, 2 skipped, 4 subtests**. Ruff изменённых runtime/tests — clean.
+  Старые server tests не соответствовали ранее развёрнутому коду; итоговый
+  прогон использовал актуальные tracked tests, scripts и legacy tender_agent.
+- Новая проверка сохраняет неизменный payload как intake v4 с
+  `parser_name=locality-revalidation`, без нового пользовательского сообщения;
+  событие `locality_verification_retried` ссылается на предыдущую parse version.
+  Job `6d6c0be6-1a3f-40d7-9f4a-2b89f09cc25e`: 08:01:33 UTC AGY
+  lookup отклонён как UnsafeBrowserResult; серверный Codex Chrome fallback
+  начал проверку. В 08:02:45 UTC job succeeded с первой попытки: Codex
+  вернул «Северное Кольцо шоссе», geographic 2GIS ID `9430150454182000`,
+  source URL `https://2gis.kz/almaty/geo/9430150454182000`; locality v4
+  `resolved`, case `ready`. Все 55 ID, цен и техспеков совпали с baseline
+  до проверки. Оба locality-вопроса dismissed.
+- Последний research run `9729892b-b8f0-474a-a75a-1844ce4b6d21` planned;
+  approval `07267580-e7bc-4c1c-943e-8a70b2196766` requested. Telegram outbox
+  отправил кнопку «Запустить поиск». Поиск/сообщения поставщикам не запускались
+  от имени пользователя; мониторинг остаётся активным до отчёта. Runtime
+  deployed, копии для отката в `var/releases/locality-recovery-20260929`.

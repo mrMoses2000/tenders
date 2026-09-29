@@ -188,7 +188,36 @@ async def persist_intake_result(
             result.parser_name,
             payload,
         )
-        await _replace_item_projection(connection, case_id, result)
+        if context.request is not None and context.request.items == result.request.items:
+            # A geography answer cannot change item identity or delete financial
+            # records created before a locality lookup asked a follow-up question.
+            await connection.execute(
+                "UPDATE request_items SET status=$2 WHERE case_id=$1",
+                case_id,
+                "ready" if result.ready_to_search else "needs_clarification",
+            )
+            if result.ready_to_search:
+                item_rows = await connection.fetch(
+                    "SELECT id,line_number FROM request_items "
+                    "WHERE case_id=$1 ORDER BY line_number",
+                    case_id,
+                )
+                if len(item_rows) != len(result.request.items):
+                    raise StaleIntakeContext("item projection no longer matches the parsed request")
+                for row, item in zip(item_rows, result.request.items, strict=True):
+                    if item.tender_unit_price_private is not None:
+                        await connection.execute(
+                            """
+                            INSERT INTO request_item_financials(
+                                request_item_id,tender_unit_price_private,currency,source_system
+                            ) VALUES ($1,$2,'KZT','document')
+                            ON CONFLICT (request_item_id) DO NOTHING
+                            """,
+                            row["id"],
+                            item.tender_unit_price_private,
+                        )
+        else:
+            await _replace_item_projection(connection, case_id, result)
         await connection.execute(
             "UPDATE clarifications SET status='dismissed' WHERE case_id=$1 AND status='open'",
             case_id,
@@ -335,7 +364,7 @@ def _telegram_reply(result: IntakeResult, _case_id: UUID) -> str:
         }.get(scope_value, "по вашим условиям")
         return (
             f"Заявку разобрал: {item_count} {item_word}. "
-            f"Ищу в городе {result.request.city}, {scope}. "
+            f"План поиска: город {result.request.city}, {scope}. "
             "Сейчас подготовлю поиск и покажу его перед запуском."
         )
     intro = (

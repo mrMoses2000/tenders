@@ -4,9 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
-from procurement_bot.providers.browser import UnsafeBrowserResult
+from procurement_bot.providers.browser import LocalityBrowserResult, UnsafeBrowserResult
 from procurement_bot.providers.two_gis_fallback import TwoGisFallbackProvider
-from procurement_bot.research import ResearchSource
+from procurement_bot.research import LocalityCandidate, ResearchSource
 
 
 class _Primary:
@@ -29,6 +29,111 @@ class _Fallback:
 class _Plan:
     def __init__(self, source: ResearchSource) -> None:
         self.source = source
+
+
+class _LocalityPrimary:
+    def __init__(self, result=None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls = 0
+
+    async def resolve_locality(self, _task):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _LocalityFallback:
+    def __init__(self, result=None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls = 0
+
+    async def resolve_locality(self, _task):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def _locality_result(*, candidates=()) -> LocalityBrowserResult:
+    return LocalityBrowserResult(
+        spec_sha256="a" * 64,
+        request_sha256="b" * 64,
+        candidates=list(candidates),
+    )
+
+
+def _locality_candidate(name: str) -> LocalityCandidate:
+    return LocalityCandidate(
+        canonical_name=name,
+        place_type="landmark",
+        city="Алматы",
+        source=ResearchSource.TWO_GIS,
+        provider_place_id="place-1",
+        source_url="https://2gis.kz/almaty/geo/123",
+        raw_snapshot_sha256="c" * 64,
+        confidence=0.9,
+    )
+
+
+@pytest.mark.asyncio
+async def test_locality_nonempty_primary_result_is_preserved() -> None:
+    primary_result = _locality_result(candidates=[_locality_candidate("Северное кольцо")])
+    primary = _LocalityPrimary(result=primary_result)
+    fallback = _LocalityFallback(result=_locality_result())
+    provider = TwoGisFallbackProvider(primary, fallback)  # type: ignore[arg-type]
+
+    assert await provider.resolve_locality(object()) is primary_result
+    assert primary.calls == 1
+    assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_locality_result_uses_fallback_once() -> None:
+    primary = _LocalityPrimary(result=_locality_result())
+    fallback_result = _locality_result(candidates=[_locality_candidate("Северное кольцо")])
+    fallback = _LocalityFallback(result=fallback_result)
+    provider = TwoGisFallbackProvider(primary, fallback)  # type: ignore[arg-type]
+
+    assert await provider.resolve_locality(object()) is fallback_result
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        UnsafeBrowserResult("invalid locality evidence"),
+        RetryableProviderError("AGY browser CLI timeout"),
+        PermanentProviderError("AGY browser result_json is invalid JSON"),
+        ValidationError.from_exception_data("LocalityBrowserResult", []),
+    ],
+)
+async def test_locality_operational_or_validation_failure_uses_fallback(error: Exception) -> None:
+    primary = _LocalityPrimary(error=error)
+    fallback_result = _locality_result(candidates=[_locality_candidate("Северное кольцо")])
+    fallback = _LocalityFallback(result=fallback_result)
+    provider = TwoGisFallbackProvider(primary, fallback)  # type: ignore[arg-type]
+
+    assert await provider.resolve_locality(object()) is fallback_result
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_locality_fallback_failure_propagates_without_retry_loop() -> None:
+    primary = _LocalityPrimary(result=_locality_result())
+    fallback_error = RetryableProviderError("Codex Chrome fallback timed out")
+    fallback = _LocalityFallback(error=fallback_error)
+    provider = TwoGisFallbackProvider(primary, fallback)  # type: ignore[arg-type]
+
+    with pytest.raises(RetryableProviderError, match="Codex Chrome fallback timed out"):
+        await provider.resolve_locality(object())
+    assert primary.calls == 1
+    assert fallback.calls == 1
 
 
 @pytest.mark.asyncio

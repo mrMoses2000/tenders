@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from procurement_bot.providers.browser import (
     StructuredBrowserProvider,
     UnsafeBrowserResult,
 )
+from procurement_bot.providers.codex_chrome import CodexChromeExecutor
 from procurement_bot.research import (
     AvailabilityStatus,
     ContactKind,
@@ -70,6 +72,38 @@ def test_prepare_is_pure_and_contains_safety_contract():
     assert "untrusted data" in call.trusted_instruction
     assert "Do not send messages" in call.trusted_instruction
     assert "budget/tender price" in call.trusted_instruction
+    assert "highway, market area" in call.trusted_instruction
+    assert "not supplier search" in call.trusted_instruction
+
+
+@pytest.mark.asyncio
+async def test_codex_can_verify_locality_without_a_supplier_plan(monkeypatch):
+    call = StructuredBrowserProvider(StaticBrowserExecutor({})).prepare_locality(
+        LocalityResearchTask(city="Алматы", phrase="Северное Кольцо")
+    )
+    executor = CodexChromeExecutor(executable=Path("/bin/true"))
+    seen = []
+
+    async def invoke(prepared, *, source, direct_firm_card):
+        seen.append((prepared.operation, source, direct_firm_card))
+        return {"spec_sha256": prepared.spec_sha256,
+                "request_sha256": prepared.request_sha256,
+                "candidates": [], "pages_examined": 1}
+
+    monkeypatch.setattr(executor, "_invoke", invoke)
+    result = await executor.execute(call)
+    assert seen == [(call.operation, "2gis", False)]
+    assert StructuredBrowserProvider(executor).accept_locality(call, result).pages_examined == 1
+
+
+def test_empty_locality_without_page_inspection_is_an_operational_error():
+    provider = StructuredBrowserProvider(StaticBrowserExecutor({}))
+    call = provider.prepare_locality(LocalityResearchTask(city="Алматы", phrase="Алматы 1"))
+    with pytest.raises(UnsafeBrowserResult, match="inspected no pages"):
+        provider.accept_locality(call, {
+            "spec_sha256": call.spec_sha256, "request_sha256": call.request_sha256,
+            "candidates": [], "access_issue": "mcp_error",
+        })
 
 
 def test_2gis_instruction_routes_site_and_instagram_to_product_evidence():

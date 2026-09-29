@@ -1307,6 +1307,10 @@ class JobWorker:
                     payload={
                         "chat_id": int(chat_id),
                         "text": (
+                            "Техническая ошибка при обработке сообщения. Ваш текст сохранён."
+                            if job.kind == "process_intake"
+                            and job.payload.get("input_kind", "text") == "text"
+                            else
                             "Не удалось обработать материал автоматически. "
                             "Попробуйте другой файл или пришлите данные текстом."
                         ),

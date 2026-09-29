@@ -325,6 +325,7 @@ class IntakeService:
             and open_clarification is not None
             and open_clarification.topic in {
                 "city_missing", "search_scope_missing", "search_area_missing",
+                "locality_resolution",
             }
         )
         model_current = current
