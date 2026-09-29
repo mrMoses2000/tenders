@@ -114,6 +114,18 @@ function detailField(key, value, column) {
   row.append(el("span", "", key), el("strong", "", value));
   return row;
 }
+function twoGisFirmCardUrl(sourceProvider, placeId, sourceUrl) {
+  if (sourceProvider !== "2gis" || !/^\d{5,30}$/.test(String(placeId || ""))) return null;
+  try {
+    const origin = new URL(sourceUrl);
+    if (origin.protocol !== "https:" || origin.hostname !== "2gis.kz") return null;
+    const city = origin.pathname.split("/")[1];
+    if (!/^[a-z0-9_-]+$/i.test(city || "")) return null;
+    return "https://2gis.kz/" + city + "/firm/" + placeId;
+  } catch (_) {
+    return null;
+  }
+}
 function offerCard(offer, context = {}) {
   const line = el("div", "offer-line");
   const top = el("div", "offer-top");
@@ -160,6 +172,16 @@ function offerCard(offer, context = {}) {
     source.target = "_blank";
     source.rel = "noopener noreferrer";
     line.append(source);
+  }
+  const firmCard = twoGisFirmCardUrl(
+    offer.source_provider, offer.provider_place_id, offer.location_source_url
+  );
+  if (firmCard) {
+    const link = el("a", "offer-source", "Карточка фирмы в 2ГИС ↗");
+    link.href = firmCard;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    line.append(link);
   }
   if (offer.supplier_id) line.append(supplierDetails(offer.supplier_id, offer.id));
   if (context.caseId && context.editable) line.append(technicalReviewPanel(offer, context));
@@ -411,9 +433,20 @@ function supplierDetails(supplierId, offerId = null) {
         }
         content.append(row);
       });
-      (data.locations || []).slice(0, 5).forEach(location => content.append(detailField(
-        "Адрес", [location.city, location.address_text, location.market_name,
-          location.pavilion].filter(Boolean).join(", ") || "Не указан")));
+      (data.locations || []).slice(0, 5).forEach(location => {
+        content.append(detailField("Адрес", [location.city, location.address_text,
+          location.market_name, location.pavilion].filter(Boolean).join(", ") || "Не указан"));
+        const firmCard = twoGisFirmCardUrl(
+          location.source_provider, location.provider_place_id, location.source_url
+        );
+        if (firmCard) {
+          const link = el("a", "offer-source", "Карточка фирмы в 2ГИС ↗");
+          link.href = firmCard;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          content.append(link);
+        }
+      });
     } catch (error) {
       loaded = false;
       content.replaceChildren(el("p", "entry-feedback", error.message));

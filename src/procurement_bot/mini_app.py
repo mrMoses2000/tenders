@@ -399,6 +399,8 @@ async def case_detail(request: web.Request) -> web.Response:
             SELECT o.id,o.request_item_id,o.supplier_id,o.status,
                    o.supplier_product_name,o.model_sku,
                    s.display_name AS supplier_name,sl.city AS supplier_city,
+                   sl.source_provider,sl.provider_place_id,
+                   location_evidence.source_url AS location_source_url,
                    priced.price_amount,priced.currency,
                    COALESCE(terms.price_unit,priced.price_unit) AS price_unit,
                    COALESCE(terms.pack_qty,priced.pack_qty) AS pack_qty,
@@ -421,6 +423,8 @@ async def case_detail(request: web.Request) -> web.Response:
             JOIN request_items i ON i.id=o.request_item_id
             JOIN suppliers s ON s.id=o.supplier_id
             LEFT JOIN supplier_locations sl ON sl.id=o.supplier_location_id
+            LEFT JOIN source_evidence location_evidence
+              ON location_evidence.id=sl.source_evidence_id
             LEFT JOIN LATERAL (
                 SELECT ob.*,se.source_url
                 FROM offer_observations ob
