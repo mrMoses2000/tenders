@@ -179,12 +179,13 @@ async def persist_intake_result(
             INSERT INTO case_parse_versions(
                 case_id,source_message_id,source_extraction_id,version,
                 parser_name,parser_version,normalized_payload,status,applied_at
-            ) VALUES ($1,$2,$3,$4,'agy-intake','1',$5::jsonb,'applied',now())
+            ) VALUES ($1,$2,$3,$4,$5,'1',$6::jsonb,'applied',now())
             """,
             case_id,
             message_id,
             source_extraction_id,
             version,
+            result.parser_name,
             payload,
         )
         await _replace_item_projection(connection, case_id, result)
@@ -294,6 +295,16 @@ async def _replace_item_projection(
                 requirement.hard_requirement,
                 requirement.source_reference or "",
                 requirement.confidence,
+            )
+        if result.ready_to_search and item.tender_unit_price_private is not None:
+            await connection.execute(
+                """
+                INSERT INTO request_item_financials(
+                    request_item_id,tender_unit_price_private,currency,source_system
+                ) VALUES ($1,$2,'KZT','document')
+                """,
+                item_id,
+                item.tender_unit_price_private,
             )
 
 

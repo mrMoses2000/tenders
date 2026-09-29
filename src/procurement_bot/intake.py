@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from decimal import Decimal
+import re
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
@@ -51,6 +52,10 @@ class ProcurementItem(StrictModel):
     name: CleanText | None = Field(default=None, max_length=500)
     quantity: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
     unit: CleanText | None = Field(default=None, max_length=80)
+    tender_unit_price_private: Decimal | None = Field(
+        default=None, ge=0, max_digits=16, decimal_places=4,
+        description="Explicit customer tender unit price; never a supplier quote; unknown is null",
+    )
     requirements: list[ProcurementRequirement] = Field(default_factory=list, max_length=100)
     analogs_allowed: bool | None = None
     source_reference: CleanText | None = Field(default=None, max_length=240)
@@ -89,6 +94,19 @@ class ProcurementRequestPatch(StrictModel):
     spec_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     request: ParsedProcurementRequest
+
+
+class ProcurementLocationPatch(StrictModel):
+    """Small response for the location question; it cannot replace product rows."""
+
+    spec_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    city: CleanText | None = Field(default=None, max_length=160)
+    search_scope: SearchScope | None = None
+    search_area_text: CleanText | None = Field(default=None, max_length=500)
+    transcript_ambiguous: bool = False
+    ambiguous_fields: list[CleanText] = Field(default_factory=list, max_length=30)
+    warnings: list[CleanText] = Field(default_factory=list, max_length=30)
 
 
 class IntakeClarificationContext(StrictModel):
@@ -143,7 +161,22 @@ def _merge_request(
         if value is not None:
             update[field_name] = value
     if proposal.items:
-        update["items"] = proposal.items
+        prior_by_source = {
+            item.source_reference: item
+            for item in current.items
+            if item.source_reference
+        }
+        update["items"] = [
+            item.model_copy(update={
+                "tender_unit_price_private": prior_by_source[
+                    item.source_reference
+                ].tender_unit_price_private
+            })
+            if item.tender_unit_price_private is None
+            and item.source_reference in prior_by_source
+            else item
+            for item in proposal.items
+        ]
     update["transcript_ambiguous"] = proposal.transcript_ambiguous
     # These are extraction-state flags, not facts: a later clarification must be
     # able to clear them deterministically.
@@ -173,6 +206,97 @@ class IntakeResult(StrictModel):
     clarifications: list[str] = Field(default_factory=list)
     applied_defaults: dict[str, str] = Field(default_factory=dict)
     ready_to_search: bool
+    parser_name: str = "agy-intake"
+
+
+_TABLE_ROW = re.compile(
+    r"\[(table:\d+:row:\d+)\]\n(.*?)(?=\n\n\[[^\]]+\]\n|\Z)",
+    re.DOTALL,
+)
+
+
+def _table_decimal(value: str) -> Decimal | None:
+    normalized = value.strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        number = Decimal(normalized) if normalized else None
+        return number if number is None or number.is_finite() else None
+    except InvalidOperation:
+        return None
+
+
+def _parse_priced_table(text: str) -> ParsedProcurementRequest | None:
+    """Read explicit seven-column tender rows without inferring search locality."""
+    rows = [
+        (locator, content.rstrip())
+        for locator, content in _TABLE_ROW.findall(text)
+    ]
+    item_tables: set[str] = set()
+    for locator, content in rows:
+        header = [part.strip().lower() for part in content.split(" | ")]
+        if len(header) == 7 and (
+            "наименование" in header[1]
+            and "ед." in header[2]
+            and "кол-во" in header[3]
+            and "цена" in header[4]
+            and "стоимость" in header[5]
+            and "характеристика" in header[6]
+        ):
+            item_tables.add(locator.split(":")[1])
+    if not item_tables:
+        return None
+
+    items: list[ProcurementItem] = []
+    delivery_address: str | None = None
+    deadline_text: str | None = None
+    for locator, content in rows:
+        cells = [part.strip() for part in content.split(" | ", 6)]
+        if len(cells) == 2 and not cells[0] and "Республика Казахстан" in cells[1]:
+            delivery_address = cells[1][:500]
+        if len(cells) == 2 and cells[0].lower() == "срок поставки":
+            deadline_text = cells[1][:240]
+        if locator.split(":")[1] not in item_tables:
+            continue
+        if not re.fullmatch(r"\d+", cells[0]):
+            continue
+        if len(cells) != 7 or not cells[1] or int(cells[0]) != len(items) + 1:
+            return None
+        quantity = _table_decimal(cells[3])
+        if quantity is None or quantity <= 0:
+            return None
+        price = _table_decimal(cells[4])
+        if (cells[4] and price is None) or (price is not None and price < 0):
+            return None
+        spec = cells[6]
+        if len(spec) > 1000:
+            return None
+        requirements = [
+            ProcurementRequirement(
+                name="Техническая характеристика",
+                expected_value=spec,
+                source_reference=locator,
+            )
+        ] if spec else []
+        try:
+            items.append(
+                ProcurementItem(
+                    name=cells[1],
+                    quantity=quantity,
+                    unit=cells[2] or None,
+                    tender_unit_price_private=price,
+                    requirements=requirements,
+                    source_reference=locator,
+                )
+            )
+        except ValueError:
+            return None
+    if not items or len(items) > 200:
+        return None
+    return ParsedProcurementRequest(
+        source_type=SourceType.DOCUMENT,
+        delivery_address=delivery_address,
+        deadline_text=deadline_text,
+        items=items,
+    )
 
 
 class IntakeService:
@@ -195,7 +319,18 @@ class IntakeService:
         from procurement_bot.dialogue import apply_search_scope_policy, evaluate_missing_blockers
 
         source = SourceType(source_type)
-        context_json, _ = request_context_hash(current)
+        location_reply = (
+            source in {SourceType.TEXT, SourceType.VOICE}
+            and current is not None
+            and open_clarification is not None
+            and open_clarification.topic in {
+                "city_missing", "search_scope_missing", "search_area_missing",
+            }
+        )
+        model_current = current
+        if location_reply:
+            model_current = current.model_copy(update={"items": []})
+        context_json, _ = request_context_hash(model_current)
         trusted_context = {
             "current_request": json.loads(context_json),
             "input_source_type": source.value,
@@ -207,13 +342,41 @@ class IntakeService:
         }
         # Hash exactly what is supplied to the model, including the transport source.
         _, model_context_sha256 = canonical_json_hash(trusted_context)
-        patch = await self.extractor.extract(
-            text,
-            ProcurementRequestPatch,
-            context=trusted_context,
-            spec_sha256=INTAKE_SPEC_SHA256,
-            context_sha256=model_context_sha256,
-        )
+        tabular = _parse_priced_table(text) if source == SourceType.DOCUMENT else None
+        if tabular is not None and current is None:
+            patch = ProcurementRequestPatch(
+                spec_sha256=INTAKE_SPEC_SHA256,
+                context_sha256=model_context_sha256,
+                request=tabular,
+            )
+        elif location_reply:
+            location = await self.extractor.extract(
+                text,
+                ProcurementLocationPatch,
+                context=trusted_context,
+                spec_sha256=INTAKE_SPEC_SHA256,
+                context_sha256=model_context_sha256,
+            )
+            patch = ProcurementRequestPatch(
+                spec_sha256=location.spec_sha256,
+                context_sha256=location.context_sha256,
+                request=ParsedProcurementRequest(
+                    city=location.city,
+                    search_scope=location.search_scope,
+                    search_area_text=location.search_area_text,
+                    transcript_ambiguous=location.transcript_ambiguous,
+                    ambiguous_fields=location.ambiguous_fields,
+                    warnings=location.warnings,
+                ),
+            )
+        else:
+            patch = await self.extractor.extract(
+                text,
+                ProcurementRequestPatch,
+                context=trusted_context,
+                spec_sha256=INTAKE_SPEC_SHA256,
+                context_sha256=model_context_sha256,
+            )
         merged = apply_intake_patch(
             current,
             patch,
@@ -230,4 +393,9 @@ class IntakeService:
             clarifications=report.questions,
             applied_defaults=applied_defaults,
             ready_to_search=report.ready_to_search,
+            parser_name=(
+                "priced-table-intake"
+                if tabular is not None and current is None
+                else "agy-intake"
+            ),
         )
