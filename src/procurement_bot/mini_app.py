@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -59,6 +60,7 @@ from procurement_bot.outreach_batch import (
     OutreachBatchConflict,
     approve_initial_outreach_batch,
     load_initial_outreach_drafts,
+    refresh_initial_outreach_drafts,
 )
 from procurement_bot.queue import enqueue_job, stable_key
 from procurement_bot.research_workflow import ResearchStartDenied
@@ -892,6 +894,27 @@ async def approve_outreach_drafts(request: web.Request) -> web.Response:
         return _json(request, {"error": str(exc)}, status=400)
 
 
+async def refresh_outreach_drafts(request: web.Request) -> web.Response:
+    """Return replacement exact texts for a separate owner approval step."""
+
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        body = await _body(request)
+        raw_ids = body.get("approval_ids")
+        if not isinstance(raw_ids, list) or not 1 <= len(raw_ids) <= 10:
+            raise OutreachBatchConflict("Выберите от 1 до 10 сообщений")
+        approval_ids = [_uuid(value) for value in raw_ids]
+        pool: asyncpg.Pool = request.app["pool"]
+        async with pool.acquire() as connection:
+            refreshed = await refresh_initial_outreach_drafts(
+                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                approval_ids=approval_ids,
+            )
+        return _json(request, {"drafts": [asdict(draft) for draft in refreshed]})
+    except (ValueError, OutreachBatchConflict) as exc:
+        return _json(request, {"error": str(exc)}, status=400)
+
+
 def _uuid(value: object) -> UUID:
     if not isinstance(value, str):
         raise ValueError("Неверный идентификатор")
@@ -1463,6 +1486,10 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_post(
         "/api/cases/{case_id}/outreach/approve",
         approve_outreach_drafts,
+    )
+    app.router.add_post(
+        "/api/cases/{case_id}/outreach/refresh",
+        refresh_outreach_drafts,
     )
     app.router.add_post("/api/cases/{case_id}/purchases", add_purchase)
     app.router.add_post("/api/cases/{case_id}/closure", change_case_status)

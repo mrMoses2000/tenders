@@ -5,12 +5,45 @@ from uuid import uuid4
 
 import pytest
 
-from procurement_bot.supplier_outreach import _quantity, prepare_supplier_outreach
+from procurement_bot.supplier_outreach import (
+    _quantity,
+    prepare_supplier_outreach,
+    product_label,
+)
 
 
 def test_supplier_quantity_is_readable() -> None:
     assert _quantity(Decimal("40.000000"), "Штука") == "40 шт."
     assert _quantity(Decimal("1.000000"), "кг") == "1 кг"
+
+
+def test_generic_catalog_name_uses_short_product_identity_from_spec() -> None:
+    spec = (
+        "Плита для потолка АРМСТРОНГ. Потолочная панель декоративная "
+        "тепло- и звукоизоляционная, 60 x 60 см. По согласованию с заказчиком"
+    )
+    assert product_label("Плитка", spec) == "потолочная панель Armstrong"
+
+
+def test_pilot_messages_name_actual_products_from_spec() -> None:
+    assert product_label("Пакля", "Лён сантехнический, коса 1кг.") == "Лён сантехнический"
+    assert product_label("Доводчик дверной", "Петля с доводчиком для ДСП, серебряный") == (
+        "Петля с доводчиком для ДСП"
+    )
+    assert product_label(
+        "Машина стационарная для сварки", "Аппарат для сварки пластиковых труб 2000 Вт."
+    ) == "Аппарат для сварки пластиковых труб 2000 Вт"
+
+
+def test_product_label_never_copies_a_long_specification() -> None:
+    label = product_label(
+        "Кабель",
+        "Кабель силовой медный для внутренней прокладки, сечение 3х2.5 мм2, "
+        "изоляция ПВХ, цвет белый, напряжение 220В, сертификат соответствия",
+    )
+    assert len(label) <= 72
+    assert "сечение" not in label
+    assert "сертификат" not in label
 
 
 class _Transaction(AbstractAsyncContextManager[None]):

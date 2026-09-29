@@ -34,6 +34,11 @@ def test_telegram_allowlist_is_deny_by_default():
         settings.require_telegram_allowed_user_ids()
 
 
+def test_codex_browser_timeout_covers_eight_listing_fallback() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.codex_2gis_timeout_seconds == 900
+
+
 def test_telegram_allowlist_parses_comma_separated_ids():
     settings = Settings(_env_file=None, TELEGRAM_ALLOWED_USER_IDS="123, 456,123")
     assert settings.require_telegram_allowed_user_ids() == {123, 456}

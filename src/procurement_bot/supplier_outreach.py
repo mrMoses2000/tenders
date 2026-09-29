@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -211,18 +212,15 @@ async def prepare_supplier_outreach(
                     ),
                 ),
             )
-            inquiry = SupplierInquiry(
-                product_name=str(candidate["name"]),
-                quantity=_quantity(candidate["quantity"], candidate["unit"]),
-                required_spec=(
-                    str(candidate["specification_text"]).strip()
-                    or "требования из заявки"
-                ),
-            )
             command = WhatsAppSendCommand(
                 case_id=case_id,
                 recipient=recipient,
-                text=build_availability_inquiry(inquiry, "ru"),
+                text=initial_inquiry_text(
+                    str(candidate["name"]),
+                    str(candidate["specification_text"] or ""),
+                    candidate["quantity"],
+                    candidate["unit"],
+                ),
                 conversation_id=conversation.id,
                 logical_action_id=f"initial-availability:{candidate['offer_id']}",
             )
@@ -295,3 +293,75 @@ def _quantity(value: Decimal | None, unit: str | None) -> str:
     }.get(normalize_goods_unit(unit), str(unit or "").strip())
     suffix = f" {display_unit}" if display_unit else ""
     return quantity + suffix
+
+
+_GENERIC_ITEM_NAMES = frozenset(
+    {
+        "товар", "позиция", "изделие", "продукция", "материал", "плитка",
+        "кабель", "труба", "краска", "лист", "плита", "панель", "крепеж",
+        "крепёж", "оборудование", "инструмент", "смесь",
+    }
+)
+_DETAIL_START = re.compile(
+    r"\b(?:размер(?:ы)?|толщин\w*|ширин\w*|длин\w*|цвет\w*|материал\w*|"
+    r"характеристик\w*|техническ\w*|предназначен\w*|соответств\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def product_label(item_name: str, specification_text: str = "") -> str:
+    """Return a short supplier-facing name, never the full tender specification.
+
+    Prefer the first concise product phrase in the specification when present.
+    The full specification remains reserved for the follow-up after the
+    supplier confirms availability.
+    """
+
+    name = " ".join(item_name.split()).strip(" .,:;—-")
+    spec = " ".join(specification_text.split()).strip()
+    if spec:
+        if "армстронг" in spec.casefold() and any(
+            token in spec.casefold() for token in ("потол", "плит", "панел")
+        ):
+            return "потолочная панель Armstrong"
+        candidate = re.split(r"[.,;!?\n]", spec, maxsplit=1)[0]
+        detail = _DETAIL_START.search(candidate)
+        if detail:
+            candidate = candidate[: detail.start()]
+        candidate = candidate.strip(" .,:;—-")
+        if (
+            len(candidate.split()) >= 2
+            and candidate.casefold() not in _GENERIC_ITEM_NAMES
+            and not candidate.casefold().startswith((
+                "по согласованию", "техническая спецификация", "технические характеристики",
+            ))
+        ):
+            return _short_label(candidate)
+
+    return _short_label(name) if name else "товар из заявки"
+
+
+def initial_inquiry_text(
+    item_name: str,
+    specification_text: str,
+    quantity: Decimal | None,
+    unit: str | None,
+) -> str:
+    """Build the current version of an availability-first supplier message."""
+
+    inquiry = SupplierInquiry(
+        product_name=product_label(item_name, specification_text),
+        quantity=_quantity(quantity, unit),
+        required_spec=specification_text.strip() or "требования из заявки",
+    )
+    return build_availability_inquiry(inquiry, "ru")
+
+
+def _short_label(value: str) -> str:
+    """Cap labels so a long technical sentence cannot become a copied spec."""
+
+    words = value.split()[:9]
+    label = " ".join(words).strip(" .,:;—-")
+    if len(label) > 72:
+        label = label[:72].rsplit(" ", maxsplit=1)[0].strip(" .,:;—-")
+    return label or "товар из заявки"

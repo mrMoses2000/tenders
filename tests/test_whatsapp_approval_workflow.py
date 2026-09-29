@@ -162,6 +162,28 @@ async def test_approved_send_is_consumed_and_enqueued_atomically() -> None:
 
 
 @pytest.mark.asyncio
+async def test_old_initial_text_cannot_reach_whatsapp_outbox() -> None:
+    class InitialConnection(FakeConnection):
+        async def fetchrow(self, query: str, *args: object):
+            if "FROM supplier_conversation_targets" in query:
+                return {
+                    "name": "Плитка", "specification_text": "Потолочная плитка Армстронг",
+                    "quantity": 40, "unit": "Штука",
+                }
+            return await super().fetchrow(query, *args)
+
+    connection = InitialConnection()
+    connection.payload["logical_action_id"] = f"initial-availability:{uuid4()}"
+    connection.payload["text"] = "Плитка, количество 40. Есть ли?"
+    connection.approval["payload_sha256"] = payload_sha256(connection.payload)
+
+    with pytest.raises(WhatsAppSendDenied, match="черновик устарел"):
+        await start_approved_whatsapp_send(connection, connection.approval_id)
+    assert connection.outbox is None
+    assert connection.approval_updates == 0
+
+
+@pytest.mark.asyncio
 async def test_consumed_retry_through_pool_returns_only_exact_existing_outbox() -> None:
     connection = FakeConnection()
     pool = FakePool(connection)

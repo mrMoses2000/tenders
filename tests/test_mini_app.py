@@ -12,6 +12,7 @@ import pytest
 from procurement_bot.mini_app import (
     add_item_requirement,
     parse_item_requirement,
+    refresh_outreach_drafts,
     validate_public_url,
     verify_init_data,
 )
@@ -158,3 +159,29 @@ async def test_item_requirement_route_is_owner_scoped_and_additive(monkeypatch) 
     foreign_response = await add_item_requirement(foreign_request)
     assert foreign_response.status == 400
     assert not foreign_request.app["pool"].connection.inserted_requirement
+
+
+@pytest.mark.asyncio
+async def test_refresh_outreach_route_returns_unapproved_replacement(monkeypatch) -> None:
+    import procurement_bot.mini_app as mini_app
+    from procurement_bot.outreach_batch import RefreshedOutreachDraft
+
+    approval_id = uuid4()
+    request = _RequirementRequest({"approval_ids": [str(approval_id)]})
+    seen = {}
+
+    async def refresh(_connection, **kwargs):
+        seen.update(kwargs)
+        return [RefreshedOutreachDraft(
+            approval_id=uuid4(), request_item_id=uuid4(), item_name="Плитка",
+            supplier_name="Магазин", recipient="+77000000000", text="Точный текст",
+        )]
+
+    monkeypatch.setattr(mini_app, "refresh_initial_outreach_drafts", refresh)
+    response = await refresh_outreach_drafts(request)
+    payload = json.loads(response.text)
+    assert response.status == 200
+    assert seen["case_id"] == UUID(request.match_info["case_id"])
+    assert seen["owner_user_id"] == request.owner_id
+    assert seen["approval_ids"] == [approval_id]
+    assert payload["drafts"][0]["text"] == "Точный текст"

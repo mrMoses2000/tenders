@@ -21,6 +21,7 @@ from procurement_bot.supplier_dialogue import (
     assert_send_allowed,
     assert_supplier_safe_text,
 )
+from procurement_bot.supplier_outreach import initial_inquiry_text
 
 _APPROVAL_ACTION = "send_whatsapp"
 _OUTBOX_EVENT = "whatsapp.send_text"
@@ -175,6 +176,32 @@ async def _connection(
 
 def _now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+async def initial_draft_is_current(
+    connection: asyncpg.Connection, *, case_id: UUID, conversation_id: UUID,
+    logical_action_id: str, text: str,
+) -> bool:
+    """Check the exact first-contact text against the current item facts."""
+
+    if not logical_action_id.startswith("initial-availability:"):
+        return True
+    try:
+        offer_id = UUID(logical_action_id.removeprefix("initial-availability:"))
+    except ValueError:
+        return False
+    item = await connection.fetchrow(
+        """SELECT item.name,item.specification_text,item.quantity,item.unit
+           FROM supplier_conversation_targets AS target
+           JOIN request_items AS item ON item.id=target.request_item_id
+           WHERE target.conversation_id=$1 AND target.offer_id=$2
+             AND item.case_id=$3""",
+        conversation_id, offer_id, case_id,
+    )
+    return item is not None and text == initial_inquiry_text(
+        str(item["name"]), str(item["specification_text"] or ""),
+        item["quantity"], item["unit"],
+    )
 
 
 async def _existing_exact_outbox(
@@ -336,6 +363,13 @@ async def start_approved_whatsapp_send(
             raise WhatsAppSendDenied("persisted WhatsApp contact is invalid") from exc
         if persisted_recipient != normalize_phone(payload.recipient):
             raise WhatsAppSendDenied("approved recipient does not match the conversation contact")
+
+        if not await initial_draft_is_current(
+            connection, case_id=payload.case_id,
+            conversation_id=payload.conversation_id,
+            logical_action_id=payload.logical_action_id, text=payload.text,
+        ):
+            raise WhatsAppSendDenied("Первый черновик устарел; обновите текст в заявке")
 
         context = SendContext(
             enabled=True,

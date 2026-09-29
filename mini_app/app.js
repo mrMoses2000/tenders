@@ -1109,18 +1109,24 @@ function outreachDraftsPanel(caseId, drafts, enabled) {
   const content = el("div", "outreach-drafts-content");
   content.append(el("p", "data-note", "Проверьте получателя и текст. Нажатие «Одобрить и отправить» " +
     "передаст выбранные сообщения в очередь WhatsApp. За раз можно выбрать до 10. " +
-    "Отправка доступна с 09:00 до 20:00 по Алматы."));
+    "Отправка доступна с 09:00 до 20:00 по Алматы. Устаревшие тексты сначала " +
+    "обновите, затем прочитайте новые черновики и одобрите отдельно."));
   if (drafts.length > 300) content.append(el("p", "data-note", "Показаны первые 301 черновик."));
   if (!enabled) content.append(el("p", "entry-feedback", "WhatsApp отправка сейчас выключена."));
   const selected = new Set();
   const controls = el("div", "outreach-controls");
   const selectTen = el("button", "entry-submit", "Выбрать 10");
+  const refresh = el("button", "entry-submit", "Обновить текст");
   const approve = el("button", "entry-submit", "Одобрить и отправить");
-  selectTen.type = approve.type = "button";
-  approve.disabled = true;
+  selectTen.type = refresh.type = approve.type = "button";
+  refresh.disabled = approve.disabled = true;
   const checkboxes = [];
   function update() {
-    approve.disabled = !enabled || !selected.size;
+    const chosen = drafts.filter(draft => selected.has(draft.approval_id));
+    const stale = chosen.filter(draft => draft.needs_refresh);
+    refresh.disabled = !selected.size || stale.length !== chosen.length;
+    approve.disabled = !enabled || !selected.size || stale.length > 0;
+    refresh.textContent = "Обновить текст · " + selected.size;
     approve.textContent = "Одобрить и отправить · " + selected.size;
   }
   selectTen.addEventListener("click", () => {
@@ -1143,7 +1149,19 @@ function outreachDraftsPanel(caseId, drafts, enabled) {
       update();
     }
   });
-  controls.append(selectTen, approve);
+  refresh.addEventListener("click", async () => {
+    refresh.disabled = true;
+    try {
+      await apiWrite("/api/cases/" + caseId + "/outreach/refresh", {
+        approval_ids: [...selected]
+      });
+      await openDetail(caseId);
+    } catch (error) {
+      content.append(el("p", "entry-feedback", error.message));
+      update();
+    }
+  });
+  controls.append(selectTen, refresh, approve);
   content.append(controls);
   drafts.forEach(draft => {
     const row = el("label", "outreach-draft");
@@ -1165,6 +1183,7 @@ function outreachDraftsPanel(caseId, drafts, enabled) {
       " · " + draft.supplier_name));
     text.append(el("small", "", draft.recipient +
       (new Date(draft.expires_at) <= new Date() ? " · прежнее одобрение истекло" : "")));
+    if (draft.needs_refresh) text.append(el("small", "entry-feedback", "Текст нужно обновить перед отправкой"));
     text.append(el("p", "", draft.text));
     row.append(checkbox, text);
     content.append(row);

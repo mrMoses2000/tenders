@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     codex_2gis_executable: Path = Path("/home/moses/.local/bin/codex")
     codex_2gis_model: str = "gpt-6-luna"
     codex_2gis_reasoning_effort: Literal["low", "medium", "high"] = "high"
-    codex_2gis_timeout_seconds: int = Field(default=600, ge=30, le=1800)
+    codex_2gis_timeout_seconds: int = Field(default=900, ge=30, le=1800)
 
     voice_provider: str = "assemblyai"
     assemblyai_env_file: Path = Path("/home/moses/audio_transcription/.env")
