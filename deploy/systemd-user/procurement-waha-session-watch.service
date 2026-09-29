@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover failed procurement WAHA session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/moses/tenders
+EnvironmentFile=/home/moses/tenders/.env
+ExecStart=/home/moses/tenders/.venv/bin/python /home/moses/tenders/scripts/watch_waha_session.py
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/moses/tenders/var/run

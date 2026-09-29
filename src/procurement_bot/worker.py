@@ -953,6 +953,7 @@ class JobWorker:
                             idempotency_key=stable_key(
                                 "prepare-supplier-outreach", result.case_id, run_id,
                             ),
+                            max_attempts=20,
                         )
 
     async def _enrich_2gis_contact(self, payload: dict[str, Any]) -> None:
@@ -988,6 +989,7 @@ class JobWorker:
                     idempotency_key=stable_key(
                         "outreach-after-contact-enrichment", case_id, supplier_id,
                     ),
+                    max_attempts=20,
                 )
 
     async def _prepare_supplier_outreach(self, payload: dict[str, Any]) -> None:
@@ -1262,6 +1264,7 @@ class JobWorker:
                     kind="prepare_supplier_outreach",
                     payload={"case_id": str(result.case_id)},
                     idempotency_key=stable_key("outreach-after-reply", message_id),
+                    max_attempts=20,
                 )
 
     async def _record_terminal_failure(self, job: ClaimedJob, error_code: str) -> None:

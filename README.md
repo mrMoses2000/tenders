@@ -222,6 +222,16 @@ CAPTCHA: Chrome-плагин требует подтверждения непо�
 ```
 
 Файл `var/waha-qr.png` является краткоживущим секретом сопряжения и имеет права `600`.
+Если сессия WAHA временно переходит в `FAILED`, отдельный таймер раз в пять
+минут проверяет локальный API и запрашивает restart не чаще раза в 30 минут.
+Он не отправляет сообщений и не трогает состояния QR/входа. На новом хосте:
+
+```bash
+install -d -m 700 var/run
+systemctl --user link deploy/systemd-user/procurement-waha-session-watch.service
+systemctl --user link deploy/systemd-user/procurement-waha-session-watch.timer
+systemctl --user enable --now procurement-waha-session-watch.timer
+```
 
 Research и WhatsApp send approval-кнопки разделены: разрешение на поиск не даёт разрешения
 писать поставщику. Текущий WAHA-адаптер fail-closed; каждый исходящий payload согласуется
