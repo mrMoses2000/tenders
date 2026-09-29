@@ -3,11 +3,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from contextlib import asynccontextmanager
 from urllib.parse import urlencode
+from uuid import UUID, uuid4
 
 import pytest
 
-from procurement_bot.mini_app import validate_public_url, verify_init_data
+from procurement_bot.mini_app import (
+    add_item_requirement,
+    parse_item_requirement,
+    validate_public_url,
+    verify_init_data,
+)
 
 
 def _signed_data(token: str, *, auth_date: int, user_id: int) -> str:
@@ -38,3 +45,116 @@ def test_public_url_requires_https_and_normalizes_path() -> None:
         validate_public_url("http://example.com/miniapp")
     with pytest.raises(ValueError):
         validate_public_url("https://example.com/miniapp?token=unsafe")
+
+
+def test_item_requirement_requires_an_explicit_source_and_valid_fields() -> None:
+    requirement = parse_item_requirement({
+        "requirement_key": "Диаметр трубы",
+        "expected_value": "20",
+        "unit": "мм",
+        "operator": "minimum",
+        "is_hard": True,
+        "source_pointer": "ТЗ, пункт 3.2",
+    })
+    assert requirement == {
+        "requirement_key": "Диаметр трубы",
+        "expected_value": {"value": "20", "unit": "мм"},
+        "operator": "minimum",
+        "is_hard": True,
+        "source_pointer": "ТЗ, пункт 3.2",
+    }
+    with pytest.raises(ValueError, match="источник"):
+        parse_item_requirement({
+            "requirement_key": "Диаметр трубы", "expected_value": "20",
+        })
+    with pytest.raises(ValueError, match="оператор"):
+        parse_item_requirement({
+            "requirement_key": "Диаметр трубы", "expected_value": "20",
+            "source_pointer": "ТЗ, пункт 3.2", "operator": "delete",
+        })
+
+
+class _RequirementRequest:
+    def __init__(self, body, *, item_exists=True):
+        self.match_info = {"case_id": str(uuid4()), "item_id": str(uuid4())}
+        self.app = {"pool": _RequirementPool(item_exists=item_exists)}
+        self.owner_id = uuid4()
+        self.body = body
+
+    def __getitem__(self, key):
+        if key == "owner_id":
+            return self.owner_id
+        raise KeyError(key)
+
+    async def json(self):
+        return self.body
+
+
+class _RequirementPool:
+    def __init__(self, *, item_exists):
+        self.connection = _RequirementConnection(item_exists=item_exists)
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self.connection
+
+
+class _RequirementConnection:
+    def __init__(self, *, item_exists):
+        self.item_exists = item_exists
+        self.inserted_requirement = False
+        self.queries = []
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    async def fetchrow(self, query, *args):
+        self.queries.append(query)
+        if "FROM request_items i" in query:
+            return {"id": args[0]} if self.item_exists else None
+        if "FROM workflow_events" in query:
+            return None
+        raise AssertionError(f"unexpected fetchrow query: {query}")
+
+    async def fetchval(self, query, *args):
+        self.queries.append(query)
+        if "INSERT INTO item_requirements" in query:
+            self.inserted_requirement = True
+            return uuid4()
+        raise AssertionError(f"unexpected fetchval query: {query}")
+
+    async def execute(self, query, *args):
+        self.queries.append(query)
+        assert "INSERT INTO workflow_events" in query
+        assert args[4]["requirement_id"]
+
+
+@pytest.mark.asyncio
+async def test_item_requirement_route_is_owner_scoped_and_additive(monkeypatch) -> None:
+    import procurement_bot.mini_app as mini_app
+
+    async def no_job(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mini_app, "enqueue_job", no_job)
+    request = _RequirementRequest({
+        "idempotency_key": str(uuid4()), "requirement_key": "Диаметр",
+        "expected_value": "20", "unit": "мм", "source_pointer": "ТЗ, пункт 3",
+    })
+    response = await add_item_requirement(request)
+    result = json.loads(response.text)
+    assert response.status == 201
+    assert UUID(result["id"])
+    connection = request.app["pool"].connection
+    assert connection.inserted_requirement
+    assert all("UPDATE item_requirements" not in query for query in connection.queries)
+    assert all("DELETE FROM item_requirements" not in query for query in connection.queries)
+
+    foreign_request = _RequirementRequest({
+        "idempotency_key": str(uuid4()), "requirement_key": "Диаметр",
+        "expected_value": "20", "source_pointer": "ТЗ, пункт 3",
+    }, item_exists=False)
+    foreign_response = await add_item_requirement(foreign_request)
+    assert foreign_response.status == 400
+    assert not foreign_request.app["pool"].connection.inserted_requirement

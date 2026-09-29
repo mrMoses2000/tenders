@@ -14,6 +14,7 @@ from pydantic import AwareDatetime, Field, field_validator, model_validator
 from procurement_bot.intake import (
     CleanText,
     ParsedProcurementRequest,
+    ProcurementItem,
     SearchScope,
     StrictModel,
 )
@@ -312,6 +313,25 @@ def _deduplicate_terms(values: list[str]) -> list[str]:
     return result
 
 
+def _category_clues(item: ProcurementItem, search_terms: list[str]) -> list[str]:
+    """Give category inference product facts without lengthening the site query."""
+
+    clues = list(search_terms)
+    for requirement in item.requirements:
+        fact = " ".join(part for part in (
+            requirement.name, requirement.expected_value, requirement.unit
+        ) if part)
+        if not fact or len(clues) >= 20:
+            continue
+        try:
+            assert_no_private_price(fact, path="category_clue")
+        except PrivatePriceLeakError:
+            continue
+        if fact.casefold() not in {value.casefold() for value in clues}:
+            clues.append(fact[:500])
+    return clues
+
+
 def _locality_constraint(
     request: ParsedProcurementRequest,
     locality_resolution: LocalityResolution | None,
@@ -420,7 +440,10 @@ def build_research_plan(
                     item_index=index,
                     source=source,
                     purpose=purpose,
-                    query_terms=terms,
+                    query_terms=(
+                        _category_clues(item, terms)
+                        if source == ResearchSource.TWO_GIS else terms
+                    ),
                     rendered_query=" ".join(query_parts),
                     locality=locality,
                     minimum_unique_candidates=per_branch_minimum,
@@ -466,8 +489,11 @@ class SupplierEvidence(StrictModel):
     availability: AvailabilityStatus = AvailabilityStatus.UNKNOWN
     price_amount: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
     currency: CleanText | None = Field(default=None, max_length=3)
+    price_unit: CleanText | None = Field(default=None, max_length=50)
     pack_qty: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
     moq: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+    order_multiple: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+    available_qty: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=6)
 
     _source_url = field_validator("source_url")(_validate_source_url)
 

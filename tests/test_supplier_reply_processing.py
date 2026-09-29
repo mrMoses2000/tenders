@@ -15,6 +15,7 @@ from procurement_bot.supplier_reply_processing import (
     ReplyClassification,
     SupplierReplyProcessingConflict,
     classify_supplier_reply,
+    extract_quote_details,
     process_supplier_reply,
 )
 from procurement_bot.suppliers import UpsertResult
@@ -66,6 +67,41 @@ def test_classifier_extracts_only_unambiguous_facts(
     assert result.availability_status == availability
     assert (result.price.amount if result.price else None) == amount
     assert (result.price.currency if result.price else None) == currency
+
+
+def test_quantified_stock_after_in_stock_phrase_is_kept_in_item_units() -> None:
+    classified = classify_supplier_reply("Есть в наличии 5 штук")
+    details = extract_quote_details("Есть в наличии 5 штук", item_unit="шт")
+
+    assert classified.classification == ReplyClassification.AVAILABLE
+    assert details.available_qty == Decimal("5")
+
+
+def test_pack_details_require_explicit_pack_size_and_keep_pack_moq() -> None:
+    details = extract_quote_details(
+        "Цена 900 тг за коробку. Коробка по 6 штук. Минимальная партия 2 коробки.",
+        item_unit="шт",
+    )
+
+    assert details.price_unit == "коробку"
+    assert details.pack_qty == Decimal("6")
+    assert details.moq == Decimal("2")
+
+
+def test_package_stock_is_not_guessed_as_tender_item_stock() -> None:
+    details = extract_quote_details(
+        "Цена 900 тг за упаковку. В упаковке 6 шт. Есть 5 упаковок.",
+        item_unit="шт",
+    )
+
+    assert details.available_qty is None
+
+
+def test_separate_goods_and_delivery_prices_are_ambiguous() -> None:
+    classified = classify_supplier_reply("Товар 1 000 тг, доставка 1 000 тг")
+
+    assert classified.classification == ReplyClassification.AMBIGUOUS
+    assert classified.price is None
 
 
 class _Transaction(AbstractAsyncContextManager[None]):

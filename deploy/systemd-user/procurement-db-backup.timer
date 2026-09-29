@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily procurement PostgreSQL schema backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+Unit=procurement-db-backup.service
+
+[Install]
+WantedBy=timers.target

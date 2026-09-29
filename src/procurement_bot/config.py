@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     agy_browser_effort: Literal["low", "medium", "high"] = "high"
     agy_browser_timeout_seconds: int = Field(default=240, ge=30, le=1800)
     agy_browser_concurrency: int = Field(default=1, ge=1, le=4)
+    codex_2gis_fallback_enabled: bool = False
+    codex_olx_fallback_enabled: bool = False
+    codex_2gis_executable: Path = Path("/home/moses/.local/bin/codex")
+    codex_2gis_model: str = "gpt-6-luna"
+    codex_2gis_reasoning_effort: Literal["low", "medium", "high"] = "high"
+    codex_2gis_timeout_seconds: int = Field(default=600, ge=30, le=1800)
 
     voice_provider: str = "assemblyai"
     assemblyai_env_file: Path = Path("/home/moses/audio_transcription/.env")
@@ -268,9 +274,7 @@ class Settings(BaseSettings):
         """Provision one browser-only AGY profile with an exact MCP allowlist."""
 
         server = self.require_browser_mcp_server()
-        source = self.agy_auth_token_source
-        if not source.is_file():
-            raise ValueError(f"AGY auth token was not found: {source}")
+        source = self._available_agy_auth_token()
         root = self.agy_browser_home
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
@@ -333,9 +337,7 @@ class Settings(BaseSettings):
     def prepare_isolated_agy_home(self) -> Path:
         """Create a parser-only AGY profile containing authentication, not MCP config."""
 
-        source = self.agy_auth_token_source
-        if not source.is_file():
-            raise ValueError(f"AGY auth token was not found: {source}")
+        source = self._available_agy_auth_token()
         root = self.agy_home
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
@@ -367,6 +369,21 @@ class Settings(BaseSettings):
         )
         settings_file.chmod(0o600)
         return root
+
+    def _available_agy_auth_token(self) -> Path:
+        """Reuse a private isolated copy if AGY removes its primary token file."""
+
+        name = Path(".gemini/antigravity-cli/antigravity-oauth-token")
+        for source in (
+            self.agy_auth_token_source,
+            self.agy_home / name,
+            self.agy_browser_home / name,
+        ):
+            if source.is_file() and source.stat().st_size > 0:
+                return source
+        raise ValueError(
+            f"AGY auth token was not found: {self.agy_auth_token_source}"
+        )
 
 
 @lru_cache

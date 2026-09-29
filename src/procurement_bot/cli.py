@@ -26,7 +26,10 @@ from procurement_bot.outbox import TelegramOutboxWorker, WhatsAppOutboxWorker
 from procurement_bot.providers.agy import AgyExtractor
 from procurement_bot.providers.agy_browser import AgyBrowserMcpExecutor
 from procurement_bot.providers.assemblyai import AssemblyAITranscriber
-from procurement_bot.providers.browser import StructuredBrowserProvider
+from procurement_bot.providers.browser import BrowserResearchPort, StructuredBrowserProvider
+from procurement_bot.providers.codex_chrome import CodexChromeExecutor
+from procurement_bot.providers.olx_fallback import OlxFallbackProvider
+from procurement_bot.providers.two_gis_fallback import TwoGisFallbackProvider
 from procurement_bot.providers.waha import WahaClient
 from procurement_bot.research_execution import ResearchRunExecutor
 from procurement_bot.storage import LocalContentAddressedStorage
@@ -251,6 +254,16 @@ def _start_worker_tasks(
     else:
         transcriber = DisabledTranscriber()
     process = f"{socket.gethostname()}:{os.getpid()}"
+    waha = (
+        WahaClient(
+            base_url=settings.waha_base_url,
+            api_key=settings.require_waha_api_key(),
+            session=settings.waha_session,
+            enabled=True,
+            timeout_seconds=settings.waha_timeout_seconds,
+        )
+        if settings.waha_enabled else None
+    )
     download_limit = settings.max_source_file_bytes
     if not settings.telegram_api_base_url:
         download_limit = min(download_limit, settings.telegram_cloud_download_limit_bytes)
@@ -273,6 +286,7 @@ def _start_worker_tasks(
                 settings.transcription_min_language_confidence
             ),
             waha_session=settings.waha_session,
+            waha_client=waha,
         )
         tasks.create_task(worker.run_forever())
     outbox = TelegramOutboxWorker(
@@ -283,13 +297,7 @@ def _start_worker_tasks(
     )
     tasks.create_task(outbox.run_forever())
     if settings.waha_enabled:
-        waha = WahaClient(
-            base_url=settings.waha_base_url,
-            api_key=settings.require_waha_api_key(),
-            session=settings.waha_session,
-            enabled=True,
-            timeout_seconds=settings.waha_timeout_seconds,
-        )
+        assert waha is not None
         whatsapp_outbox = WhatsAppOutboxWorker(
             pool=pool,
             client=waha,
@@ -327,7 +335,22 @@ def _build_research_executor(
         concurrency=settings.agy_browser_concurrency,
         runtime_environment=runtime_environment,
     )
-    return ResearchRunExecutor(pool, StructuredBrowserProvider(transport))
+    browser: BrowserResearchPort = StructuredBrowserProvider(transport)
+    if settings.codex_2gis_fallback_enabled or settings.codex_olx_fallback_enabled:
+        codex = settings.codex_2gis_executable.expanduser()
+        if not codex.is_absolute() or not codex.is_file():
+            raise ValueError(f"Codex Chrome fallback executable was not found: {codex}")
+        fallback = StructuredBrowserProvider(CodexChromeExecutor(
+            executable=codex,
+            model=settings.codex_2gis_model,
+            reasoning_effort=settings.codex_2gis_reasoning_effort,
+            timeout_seconds=settings.codex_2gis_timeout_seconds,
+        ))
+        if settings.codex_2gis_fallback_enabled:
+            browser = TwoGisFallbackProvider(browser, fallback)
+        if settings.codex_olx_fallback_enabled:
+            browser = OlxFallbackProvider(browser, fallback)
+    return ResearchRunExecutor(pool, browser)
 
 
 async def _async_main(command: str) -> None:

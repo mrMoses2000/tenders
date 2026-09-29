@@ -16,6 +16,8 @@ from procurement_bot.conversations import (
     transition_conversation_state,
 )
 from procurement_bot.errors import ValidationBlocked
+from procurement_bot.offer_comparison import normalize_goods_unit
+from procurement_bot.phone import normalize_phone
 from procurement_bot.queue import stable_key
 from procurement_bot.supplier_dialogue import (
     SupplierDialogueState,
@@ -43,6 +45,10 @@ class ReplyClassification(StrEnum):
     UNAVAILABLE = "unavailable"
     AVAILABLE = "available"
     PRICE_RECEIVED = "price_received"
+    SPEC_CONFIRMED = "spec_confirmed"
+    SPEC_MISMATCH = "spec_mismatch"
+    NEEDS_TIME = "needs_time"
+    REFERRAL = "referral"
     AMBIGUOUS = "ambiguous"
     UNRECOGNIZED = "unrecognized"
 
@@ -51,6 +57,15 @@ class ReplyClassification(StrEnum):
 class ExplicitPrice:
     amount: Decimal
     currency: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteDetails:
+    price_unit: str | None = None
+    pack_qty: Decimal | None = None
+    moq: Decimal | None = None
+    order_multiple: Decimal | None = None
+    available_qty: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +123,68 @@ _CURRENCY_AMOUNT = re.compile(
 _PRICE_WITHOUT_CURRENCY = re.compile(
     r"\b(?:цена|стоимость|по)\s*[:—-]?\s*\d", re.IGNORECASE
 )
+_SPEC_CONFIRMED = re.compile(
+    r"\b(?:характеристики|параметры|требования|спецификация)\b.{0,80}"
+    r"\b(?:соответствуют|совпадают|подходят|подтверждаем)\b"
+    r"|\b(?:соответствует|подходит)\b.{0,80}"
+    r"\b(?:характеристикам|параметрам|требованиям|спецификации)\b",
+    re.IGNORECASE,
+)
+_SPEC_MISMATCH = re.compile(
+    r"\bне\s+(?:соответствует|подходит|совпадает)\b.{0,80}"
+    r"\b(?:требованиям|параметрам|характеристикам|спецификации)\b"
+    r"|\b(?:характеристики|параметры|размер|мощность)\b.{0,80}"
+    r"\b(?:другие|другая|другой|не совпадают)\b",
+    re.IGNORECASE,
+)
+_NEEDS_TIME = re.compile(
+    r"\b(?:уточню|проверю|подождите|перезвоню|отвечу позже|нужно уточнить)\b",
+    re.IGNORECASE,
+)
+_REFERRAL = re.compile(
+    r"\b(?:пишите|обратитесь|позвоните|свяжитесь|контакт|другой номер)\b",
+    re.IGNORECASE,
+)
+_PHONE_CANDIDATE = re.compile(r"(?<!\d)(?:\+?7|8)[\d\s()\-]{9,20}\d(?!\d)")
+_QUANTITY_NUMBER = r"\d+(?:[.,]\d{1,3})?"
+_GOODS_UNIT = (
+    r"шт(?:ук[аи]?)?|штук|штука|штуки|штуку|кг|килограмм(?:а|ов)?|"
+    r"г|грамм(?:а|ов)?|м²|м2|кв\.?\s*м|метр(?:а|ов)?|м|"
+    r"рулон(?:а|ов)?|л|литр(?:а|ов)?"
+)
+_AVAILABLE_QUANTITY = re.compile(
+    rf"\b(?:есть(?:\s+в\s+наличии)?|осталось|в\s+наличии|можем\s+поставить)\s*"
+    rf"(?P<amount>{_QUANTITY_NUMBER})\s*(?P<unit>{_GOODS_UNIT})\b",
+    re.IGNORECASE,
+)
+_AVAILABLE_PACK_QUANTITY = re.compile(
+    rf"\b(?:есть(?:\s+в\s+наличии)?|осталось|в\s+наличии|можем\s+поставить)\s*"
+    rf"(?P<amount>{_QUANTITY_NUMBER})\s*"
+    r"(?P<unit>упаков(?:ка|ки|ок)|пачк(?:а|и|ек)|коробк(?:а|и|ок))\b",
+    re.IGNORECASE,
+)
+_PRICE_UNIT = re.compile(
+    rf"(?:\bза\s+|/)\s*(?:1\s+)?(?P<unit>{_GOODS_UNIT}|"
+    r"упаковку|упаковка|пачку|пачка|коробку|коробка)\b",
+    re.IGNORECASE,
+)
+_PACK_QUANTITY = re.compile(
+    rf"\b(?:в\s+упаковке|в\s+пачке|в\s+коробке|упаковка\s+по|пачка\s+по|коробка\s+по)\s*"
+    rf"(?P<amount>{_QUANTITY_NUMBER})\s*(?P<unit>{_GOODS_UNIT})\b",
+    re.IGNORECASE,
+)
+_MOQ = re.compile(
+    rf"\b(?:минимальн(?:ая\s+партия|ый\s+заказ)|минимум\s+от)\s*"
+    r"[:—-]?\s*"
+    rf"(?P<amount>{_QUANTITY_NUMBER})\s*(?P<unit>{_GOODS_UNIT}|"
+    r"упаковк(?:а|и|ок)|пачк(?:а|и|ек)|коробк(?:а|и|ок))\b",
+    re.IGNORECASE,
+)
+_ORDER_MULTIPLE = re.compile(
+    rf"\bкратно\s*(?P<amount>{_QUANTITY_NUMBER})\s*"
+    rf"(?P<unit>{_GOODS_UNIT}|упаковкам|упаковок|пачкам|коробкам)?",
+    re.IGNORECASE,
+)
 _CURRENCY_CODES = {
     "₸": "KZT",
     "тг": "KZT",
@@ -123,6 +200,11 @@ _CURRENCY_CODES = {
     "eur": "EUR",
     "евро": "EUR",
 }
+_PACKAGE_UNIT_GROUPS = (
+    {"упаковка", "упаковку", "упаковки", "упаковок", "упаковкам"},
+    {"пачка", "пачку", "пачки", "пачек", "пачкам"},
+    {"коробка", "коробку", "коробки", "коробок", "коробкам"},
+)
 _ACTIVE_OFFER_STATUSES = ("lead", "confirm", "exact", "mismatch")
 _PROCESS_EVENT = "supplier_reply_processed"
 
@@ -144,11 +226,34 @@ def classify_supplier_reply(text: str) -> ClassifiedSupplierReply:
             signals=("opt_out",),
             reason="explicit opt-out phrase",
         )
+    if _REFERRAL.search(normalized) and _PHONE_CANDIDATE.search(normalized):
+        return ClassifiedSupplierReply(
+            ReplyClassification.REFERRAL, signals=("referral",),
+            reason="supplier supplied another contact",
+        )
+    if _NEEDS_TIME.search(normalized):
+        return ClassifiedSupplierReply(
+            ReplyClassification.NEEDS_TIME, signals=("needs_time",),
+            reason="supplier asked for time to clarify",
+        )
+    if _SPEC_MISMATCH.search(normalized):
+        return ClassifiedSupplierReply(
+            ReplyClassification.SPEC_MISMATCH, signals=("spec_mismatch",),
+            reason="supplier reported a specification mismatch",
+        )
+    if _SPEC_CONFIRMED.search(normalized):
+        return ClassifiedSupplierReply(
+            ReplyClassification.SPEC_CONFIRMED, signals=("spec_confirmed",),
+            reason="supplier explicitly confirmed specification",
+        )
 
     unavailable = bool(_EXACT_UNAVAILABLE.fullmatch(normalized)) or any(
         pattern.search(normalized) for pattern in _UNAVAILABLE_PATTERNS
     )
-    available = any(pattern.search(normalized) for pattern in _AVAILABLE_PATTERNS)
+    available = any(pattern.search(normalized) for pattern in _AVAILABLE_PATTERNS) or bool(
+        _AVAILABLE_QUANTITY.search(normalized)
+        or _AVAILABLE_PACK_QUANTITY.search(normalized)
+    )
     prices = _extract_explicit_prices(normalized)
     price_shaped = bool(prices) or bool(_PRICE_WITHOUT_CURRENCY.search(normalized))
     signals = tuple(
@@ -334,8 +439,45 @@ async def process_supplier_reply(
                 ),
             )
             evidence_id = evidence.id
-            if candidate is not None and classified.classification != ReplyClassification.OPT_OUT:
-                price = classified.price
+            if classified.classification == ReplyClassification.REFERRAL:
+                for match in list(_PHONE_CANDIDATE.finditer(row["text_content"]))[:10]:
+                    try:
+                        referred_phone = normalize_phone(match.group())
+                    except ValueError:
+                        continue
+                    await connection.execute(
+                        """INSERT INTO supplier_contact_referrals(
+                               conversation_id,message_id,source_evidence_id,normalized_phone
+                           ) VALUES ($1,$2,$3,$4)
+                           ON CONFLICT (message_id,normalized_phone) DO NOTHING""",
+                        conversation_id, message_id, evidence_id, referred_phone,
+                    )
+            details = (
+                extract_quote_details(row["text_content"], item_unit=str(candidate["unit"]))
+                if candidate is not None else QuoteDetails()
+            )
+            explicit_prices = _extract_explicit_prices(row["text_content"])
+            price = (
+                classified.price or explicit_prices[0]
+                if len(explicit_prices) == 1
+                and classified.classification not in {
+                    ReplyClassification.AMBIGUOUS, ReplyClassification.OPT_OUT,
+                    ReplyClassification.REFERRAL,
+                }
+                else None
+            )
+            availability_status = classified.availability_status
+            if details.available_qty is not None and availability_status != "out_of_stock":
+                availability_status = (
+                    "in_stock" if details.available_qty > 0 else "out_of_stock"
+                )
+            if candidate is not None and (
+                classified.classification in {
+                    ReplyClassification.UNAVAILABLE, ReplyClassification.AVAILABLE,
+                    ReplyClassification.PRICE_RECEIVED,
+                }
+                or price is not None or details.available_qty is not None
+            ):
                 observation = await upsert_offer_observation(
                     connection,
                     OfferObservationInput(
@@ -347,7 +489,12 @@ async def process_supplier_reply(
                         external_message_id=row["external_message_id"],
                         price_amount=price.amount if price is not None else None,
                         currency=price.currency if price is not None else None,
-                        availability_status=classified.availability_status,
+                        price_unit=details.price_unit,
+                        pack_qty=details.pack_qty,
+                        moq=details.moq,
+                        order_multiple=details.order_multiple,
+                        available_qty=details.available_qty,
+                        availability_status=availability_status,
                         evidence_level=4,
                         raw_payload=evidence_payload,
                         idempotency_key=stable_key(
@@ -469,6 +616,17 @@ def _decide(
     ):
         reply = SupplierReply.AVAILABLE
     elif (
+        state == SupplierDialogueState.WAITING_SPEC
+        and classified.classification == ReplyClassification.SPEC_CONFIRMED
+    ):
+        reply = SupplierReply.SPEC_CONFIRMED
+    elif (
+        classified.classification == ReplyClassification.SPEC_MISMATCH
+        and state in {SupplierDialogueState.WAITING_SPEC,
+                      SupplierDialogueState.WAITING_PRICE}
+    ):
+        reply = SupplierReply.SPEC_MISMATCH
+    elif (
         state == SupplierDialogueState.WAITING_PRICE
         and classified.price is not None
         and classified.classification
@@ -504,7 +662,7 @@ def _escalate(state: SupplierDialogueState, reason: str) -> _Outcome:
 
 
 def _extract_explicit_prices(text: str) -> tuple[ExplicitPrice, ...]:
-    found: set[tuple[Decimal, str]] = set()
+    found: list[tuple[Decimal, str]] = []
     for match in _CURRENCY_AMOUNT.finditer(text):
         currency_token = match.group("prefix") or match.group("suffix")
         amount_token = match.group("prefix_amount") or match.group("suffix_amount")
@@ -517,11 +675,69 @@ def _extract_explicit_prices(text: str) -> tuple[ExplicitPrice, ...]:
         except InvalidOperation:
             continue
         if amount >= 0:
-            found.add((amount, currency))
+            found.append((amount, currency))
     return tuple(
         ExplicitPrice(amount=amount, currency=currency)
         for amount, currency in sorted(found, key=lambda value: (value[1], value[0]))
     )
+
+
+def extract_quote_details(text: str, *, item_unit: str) -> QuoteDetails:
+    """Keep only quantities explicitly stated in the tender item's unit."""
+
+    required_unit = normalize_goods_unit(item_unit)
+
+    def amount(match: re.Match[str] | None) -> Decimal | None:
+        if match is None:
+            return None
+        try:
+            return Decimal(match.group("amount").replace(",", "."))
+        except InvalidOperation:
+            return None
+
+    price_match = _PRICE_UNIT.search(text)
+    price_unit = (
+        normalize_goods_unit(price_match.group("unit")) if price_match else None
+    )
+    pack_match = _PACK_QUANTITY.search(text)
+    pack_qty = (
+        amount(pack_match)
+        if pack_match and normalize_goods_unit(pack_match.group("unit")) == required_unit
+        else None
+    )
+    stock_match = _AVAILABLE_QUANTITY.search(text)
+    available_qty = (
+        amount(stock_match)
+        if stock_match and normalize_goods_unit(stock_match.group("unit")) == required_unit
+        else None
+    )
+    moq_match = _MOQ.search(text)
+    moq_unit = normalize_goods_unit(moq_match.group("unit")) if moq_match else None
+    moq = (
+        amount(moq_match)
+        if moq_unit and price_unit and _same_quote_unit(moq_unit, price_unit)
+        else None
+    )
+    multiple_match = _ORDER_MULTIPLE.search(text)
+    multiple_unit = (
+        normalize_goods_unit(multiple_match.group("unit"))
+        if multiple_match and multiple_match.group("unit") else None
+    )
+    order_multiple = (
+        amount(multiple_match)
+        if multiple_match and multiple_unit and price_unit
+        and _same_quote_unit(multiple_unit, price_unit) else None
+    )
+    return QuoteDetails(
+        price_unit=price_unit, pack_qty=pack_qty, moq=moq,
+        order_multiple=order_multiple, available_qty=available_qty,
+    )
+
+
+def _same_quote_unit(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return any(left in group and right in group for group in _PACKAGE_UNIT_GROUPS)
 
 
 def _format_quantity(quantity: Any, unit: str) -> str:

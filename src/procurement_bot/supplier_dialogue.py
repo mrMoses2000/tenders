@@ -155,14 +155,14 @@ def build_availability_inquiry(
     if SupplierLanguage(language) == SupplierLanguage.KAZAKH:
         message = (
             f"Сәлеметсіз бе! Мына тауар қолда бар ма: {inquiry.product_name}, "
-            f"саны — {inquiry.quantity}. Талаптар: {inquiry.required_spec}. "
-            "Қолда барын және көрсетілген талаптарға сәйкестігін растаңыз."
+            f"саны — {inquiry.quantity}? Қолда бар болса, нақты сипаттамаларын "
+            "келесі хабарламада жіберемін."
         )
     else:
         message = (
             f"Здравствуйте! Подскажите, пожалуйста, есть ли в наличии: {inquiry.product_name}, "
-            f"количество — {inquiry.quantity}. Требования: {inquiry.required_spec}. "
-            "Подтвердите наличие и соответствие указанным параметрам."
+            f"количество — {inquiry.quantity}? Если товар есть, следующим сообщением "
+            "уточню решающие характеристики."
         )
     assert_supplier_safe_text(message)
     return message
@@ -194,13 +194,14 @@ def build_price_inquiry(
     if SupplierLanguage(language) == SupplierLanguage.KAZAKH:
         message = (
             f"Растағаныңызға рақмет. {inquiry.product_name} тауарының {inquiry.quantity} "
-            "санына ең жақсы бағаңызды, ҚҚС-пен немесе ҚҚС-сыз екенін және алып кету/"
-            "жеткізу шарттарын жазыңыз."
+            "санына тауардың ең жақсы бағасын жазыңыз: баға қандай бірлікке, "
+            "қаптамада қанша бірлік, ең аз тапсырыс қанша және қолда нақты қанша бар?"
         )
     else:
         message = (
             f"Спасибо за подтверждение. Подскажите вашу лучшую цену на {inquiry.quantity} "
-            f"для {inquiry.product_name}, с НДС или без, а также условия самовывоза/доставки."
+            f"для {inquiry.product_name}: за какую единицу цена, сколько единиц "
+            "в упаковке, какова минимальная партия и сколько товара есть сейчас?"
         )
     assert_supplier_safe_text(message)
     return message

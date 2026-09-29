@@ -18,12 +18,24 @@ class ReportEvidence(StrictModel):
 
 
 class SupplierReportCard(StrictModel):
+    item_number: int = Field(default=0, ge=0)
+    item_name: str = Field(default="", max_length=500)
     supplier_name: str = Field(min_length=1, max_length=500)
+    supplier_phone: str | None = Field(default=None, max_length=30)
+    whatsapp_confirmed: bool = False
     location: str | None = Field(default=None, max_length=1000)
     product_name: str = Field(min_length=1, max_length=1000)
     technical_status: str = Field(min_length=1, max_length=100)
     availability: str = Field(min_length=1, max_length=300)
     price: Decimal | None = Field(default=None, ge=0)
+    price_unit: str | None = Field(default=None, max_length=50)
+    required_quantity: Decimal | None = Field(default=None, ge=0)
+    available_quantity: Decimal | None = Field(default=None, ge=0)
+    purchased_quantity: Decimal | None = Field(default=None, ge=0)
+    goods_total: Decimal | None = Field(default=None, ge=0)
+    tender_total: Decimal | None = Field(default=None, ge=0)
+    tender_difference: Decimal | None = None
+    price_state: str = "unknown"
     currency: str = Field(default="KZT", max_length=3)
     rank: int | None = Field(default=None, ge=1)
     evidence: list[ReportEvidence] = Field(default_factory=list)
@@ -46,9 +58,7 @@ class ProcurementReport(StrictModel):
 
 
 def render_report_html(report: ProcurementReport) -> str:
-    cards = "".join(_render_card(card) for card in _ordered_cards(report.cards))
-    if not cards:
-        cards = '<div class="empty">Подтверждённых вариантов пока нет.</div>'
+    cards = _render_groups(_ordered_cards(report.cards))
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -56,7 +66,9 @@ def render_report_html(report: ProcurementReport) -> str:
 <title>{_escape(report.title)}</title><style>{_CSS}</style></head>
 <body><main><header><div class="eyebrow">Заявка {_escape(report.case_reference)}</div>
 <h1>{_escape(report.title)}</h1>
-<p>{_escape(report.city)} · {_escape(report.search_scope)}</p></header>
+<p>{_escape(report.city)} · {_escape(report.search_scope)}</p>
+<p>Сравнивается только стоимость товара. Доставка учитывается после внесения факта;
+НДС отдельно не рассчитывается.</p></header>
 <section class="stats"><div><b>{report.suppliers_found}</b><span>найдено</span></div>
 <div><b>{report.suppliers_contacted}</b><span>написали в WhatsApp</span></div>
 <div><b>{report.suppliers_responded}</b><span>ответили</span></div>
@@ -72,6 +84,7 @@ def _ordered_cards(cards: list[SupplierReportCard]) -> list[SupplierReportCard]:
     return sorted(
         cards,
         key=lambda card: (
+            card.item_number,
             card.rank is None,
             card.rank or 10**9,
             card.supplier_name.casefold(),
@@ -79,18 +92,69 @@ def _ordered_cards(cards: list[SupplierReportCard]) -> list[SupplierReportCard]:
     )
 
 
+def _render_groups(cards: list[SupplierReportCard]) -> str:
+    if not cards:
+        return '<div class="empty">Предложений пока нет.</div>'
+    groups: dict[tuple[int, str], list[SupplierReportCard]] = {}
+    for card in cards:
+        groups.setdefault((card.item_number, card.item_name), []).append(card)
+    parts: list[str] = []
+    for (number, name), values in groups.items():
+        heading = f"Позиция {number}: {name}" if number else (name or "Предложения")
+        ranked = [card for card in values if card.rank is not None and card.rank <= 5]
+        others = [card for card in values if card not in ranked]
+        top = (
+            "".join(_render_card(card) for card in ranked)
+            if ranked else '<div class="empty">Подтверждённых сопоставимых цен пока нет.</div>'
+        )
+        rest = (
+            f'<details><summary>Остальные предложения · {len(others)}</summary>'
+            + "".join(_render_card(card) for card in others)
+            + "</details>"
+            if others else ""
+        )
+        parts.append(
+            f'<section class="item-group"><h2>{_escape(heading)}</h2>'
+            f'<h3>Лучшие подтверждённые предложения</h3>{top}{rest}</section>'
+        )
+    return "".join(parts)
+
+
 def _render_card(card: SupplierReportCard) -> str:
     rank = f'<span class="rank">#{card.rank}</span>' if card.rank else ""
     price = "Цена не подтверждена"
     if card.price is not None:
-        price = f"{card.price:,.2f} {_escape(card.currency)}".replace(",", " ")
+        price = (
+            f"{card.price:,.2f} {_escape(card.currency)}"
+            f"{f' за {_escape(card.price_unit)}' if card.price_unit else ' · единица не уточнена'}"
+        ).replace(",", " ")
+    goods = (
+        f'<p>Стоимость товара на партию: {_money(card.goods_total, card.currency)}'
+        f' · купить: {_escape(card.purchased_quantity)}</p>'
+        if card.goods_total is not None and card.purchased_quantity is not None else ""
+    )
+    tender = (
+        f'<p>По тендеру: {_money(card.tender_total, card.currency)}; '
+        f'разница без доставки: {_money(card.tender_difference, card.currency)}</p>'
+        if card.tender_total is not None and card.tender_difference is not None else ""
+    )
     evidence = "".join(f"<li>{_evidence(value)}</li>" for value in card.evidence)
     questions = "".join(f"<li>{_escape(value)}</li>" for value in card.questions_remaining)
     location = f"<p class=muted>{_escape(card.location)}</p>" if card.location else ""
-    return f"""<article>{rank}<h2>{_escape(card.supplier_name)}</h2>{location}
+    phone = ""
+    if card.supplier_phone:
+        digits = "".join(char for char in card.supplier_phone if char.isdigit())
+        wa = (
+            f' · <a rel="noreferrer" href="https://wa.me/{digits}">WhatsApp</a>'
+            if card.whatsapp_confirmed and len(digits) in {10, 11, 12, 13, 14, 15}
+            else ""
+        )
+        phone = f'<p>Телефон: {_escape(card.supplier_phone)}{wa}</p>'
+    return f"""<article>{rank}<h3>{_escape(card.supplier_name)}</h3>{location}{phone}
 <h3>{_escape(card.product_name)}</h3><div class="badges">
 <span>{_escape(card.technical_status)}</span>
-<span>{_escape(card.availability)}</span></div><p class="price">{price}</p>
+<span>{_escape(card.availability)}</span><span>{_escape(card.price_state)}</span>
+</div><p class="price">{price}</p>{goods}{tender}
 <h4>Доказательства</h4><ul>{evidence or '<li>Нет сохранённых доказательств</li>'}</ul>
 <h4>Что уточнить</h4><ul>{questions or '<li>Критичных уточнений нет</li>'}</ul></article>"""
 
@@ -106,6 +170,12 @@ def _escape(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _money(value: Decimal | None, currency: str) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.2f} {_escape(currency)}".replace(",", " ")
+
+
 _CSS = """
 :root{color-scheme:light;font-family:Inter,system-ui,sans-serif;
 background:#f4f6f8;color:#17202a}
@@ -118,6 +188,9 @@ border-radius:16px;padding:20px}.stats b{font-size:28px;display:block}
 .stats span,.muted,footer{color:#697386}.cards{display:grid;gap:16px}
 article{position:relative}.rank{position:absolute;right:20px;top:20px;
 background:#fca311;padding:6px 10px;border-radius:999px;font-weight:800}
+.item-group{display:grid;gap:12px;margin:26px 0}.item-group>h2{margin:0}
+.item-group>h3{margin:0;color:#697386}.item-group details{display:grid;gap:12px}
+.item-group summary{cursor:pointer;padding:12px;background:#fff;border-radius:10px}
 .badges{display:flex;gap:8px;flex-wrap:wrap}.badges span{background:#e9f2ff;
 padding:5px 9px;border-radius:8px}.price{font-size:24px;font-weight:800}
 a{color:#0759b8}footer{padding:24px 4px;font-size:13px}

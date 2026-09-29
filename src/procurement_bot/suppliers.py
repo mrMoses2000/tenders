@@ -417,6 +417,85 @@ async def upsert_supplier(
         return UpsertResult(id=supplier_id, created=True)
 
 
+async def upsert_olx_supplier_by_contact(
+    connection: asyncpg.Connection,
+    supplier: SupplierInput,
+    contacts: list[tuple[str, str]],
+) -> UpsertResult:
+    """Reuse a phone owner before attaching a newly observed OLX seller ID."""
+
+    if supplier.identity_type != "source_record":
+        raise ValueError("OLX supplier identity must be a source record")
+    normalized_identity = normalize_supplier_identity(
+        supplier.identity_type, supplier.identity_value,
+    )
+    normalized_contacts = sorted({
+        (contact_type, normalize_contact(contact_type, value))
+        for contact_type, value in contacts
+    })
+    async with connection.transaction():
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"supplier-identity:{supplier.identity_type}:{normalized_identity}",
+        )
+        for contact_type, normalized in normalized_contacts:
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"supplier-contact:{contact_type}:{normalized}",
+            )
+        alias = await connection.fetchrow(
+            """SELECT supplier_id FROM supplier_aliases
+               WHERE alias_type=$1 AND normalized_value=$2 AND active""",
+            supplier.identity_type, normalized_identity,
+        )
+        owners: set[UUID] = set()
+        for contact_type, normalized in normalized_contacts:
+            owner = await connection.fetchrow(
+                """SELECT supplier_id FROM supplier_contacts
+                   WHERE normalized_value=$2 AND active AND (
+                       contact_type=$1 OR (
+                           contact_type IN ('phone','whatsapp')
+                           AND $1 IN ('phone','whatsapp')
+                       )
+                   )""",
+                contact_type, normalized,
+            )
+            if owner is not None:
+                owners.add(owner["supplier_id"])
+        if len(owners) > 1:
+            raise SupplierIdentityConflictError(
+                "OLX contacts belong to different suppliers"
+            )
+        contact_owner = next(iter(owners), None)
+        if alias is not None and contact_owner is not None and (
+            alias["supplier_id"] != contact_owner
+        ):
+            raise SupplierIdentityConflictError(
+                "OLX seller ID and phone belong to different suppliers"
+            )
+        if contact_owner is None:
+            return await upsert_supplier(connection, supplier)
+        await connection.execute(
+            """INSERT INTO supplier_aliases(
+                   supplier_id,alias_type,display_value,normalized_value,
+                   source_evidence_id,confidence
+               ) VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT (supplier_id,alias_type,normalized_value)
+               DO UPDATE SET active=TRUE,last_seen_at=now(),
+                   confidence=GREATEST(supplier_aliases.confidence,EXCLUDED.confidence),
+                   source_evidence_id=COALESCE(
+                       supplier_aliases.source_evidence_id,EXCLUDED.source_evidence_id
+                   )""",
+            contact_owner,
+            supplier.identity_type,
+            supplier.identity_value,
+            normalized_identity,
+            supplier.source_evidence_id,
+            supplier.confidence,
+        )
+        return UpsertResult(id=contact_owner, created=False)
+
+
 async def upsert_supplier_contact(
     connection: asyncpg.Connection,
     supplier_id: UUID,
@@ -449,7 +528,8 @@ async def upsert_supplier_contact(
             await connection.execute(
                 """
                 UPDATE supplier_contacts
-                SET display_value=$2,label=$3,
+                SET contact_type=CASE WHEN $4 THEN 'whatsapp' ELSE contact_type END,
+                    display_value=$2,label=$3,
                     is_whatsapp_confirmed=is_whatsapp_confirmed OR $4,
                     source_evidence_id=$5,confidence=GREATEST(confidence,$6),
                     last_seen_at=now()

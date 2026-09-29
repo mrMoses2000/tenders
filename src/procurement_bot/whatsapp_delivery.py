@@ -13,6 +13,7 @@ from procurement_bot.conversations import OutboundMessageInput, record_outbound_
 from procurement_bot.phone import normalize_phone
 from procurement_bot.providers.waha import WahaSendResult
 from procurement_bot.queue import ClaimedOutbox
+from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
 from procurement_bot.supplier_dialogue import (
     DEFAULT_SEND_POLICY,
     SendContext,
@@ -125,11 +126,20 @@ async def assert_whatsapp_delivery_allowed(
                       AND message.received_at >= $2) AS sent_today
             FROM supplier_conversations AS c
             JOIN supplier_contacts AS contact ON contact.id=c.supplier_contact_id
-            WHERE c.id=$1
+            JOIN source_evidence AS contact_evidence
+              ON contact_evidence.id=contact.source_evidence_id
+            WHERE c.id=$1 AND c.case_id=$3
+              AND __CONTACT_SCOPE__
             FOR SHARE OF c,contact
-            """,
+            """.replace(
+                "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
+                    contact_alias="contact", evidence_alias="contact_evidence",
+                    case_param="$3",
+                ),
+            ),
             payload.conversation_id,
             day_started_at,
+            payload.case_id,
         )
         if row is None:
             raise ValueError("WhatsApp conversation does not exist")

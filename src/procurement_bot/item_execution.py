@@ -40,6 +40,7 @@ async def record_item_execution_event(
     idempotency_key: str,
     reason: str = "",
     source_artifact_id: UUID | None = None,
+    delivery_run_id: UUID | None = None,
     replaces_event_id: UUID | None = None,
     occurred_at: datetime | None = None,
 ) -> UUID:
@@ -79,6 +80,7 @@ async def record_item_execution_event(
                 "quantity_delta": quantity_delta,
                 "reason": normalized_reason,
                 "source_artifact_id": source_artifact_id,
+                "delivery_run_id": delivery_run_id,
                 "replaces_event_id": replaces_event_id,
                 "recorded_by": owner_user_id,
             }
@@ -112,6 +114,18 @@ async def record_item_execution_event(
             )
             if valid_artifact is not True:
                 raise ItemExecutionConflict("event evidence belongs to another user")
+        if delivery_run_id is not None:
+            linked = await connection.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM delivery_run_items di
+                   JOIN delivery_runs r ON r.id=di.delivery_run_id
+                   WHERE di.delivery_run_id=$1 AND di.request_item_id=$2
+                     AND di.case_id=$3 AND r.status NOT IN ('planned','cancelled'))""",
+                delivery_run_id, request_item_id, case_id,
+            )
+            if not linked:
+                raise ItemExecutionConflict(
+                    "delivery does not contain this item or has not departed"
+                )
         if replaces_event_id is not None:
             replaced = await connection.fetchval(
                 "SELECT event_kind FROM request_item_execution_events "
@@ -126,13 +140,13 @@ async def record_item_execution_event(
             INSERT INTO request_item_execution_events(
                 id,case_id,request_item_id,event_kind,quantity_delta,reason,
                 replaces_event_id,source_artifact_id,provenance,occurred_at,
-                idempotency_key,recorded_by
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10,now()),$11,$12)
+                idempotency_key,recorded_by,delivery_run_id
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10,now()),$11,$12,$13)
             """,
             event_id, case_id, request_item_id, event_kind, quantity_delta,
             normalized_reason, replaces_event_id, source_artifact_id,
             "documented" if source_artifact_id else "user_reported",
-            occurred_at, idempotency_key, owner_user_id,
+            occurred_at, idempotency_key, owner_user_id, delivery_run_id,
         )
         totals = await load_item_execution_totals(connection, request_item_id)
         if min(totals.warehouse_received, totals.delivered, totals.rejected,

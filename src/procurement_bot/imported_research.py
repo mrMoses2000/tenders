@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -9,13 +10,55 @@ import asyncpg
 
 from procurement_bot.approvals import approve_request, request_approval
 from procurement_bot.intake import ParsedProcurementRequest, ProcurementItem, SearchScope
-from procurement_bot.research import ResearchPlan, build_research_plan
+from procurement_bot.research import (
+    PrivatePriceLeakError,
+    ResearchPlan,
+    ResearchSource,
+    assert_no_private_price,
+    build_research_plan,
+)
 from procurement_bot.research_repository import persist_research_plan, recompute_plan_sha256
 from procurement_bot.research_workflow import start_approved_research
 
 
 class ImportedResearchConflict(ValueError):
     """The selected imported item cannot start another research run."""
+
+
+def _search_name(name: str, specification_text: str) -> str:
+    first_clause = re.split(
+        r"\bпо согласованию\b|[.;\n]", specification_text, maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" ,:-")
+    if len(first_clause) < 4:
+        return name
+    phrase = first_clause[:240].rsplit(" ", 1)[0] if len(first_clause) > 240 else first_clause
+    try:
+        assert_no_private_price(phrase)
+    except PrivatePriceLeakError:
+        return name
+    return phrase or name
+
+
+def _specification_clues(name: str, specification_text: str) -> list[str]:
+    """Keep product requirements available to 2GIS category inference."""
+
+    clauses = [name, *re.split(r"[.;\n]+", specification_text)]
+    clues: list[str] = []
+    seen: set[str] = set()
+    for clause in clauses:
+        value = clause.strip(" ,:-")[:500].strip()
+        if len(value) < 4 or value.casefold() in seen:
+            continue
+        try:
+            assert_no_private_price(value)
+        except PrivatePriceLeakError:
+            continue
+        clues.append(value)
+        seen.add(value.casefold())
+        if len(clues) >= 20:
+            break
+    return clues or [name]
 
 
 async def start_imported_item_research(
@@ -30,21 +73,25 @@ async def start_imported_item_research(
     async with connection.transaction():
         case = await connection.fetchrow(
             """
-            SELECT id,city,status,source_kind
+            SELECT id,city,search_area_text,status,source_kind,
+                   EXISTS(SELECT 1 FROM case_derivations d
+                          WHERE d.derived_case_id=procurement_cases.id) AS is_derived
             FROM procurement_cases
             WHERE id=$1 AND owner_user_id=$2
             """,
             case_id, owner_user_id,
         )
-        if case is None or case["source_kind"] != "notion_import":
-            raise ImportedResearchConflict("Импортированная заявка не найдена")
+        if case is None or not (
+            case["source_kind"] == "notion_import" or case["is_derived"]
+        ):
+            raise ImportedResearchConflict("Заявка для поиска не найдена")
         if case["status"] not in {"ready", "evaluating", "report_ready"}:
             raise ImportedResearchConflict("Дождитесь завершения текущего поиска")
         if not case["city"]:
             raise ImportedResearchConflict("У заявки не указан город поиска")
         items = await connection.fetch(
             """
-            SELECT id,name,quantity,unit
+            SELECT id,name,specification_text,quantity,unit
             FROM request_items WHERE case_id=$1 ORDER BY line_number,id
             """,
             case_id,
@@ -57,14 +104,42 @@ async def start_imported_item_research(
             city=case["city"],
             search_scope=SearchScope.CITYWIDE,
             items=[ProcurementItem(
-                name=item["name"], quantity=item["quantity"], unit=item["unit"] or None,
+                name=_search_name(item["name"], item["specification_text"]),
+                quantity=item["quantity"], unit=item["unit"] or None,
             )],
         )
-        single = build_research_plan(request, include_olx=True)
-        indexed = single.model_copy(update={
-            "source_plans": [branch.model_copy(update={"item_index": index})
-                             for branch in single.source_plans],
-        })
+        # The initial derived pilot used four candidates to prove each source.
+        # Subsequent runs must pursue the requested supplier campaign coverage;
+        # candidates are still only leads until contact evidence is verified.
+        single = build_research_plan(
+            request, include_olx=True,
+            minimum_unique_candidates=30 if case["is_derived"] else 10,
+        )
+        source_priority = {
+            ResearchSource.OWN_DATABASE: 0,
+            ResearchSource.OLX: 1,
+            ResearchSource.TWO_GIS: 2,
+            ResearchSource.WEB: 3,
+        }
+        area = case["search_area_text"].strip()
+        if area:
+            assert_no_private_price(area)
+        branches = []
+        for branch in sorted(
+            single.source_plans, key=lambda branch: source_priority[branch.source],
+        ):
+            changes: dict[str, object] = {"item_index": index}
+            if branch.source == ResearchSource.TWO_GIS:
+                changes["query_terms"] = _specification_clues(
+                    item["name"], item["specification_text"],
+                )
+            if area:
+                changes["rendered_query"] = f"{branch.rendered_query} {area}"
+                changes["locality"] = branch.locality.model_copy(
+                    update={"raw_area_text": area},
+                )
+            branches.append(branch.model_copy(update=changes))
+        indexed = single.model_copy(update={"source_plans": branches})
         plan = ResearchPlan.model_validate(indexed.model_copy(update={
             "plan_sha256": recompute_plan_sha256(indexed),
         }).model_dump(mode="json"))

@@ -71,7 +71,7 @@ def test_kazakh_dialogue_and_high_precision_language_detection() -> None:
     )
 
     assert "Сәлеметсіз бе" in initial
-    assert "Қолда барын" in initial
+    assert "қолда бар ма" in initial
     assert followup.outbound_text is not None and "сипаттамаларын" in followup.outbound_text
     assert detect_supplier_language("Қолда бар", fallback="ru").value == "kk"
     assert detect_supplier_language("Есть в наличии", fallback="ru").value == "ru"

@@ -113,6 +113,21 @@ async def test_waha_sends_normalized_payload_and_preserves_idempotency_key() -> 
 
 
 @pytest.mark.asyncio
+async def test_waha_uses_reserved_id_when_success_response_omits_message_id() -> None:
+    transport = RecordingTransport(HttpResponse(201, b"{}"))
+    client = WahaClient(
+        base_url="http://localhost:3000", api_key="secret",
+        enabled=True, transport=transport,
+    )
+    result = await client.send_text(
+        recipient="+77001234567", text="Тест",
+        idempotency_key="outbox-42", provider_message_id="reserved-42",
+    )
+    assert result.external_message_id == "true_77001234567@c.us_reserved-42"
+    assert result.raw == {}
+
+
+@pytest.mark.asyncio
 async def test_waha_reserves_provider_message_id_before_send() -> None:
     transport = RecordingTransport(HttpResponse(200, b'{"id":"reserved-42"}'))
     client = WahaClient(
@@ -128,6 +143,17 @@ async def test_waha_reserves_provider_message_id_before_send() -> None:
     assert transport.requests[0]["url"].endswith(
         "/api/procurement/new-message-id"
     )
+
+
+@pytest.mark.asyncio
+async def test_waha_session_422_is_retryable_before_send() -> None:
+    transport = RecordingTransport(HttpResponse(422, b'{"status":"FAILED"}'))
+    client = WahaClient(
+        base_url="http://localhost:3000", api_key="secret",
+        enabled=True, transport=transport,
+    )
+    with pytest.raises(RetryableProviderError, match="not ready"):
+        await client.new_message_id()
 
 
 @pytest.mark.asyncio

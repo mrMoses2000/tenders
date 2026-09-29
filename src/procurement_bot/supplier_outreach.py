@@ -18,8 +18,10 @@ from procurement_bot.conversations import (
     create_conversation,
     transition_conversation_state,
 )
+from procurement_bot.offer_comparison import normalize_goods_unit
 from procurement_bot.phone import normalize_phone
 from procurement_bot.queue import enqueue_outbox, stable_key
+from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
 from procurement_bot.supplier_dialogue import (
     SupplierInquiry,
     WhatsAppSendCommand,
@@ -40,7 +42,7 @@ async def prepare_supplier_outreach(
     *,
     case_id: UUID,
     session_name: str,
-    max_proposals: int = 20,
+    max_proposals: int = 100,
 ) -> OutreachPreparationResult:
     """Create approval-gated initial messages; never call the provider."""
 
@@ -79,24 +81,51 @@ async def prepare_supplier_outreach(
              AND contact.active AND contact.contact_type='whatsapp'
             JOIN source_evidence AS evidence ON evidence.id=contact.source_evidence_id
             WHERE item.case_id=$1
+              AND __CONTACT_SCOPE__
               AND offer.status=ANY($2::text[])
+              AND NOT EXISTS (
+                  SELECT 1 FROM supplier_conversation_targets target
+                  WHERE target.offer_id=offer.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM supplier_conversations existing
+                  WHERE existing.supplier_id=offer.supplier_id
+                    AND (existing.opted_out OR existing.state NOT IN
+                         ('complete','closed_no_reply','opted_out'))
+              )
             ORDER BY offer.supplier_id,
                      CASE offer.status WHEN 'exact' THEN 0 WHEN 'confirm' THEN 1 ELSE 2 END,
-                     item.line_number,offer.created_at,contact.created_at
+                     item.line_number,offer.created_at,contact.first_seen_at
             LIMIT $3
-            """,
+            """.replace(
+                "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
+                    contact_alias="contact", evidence_alias="evidence"
+                ),
+            ),
             case_id,
             ["exact", "confirm", "lead"],
             max_proposals,
         )
-        suppliers_total = int(
+        suppliers_without_whatsapp = int(
             await connection.fetchval(
                 """
                 SELECT count(DISTINCT offer.supplier_id)
                 FROM offers AS offer
                 JOIN request_items AS item ON item.id=offer.request_item_id
                 WHERE item.case_id=$1 AND offer.status=ANY($2::text[])
-                """,
+                  AND NOT EXISTS (
+                      SELECT 1 FROM supplier_contacts contact
+                      JOIN source_evidence evidence
+                        ON evidence.id=contact.source_evidence_id
+                      WHERE contact.supplier_id=offer.supplier_id
+                        AND contact.active AND contact.contact_type='whatsapp'
+                        AND __CONTACT_SCOPE__
+                  )
+                """.replace(
+                    "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
+                        contact_alias="contact", evidence_alias="evidence"
+                    ),
+                ),
                 case_id,
                 ["exact", "confirm", "lead"],
             )
@@ -107,6 +136,35 @@ async def prepare_supplier_outreach(
         for candidate in candidates:
             recipient = normalize_phone(candidate["normalized_value"])
             external_chat_id = recipient.removeprefix("+") + "@c.us"
+            conversation_key = stable_key(
+                "supplier-conversation",
+                case_id,
+                candidate["supplier_id"],
+                candidate["contact_id"],
+                candidate["offer_id"],
+            )
+            existing_transport = await connection.fetchrow(
+                """
+                SELECT idempotency_key FROM supplier_conversations
+                WHERE case_id=$1 AND supplier_id=$2 AND supplier_contact_id=$3
+                  AND session_name=$4 AND external_chat_id=$5
+                  AND state NOT IN ('complete','closed_no_reply','opted_out')
+                FOR UPDATE
+                """,
+                case_id,
+                candidate["supplier_id"],
+                candidate["contact_id"],
+                session_name,
+                external_chat_id,
+            )
+            if (
+                existing_transport is not None
+                and existing_transport["idempotency_key"] != conversation_key
+            ):
+                # Preserve a pre-existing manual or test dialogue and its exact
+                # approval payload; this campaign must not adopt it implicitly.
+                skipped += 1
+                continue
             conversation = await create_conversation(
                 connection,
                 ConversationInput(
@@ -115,12 +173,7 @@ async def prepare_supplier_outreach(
                     supplier_contact_id=candidate["contact_id"],
                     session_name=session_name,
                     external_chat_id=external_chat_id,
-                    idempotency_key=stable_key(
-                        "supplier-conversation",
-                        case_id,
-                        candidate["supplier_id"],
-                        candidate["contact_id"],
-                    ),
+                    idempotency_key=conversation_key,
                     preferred_language="ru",
                 ),
             )
@@ -220,19 +273,25 @@ async def prepare_supplier_outreach(
             stable_key("supplier-outreach-prepared", case_id),
             {
                 "proposals_created": created,
-                "suppliers_without_whatsapp": max(0, suppliers_total - len(candidates)),
+                "suppliers_without_whatsapp": suppliers_without_whatsapp,
                 "skipped_existing": skipped,
             },
         )
         return OutreachPreparationResult(
             case_id=case_id,
             proposals_created=created,
-            suppliers_without_whatsapp=max(0, suppliers_total - len(candidates)),
+            suppliers_without_whatsapp=suppliers_without_whatsapp,
             skipped_existing=skipped,
         )
 
 
 def _quantity(value: Decimal | None, unit: str | None) -> str:
     quantity = "количество нужно уточнить" if value is None else format(value, "f")
-    suffix = f" {str(unit).strip()}" if unit else ""
+    if "." in quantity:
+        quantity = quantity.rstrip("0").rstrip(".")
+    display_unit = {
+        "piece": "шт.", "kg": "кг", "g": "г", "m": "м", "m2": "м²",
+        "roll": "рул.", "liter": "л",
+    }.get(normalize_goods_unit(unit), str(unit or "").strip())
+    suffix = f" {display_unit}" if display_unit else ""
     return quantity + suffix

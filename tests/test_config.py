@@ -136,6 +136,25 @@ def test_isolated_agy_home_copies_only_auth_token(tmp_path: Path):
     assert json.loads(settings_file.read_text())["permissions"]["allow"] == []
 
 
+def test_isolated_agy_home_survives_primary_token_file_disappearing(tmp_path: Path):
+    source = tmp_path / "source-token"
+    source.write_text("isolated-auth", encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        AGY_HOME=tmp_path / "agy-home",
+        AGY_BROWSER_HOME=tmp_path / "browser-home",
+        AGY_AUTH_TOKEN_SOURCE=source,
+    )
+    settings.prepare_isolated_agy_home()
+    source.unlink()
+
+    root = settings.prepare_isolated_agy_home()
+
+    assert (root / ".gemini/antigravity-cli/antigravity-oauth-token").read_text() == (
+        "isolated-auth"
+    )
+
+
 def test_browser_mcp_config_is_explicit_and_secret_free() -> None:
     disabled = Settings(_env_file=None)
     with pytest.raises(ValueError, match="disabled"):

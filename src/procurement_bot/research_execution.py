@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -23,6 +25,8 @@ from procurement_bot.providers.browser import (
 )
 from procurement_bot.research import (
     AvailabilityStatus,
+    ContactKind,
+    EvidenceClaim,
     EvidenceType,
     PrivatePriceLeakError,
     ResearchPlan,
@@ -42,6 +46,7 @@ from procurement_bot.suppliers import (
     SupplierLocationInput,
     upsert_offer,
     upsert_offer_observation,
+    upsert_olx_supplier_by_contact,
     upsert_source_evidence,
     upsert_supplier,
     upsert_supplier_contact,
@@ -49,6 +54,7 @@ from procurement_bot.suppliers import (
 )
 
 TerminalStatus = Literal["succeeded", "partial", "failed"]
+LOGGER = logging.getLogger(__name__)
 
 _PROVIDER_BY_SOURCE = {
     ResearchSource.OWN_DATABASE: "own_database",
@@ -230,6 +236,48 @@ def _request_hash(plan: SourcePlan) -> str:
     ).hexdigest()
 
 
+def _catalog_links(candidates: list[SupplierCandidate]) -> list[str]:
+    """Extract bounded public catalogue leads from accepted 2GIS firm cards."""
+
+    links: list[str] = []
+    for candidate in candidates:
+        if candidate.source != ResearchSource.TWO_GIS:
+            continue
+        for contact in candidate.contacts:
+            if contact.kind not in {ContactKind.WEBSITE, ContactKind.INSTAGRAM}:
+                continue
+            parsed = urlparse(contact.value)
+            host = (parsed.hostname or "").casefold()
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                is_ip_address = False
+            else:
+                is_ip_address = True
+            if (
+                parsed.scheme != "https" or not host or parsed.username or parsed.password
+                or is_ip_address or host == "localhost" or host.endswith(".local")
+                or (contact.kind == ContactKind.INSTAGRAM
+                    and host not in {"instagram.com", "www.instagram.com"})
+            ):
+                continue
+            url = parsed._replace(query="", fragment="").geturl().rstrip("/")
+            if url not in links:
+                links.append(url)
+            if len(links) == 4:
+                return links
+    return links
+
+
+def _web_plan_with_catalog_links(plan: SourcePlan, links: list[str]) -> SourcePlan:
+    if plan.source != ResearchSource.WEB or not links:
+        return plan
+    unique_links = [url for url in links if url not in plan.query_terms][:4]
+    # A provider task is bounded; keep the product name and as many original clues as fit.
+    terms = [*plan.query_terms[:20 - len(unique_links)], *unique_links]
+    return SourcePlan.model_validate({**plan.model_dump(), "query_terms": terms})
+
+
 def _validate_browser_result(
     plan: SourcePlan,
     value: SupplierBrowserResult,
@@ -398,29 +446,58 @@ class ResearchRunExecutor:
                 )
 
             succeeded = failed = blocked = persisted = known = incomplete = 0
+            catalog_links_by_item: dict[int, list[str]] = {}
             for branch in snapshot.branches:
                 if branch.plan.blocked_reason is not None:
                     blocked += 1
                     continue
                 if branch.plan.source == ResearchSource.OWN_DATABASE:
-                    known += await self._count_known_candidates(connection, branch)
+                    found = await self._count_known_candidates(connection, branch)
+                    known += found
+                    LOGGER.info(
+                        "research branch run=%s source=%s known=%s",
+                        run_id, branch.plan.source.value, found,
+                    )
                     succeeded += 1
                     continue
                 try:
-                    raw_result = await self.browser.search_suppliers(branch.plan)
-                    result = _validate_browser_result(branch.plan, raw_result)
+                    search_plan = _web_plan_with_catalog_links(
+                        branch.plan, catalog_links_by_item.get(branch.plan.item_index, [])
+                    )
+                    raw_result = await self.browser.search_suppliers(search_plan)
+                    result = _validate_browser_result(search_plan, raw_result)
                 except (BrowserProviderError, PermanentProviderError,
-                        RetryableProviderError, ResearchExecutionRejected, ValidationError):
+                        RetryableProviderError, ResearchExecutionRejected,
+                        ValidationError) as exc:
                     # Browser calls are the sole unreliable network boundary. Database
                     # persistence happens outside this catch and therefore remains retryable.
+                    LOGGER.warning(
+                        "research branch run=%s source=%s failed=%s detail=%s",
+                        run_id, branch.plan.source.value, type(exc).__name__,
+                        str(exc)[:240].replace("\n", " "),
+                    )
                     failed += 1
                     continue
                 try:
                     async with connection.transaction():
-                        persisted += await self._persist_branch(connection, branch, result)
-                except (PersistenceConflictError, ValueError):
+                        saved = await self._persist_branch(connection, branch, result)
+                        persisted += saved
+                except (PersistenceConflictError, ValueError) as exc:
+                    LOGGER.warning(
+                        "research branch run=%s source=%s persistence_failed=%s",
+                        run_id, branch.plan.source.value, type(exc).__name__,
+                    )
                     failed += 1
                     continue
+                LOGGER.info(
+                    "research branch run=%s source=%s pages=%s candidates=%s saved=%s",
+                    run_id, branch.plan.source.value, result.pages_examined,
+                    len(result.candidates), saved,
+                )
+                if branch.plan.source == ResearchSource.TWO_GIS:
+                    catalog_links_by_item[branch.plan.item_index] = _catalog_links(
+                        result.candidates
+                    )
                 succeeded += 1
                 if (
                     not result.exhausted
@@ -543,6 +620,12 @@ class ResearchRunExecutor:
                 )
                 evidence_ids.append(stored.id)
             primary_evidence_id = evidence_ids[0]
+            contact_evidence_id = next(
+                (evidence_id for evidence, evidence_id in zip(
+                    candidate.evidence, evidence_ids, strict=True
+                ) if EvidenceClaim.CONTACT in evidence.claims),
+                primary_evidence_id,
+            )
             existing_offer = None
             if candidate.source == ResearchSource.OLX:
                 await connection.execute(
@@ -564,16 +647,22 @@ class ResearchRunExecutor:
                 supplier_id = existing_offer["supplier_id"]
             else:
                 identity_type, identity_value = _identity(candidate)
-                supplier = await upsert_supplier(
-                    connection,
-                    SupplierInput(
-                        display_name=candidate.name,
-                        identity_type=identity_type,
-                        identity_value=identity_value,
-                        source_evidence_id=primary_evidence_id,
-                        confidence=_confidence(candidate, "name", "0.7"),
-                    ),
+                supplier_input = SupplierInput(
+                    display_name=candidate.name,
+                    identity_type=identity_type,
+                    identity_value=identity_value,
+                    source_evidence_id=primary_evidence_id,
+                    confidence=_confidence(candidate, "name", "0.7"),
                 )
+                if candidate.source == ResearchSource.OLX and candidate.contacts:
+                    supplier = await upsert_olx_supplier_by_contact(
+                        connection,
+                        supplier_input,
+                        [(contact.kind.value, contact.value)
+                         for contact in candidate.contacts],
+                    )
+                else:
+                    supplier = await upsert_supplier(connection, supplier_input)
                 supplier_id = supplier.id
             for contact in candidate.contacts:
                 await upsert_supplier_contact(
@@ -582,7 +671,8 @@ class ResearchRunExecutor:
                     SupplierContactInput(
                         contact_type=contact.kind.value,
                         display_value=contact.value,
-                        source_evidence_id=primary_evidence_id,
+                        source_evidence_id=contact_evidence_id,
+                        is_whatsapp_confirmed=(contact.kind == ContactKind.WHATSAPP),
                         confidence=Decimal(str(contact.confidence)),
                     ),
                 )
@@ -653,8 +743,11 @@ class ResearchRunExecutor:
                         source_type=_SOURCE_TYPE[candidate.source],
                         price_amount=evidence.price_amount,
                         currency=evidence.currency.upper() if evidence.currency else None,
+                        price_unit=evidence.price_unit,
                         pack_qty=evidence.pack_qty,
                         moq=evidence.moq,
+                        order_multiple=evidence.order_multiple,
+                        available_qty=evidence.available_qty,
                         availability_status=_observation_availability(evidence.availability),
                         raw_payload=evidence.model_dump(mode="json"),
                         idempotency_key=observation_key,
@@ -723,8 +816,15 @@ class ResearchRunExecutor:
         status: TerminalStatus,
         error_code: str,
     ) -> None:
-        target_case_status = "ready" if status == "failed" else "evaluating"
         async with connection.transaction():
+            target_case_status = "evaluating"
+            if status == "failed":
+                has_report = await connection.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM report_artifacts
+                       WHERE case_id=$1 AND is_current)""",
+                    case_id,
+                )
+                target_case_status = "report_ready" if has_report else "ready"
             case = await connection.fetchrow(
                 "SELECT id,status FROM procurement_cases WHERE id=$1 FOR UPDATE",
                 case_id,
@@ -744,7 +844,7 @@ class ResearchRunExecutor:
                 if updated != "UPDATE 1":
                     raise ResearchExecutionRejected("procurement case changed during completion")
             elif not (
-                (status == "failed" and case["status"] == "ready")
+                (status == "failed" and case["status"] == target_case_status)
                 or (status != "failed" and case["status"] in _ADVANCED_CASE_STATUSES)
             ):
                 raise ResearchExecutionRejected("procurement case is not in an executable state")

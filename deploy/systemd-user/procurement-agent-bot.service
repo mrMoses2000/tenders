@@ -1,5 +1,5 @@
 [Unit]
-Description=Procurement Telegram Bot, Workers and WAHA Webhook
+Description=Procurement Telegram Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/moses/tenders
 EnvironmentFile=/home/moses/tenders/.env
-ExecStart=/home/moses/tenders/.venv/bin/procurement-bot run
+ExecStart=/home/moses/tenders/.venv/bin/procurement-bot bot
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45

@@ -7,7 +7,7 @@ import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
 from procurement_bot.phone import normalize_phone
@@ -88,6 +88,12 @@ class WahaSendResult:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class WahaContactCheck:
+    number_exists: bool
+    chat_id: str | None
+
+
 def normalize_chat_id(recipient: str) -> str:
     canonical = normalize_phone(recipient)
     return f"{canonical.removeprefix('+')}@c.us"
@@ -120,6 +126,33 @@ class WahaClient:
         self._timeout_seconds = timeout_seconds
         self._transport = transport or UrllibJsonTransport()
 
+    async def check_phone_exists(self, recipient: str) -> WahaContactCheck:
+        """Check registration without creating a chat or sending a message."""
+
+        if not self._enabled:
+            raise WahaDisabledError("WAHA contact checking is disabled")
+        if not self._api_key:
+            raise WahaDisabledError("WAHA API key is not configured")
+        phone = normalize_phone(recipient).removeprefix("+")
+        query = urlencode({"phone": phone, "session": self._session})
+        response = await self._transport.request(
+            method="GET",
+            url=urljoin(self._base_url, f"api/contacts/check-exists?{query}"),
+            headers={"Accept": "application/json", "X-Api-Key": self._api_key},
+            body=None,
+            timeout_seconds=self._timeout_seconds,
+        )
+        if response.status == 422:
+            raise RetryableProviderError("WAHA session is unavailable for contact checking")
+        decoded = self._decode(response)
+        exists = decoded.get("numberExists")
+        chat_id = decoded.get("chatId")
+        if not isinstance(exists, bool):
+            raise PermanentProviderError("WAHA contact check has no boolean numberExists")
+        if exists and (not isinstance(chat_id, str) or not chat_id.strip()):
+            raise PermanentProviderError("WAHA registered contact has no chatId")
+        return WahaContactCheck(number_exists=exists, chat_id=chat_id if exists else None)
+
     async def new_message_id(self) -> str:
         """Reserve a WAHA message id before sending (GOWS/NOWEB, WAHA 2026.4.3+)."""
 
@@ -134,6 +167,8 @@ class WahaClient:
             body=None,
             timeout_seconds=self._timeout_seconds,
         )
+        if response.status == 422:
+            raise RetryableProviderError("WAHA session is not ready to reserve a message id")
         return self._extract_message_id(self._decode(response))
 
     async def send_text(
@@ -177,7 +212,14 @@ class WahaClient:
             timeout_seconds=self._timeout_seconds,
         )
         decoded = self._decode(response)
-        external_id = self._extract_message_id(decoded)
+        if "error" in decoded:
+            raise PermanentProviderError("WAHA sendText returned an error")
+        try:
+            external_id = self._extract_message_id(decoded)
+        except RetryableProviderError:
+            # NOWEB can accept the send with a 2xx response before returning a
+            # WAMessage. The caller reserved this exact id before the request.
+            external_id = f"true_{normalize_chat_id(recipient)}_{provider_message_id}"
         return WahaSendResult(external_message_id=external_id, raw=decoded)
 
     @staticmethod

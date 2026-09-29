@@ -29,7 +29,12 @@ from procurement_bot.research import (
     SupplierEvidence,
     build_research_plan,
 )
-from procurement_bot.research_execution import ResearchRunExecutor, _QueryBranch
+from procurement_bot.research_execution import (
+    ResearchRunExecutor,
+    _catalog_links,
+    _QueryBranch,
+    _web_plan_with_catalog_links,
+)
 from procurement_bot.suppliers import UpsertResult
 
 
@@ -97,7 +102,10 @@ def _query_row(run_id: UUID, branch: Any, ordinal: int) -> dict[str, Any]:
 
 
 class _Connection:
-    def __init__(self, *, mutate_query: bool = False, private_price: bool = False) -> None:
+    def __init__(
+        self, *, mutate_query: bool = False, private_price: bool = False,
+        has_report: bool = False,
+    ) -> None:
         plan = _plan()
         self.run_id = uuid4()
         self.case_id = uuid4()
@@ -122,6 +130,7 @@ class _Connection:
             "error_code": "",
         }
         self.case = {"id": self.case_id, "status": "researching"}
+        self.has_report = has_report
         self.queries = [
             _query_row(self.run_id, branch, ordinal)
             for ordinal, branch in enumerate(plan.source_plans)
@@ -147,6 +156,8 @@ class _Connection:
         raise AssertionError(f"unexpected fetch: {sql}")
 
     async def fetchval(self, sql: str, *args: Any) -> int:
+        if "FROM report_artifacts" in sql:
+            return self.has_report
         if "count(DISTINCT o.supplier_id)" in sql:
             return 2
         raise AssertionError(f"unexpected fetchval: {sql}")
@@ -181,6 +192,88 @@ class _Browser:
 
     async def resolve_locality(self, task: Any) -> Any:  # pragma: no cover - not used here
         raise AssertionError("locality resolution is not an execution operation")
+
+
+def test_2gis_catalog_links_become_web_product_research_hints() -> None:
+    candidate = SupplierCandidate(
+        source=ResearchSource.TWO_GIS,
+        external_id="70000001077212301",
+        name="Центр крепежа",
+        contacts=[
+            SupplierContact(kind=ContactKind.WEBSITE, value="https://ck.kz/", confidence=1),
+            SupplierContact(
+                kind=ContactKind.INSTAGRAM,
+                value="https://www.instagram.com/centerkrepezha/",
+                confidence=1,
+            ),
+            SupplierContact(kind=ContactKind.WEBSITE, value="https://127.0.0.1/", confidence=1),
+        ],
+        evidence=[SupplierEvidence(
+            evidence_type=EvidenceType.BUSINESS_LISTING,
+            source=ResearchSource.TWO_GIS,
+            source_url="https://2gis.kz/almaty/firm/70000001077212301",
+            observed_at=datetime.now(UTC),
+            raw_snapshot_sha256="c" * 64,
+            claims=[EvidenceClaim.BUSINESS_IDENTITY, EvidenceClaim.CONTACT],
+        )],
+    )
+    links = _catalog_links([candidate])
+    web = next(branch for branch in _plan().source_plans if branch.source == ResearchSource.WEB)
+    enriched = _web_plan_with_catalog_links(web, links)
+
+    assert links == ["https://ck.kz", "https://www.instagram.com/centerkrepezha"]
+    assert enriched.query_terms[-2:] == links
+    assert web.query_terms == ["Марля"]
+    assert enriched.rendered_query == web.rendered_query
+
+
+@pytest.mark.asyncio
+async def test_executor_passes_2gis_site_to_following_web_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection()
+
+    class CatalogBrowser(_Browser):
+        async def search_suppliers(self, plan: Any) -> SupplierBrowserResult:
+            self.calls.append(plan)
+            candidates = []
+            if plan.source == ResearchSource.TWO_GIS:
+                candidates = [SupplierCandidate(
+                    source=ResearchSource.TWO_GIS,
+                    external_id="70000001077212301",
+                    name="Центр крепежа",
+                    contacts=[SupplierContact(
+                        kind=ContactKind.WEBSITE, value="https://ck.kz", confidence=1,
+                    )],
+                    evidence=[SupplierEvidence(
+                        evidence_type=EvidenceType.BUSINESS_LISTING,
+                        source=ResearchSource.TWO_GIS,
+                        source_url="https://2gis.kz/almaty/firm/70000001077212301",
+                        observed_at=datetime.now(UTC),
+                        raw_snapshot_sha256="c" * 64,
+                        claims=[EvidenceClaim.BUSINESS_IDENTITY, EvidenceClaim.CONTACT],
+                    )],
+                )]
+            return SupplierBrowserResult(
+                spec_sha256=BROWSER_SPEC_SHA256,
+                request_sha256=execution_module._request_hash(plan),
+                candidates=candidates,
+                exhausted=True,
+                pages_examined=1,
+            )
+
+    browser = CatalogBrowser()
+    executor = ResearchRunExecutor(connection, browser)  # type: ignore[arg-type]
+
+    async def fake_persist(*args: Any) -> int:
+        return len(args[-1].candidates)
+
+    monkeypatch.setattr(executor, "_persist_branch", fake_persist)
+    result = await executor.execute(connection.run_id)
+
+    assert result.status == "succeeded"
+    assert browser.calls[1].source == ResearchSource.WEB
+    assert "https://ck.kz" in browser.calls[1].query_terms
 
 
 @pytest.mark.asyncio
@@ -243,6 +336,17 @@ async def test_one_provider_failure_produces_partial_result() -> None:
     assert result.branches_failed == 1
     assert result.error_code == "source_failed"
     assert connection.case["status"] == "evaluating"
+
+
+@pytest.mark.asyncio
+async def test_failed_followup_keeps_case_report_ready() -> None:
+    connection = _Connection(has_report=True)
+    executor = ResearchRunExecutor(connection, _Browser())  # type: ignore[arg-type]
+    await executor._terminalize(
+        connection, run_id=connection.run_id, case_id=connection.case_id,
+        status="failed", error_code="all_research_branches_failed",
+    )
+    assert connection.case["status"] == "report_ready"
 
 
 @pytest.mark.asyncio

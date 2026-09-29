@@ -34,6 +34,7 @@ class _Connection:
         self.case_id = uuid4()
         self.run_id = uuid4()
         self.item_id = uuid4()
+        self.requirement_id = uuid4()
         self.offer_id = uuid4()
         self.supplier_id = uuid4()
         self.now = datetime(2026, 9, 23, 4, 0, tzinfo=UTC)
@@ -65,15 +66,25 @@ class _Connection:
                 "unit": "рулон",
                 "analogs_allowed": False,
                 "status": "offers_found",
+                "tender_unit_price_private": Decimal("1500"),
+                "tender_currency": "KZT",
             }
         ]
         self.requirements = [
             {
+                "id": self.requirement_id,
                 "request_item_id": self.item_id,
                 "requirement_key": "ГОСТ",
                 "is_hard": True,
                 "source_pointer": "p1",
             }
+        ]
+        self.technical_reviews = [
+            {"id": uuid4(), "offer_id": self.offer_id, "requirement_id": None,
+             "verdict": "match", "created_at": self.now},
+            {"id": uuid4(), "offer_id": self.offer_id,
+             "requirement_id": self.requirement_id,
+             "verdict": "match", "created_at": self.now},
         ]
         self.offers = [
             {
@@ -98,6 +109,14 @@ class _Connection:
                 "price_amount": Decimal("1250"),
                 "currency": "KZT",
                 "price_unit": None,
+                "pack_qty": None,
+                "moq": None,
+                "order_multiple": None,
+                "available_qty": None,
+                "stock_source_type": None,
+                "source_type": "supplier_message",
+                "supplier_phone": "+77000000000",
+                "is_whatsapp_confirmed": True,
                 "availability_status": "in_stock_unquantified",
                 "vat_status": "unknown",
                 "delivery_status": "unknown",
@@ -134,21 +153,24 @@ class _Connection:
             if "WHERE id=$1" in sql:
                 return self.run if args[0] == self.run_id else None
             return self.run if args[0] == self.case_id else None
+        if "WITH case_suppliers AS" in sql:
+            return {"contacted": 0, "whatsapp_unavailable": 1, "whatsapp_failed": 0}
         if "FROM workflow_events" in sql:
             return self.events.get(str(args[0]))
         if "FROM report_artifacts" in sql:
             return self.reports.get(args[0])  # type: ignore[arg-type]
-        if "WITH case_suppliers AS" in sql:
-            return {"contacted": 0, "whatsapp_unavailable": 1, "whatsapp_failed": 0}
         raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
     async def fetch(self, sql: str, *args: object) -> list[dict[str, Any]]:
         self.sql.append(sql)
         if "FROM request_items" in sql:
             return self.items
-        if "FROM item_requirements" in sql:
-            assert args[0] == [self.item_id]
+        if "FROM item_requirements r" in sql:
+            assert args[0] == self.case_id
             return self.requirements
+        if "FROM offer_technical_reviews review" in sql:
+            assert args[0] == self.case_id
+            return self.technical_reviews
         if "FROM offers AS o" in sql:
             assert args[0] == self.case_id
             return self.offers
@@ -239,11 +261,19 @@ async def test_builds_private_report_without_inventing_total_cost_rank(
     assert len(calls) == 1
     html = calls[0]["html"]
     assert "1 250.00 KZT" in html
-    assert "соответствие подтверждено" in html
+    assert "ТЗ проверено оператором" in html
     assert '<span class="rank">' not in html
-    assert "Уточнить, за какую единицу указана цена" in html
-    assert "Уточнить, включён ли НДС" in html
-    assert "latest.observed_at DESC" in "\n".join(connection.sql)
+    assert "Уточнить единицу цены" in html
+    assert "Уточнить НДС" not in html
+    assert "ob.observed_at DESC" in "\n".join(connection.sql)
+    offers_sql = next(sql for sql in connection.sql if "FROM offers AS o" in sql)
+    assert "contact_evidence" in offers_sql
+    assert "rr.case_id=ri.case_id" in offers_sql
+    assert "offer_observations own_observation" in offers_sql
+    assert "contact_evidence_ids" in offers_sql
+    contact_metrics_sql = next(sql for sql in connection.sql if "WITH case_suppliers AS" in sql)
+    assert "contact_evidence" in contact_metrics_sql
+    assert "rr.case_id=$1" in contact_metrics_sql
     assert connection.outbox[0]["event_type"] == "telegram.send_document"
     assert connection.outbox[0]["payload"]["storage_path"] == "reports/aa/report.html"
     assert connection.outbox[0]["payload"]["filename"] == "otchet-po-zayavke.html"
@@ -322,6 +352,7 @@ async def test_unknown_offer_remains_unconfirmed_and_unranked(
         evidence_title=None,
         source_locator=None,
     )
+    connection.technical_reviews = []
     calls = await _install_artifact_fake(monkeypatch, connection)
 
     result = await build_case_report(
@@ -332,7 +363,7 @@ async def test_unknown_offer_remains_unconfirmed_and_unranked(
 
     html = calls[0]["html"]
     assert result.exact_matches == 0
-    assert "требуется подтверждение" in html
+    assert "ТЗ не проверено" in html
     assert "Цена не подтверждена" in html
     assert "наличие не подтверждено" in html
     assert '<span class="rank">' not in html

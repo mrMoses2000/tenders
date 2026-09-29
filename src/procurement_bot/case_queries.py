@@ -178,7 +178,8 @@ async def answer_case_query(
             owner_user_id=owner_user_id,
         )
         margin = (
-            "не вычисляется: нет суммы тендера или есть покупки без цены"
+            "не вычисляется: нет суммы тендера, есть покупки без цены "
+            "или доставки без фактической стоимости"
             if snapshot.provisional_margin is None
             else f"{snapshot.provisional_margin:.2f} {snapshot.currency}"
         )

@@ -1,0 +1,24 @@
+[Unit]
+Description=Temporary Cloudflare Tunnel for Procurement Mini App
+After=network-online.target procurement-mini-app.service
+Wants=network-online.target procurement-mini-app.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moses/tenders
+ExecStart=/home/moses/tenders/.venv/bin/python /home/moses/tenders/scripts/run_mini_app_tunnel.py
+Restart=always
+RestartSec=15
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/moses/tenders
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=default.target

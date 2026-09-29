@@ -14,6 +14,7 @@ from procurement_bot.approvals import payload_sha256
 from procurement_bot.errors import ValidationBlocked
 from procurement_bot.phone import normalize_phone
 from procurement_bot.queue import enqueue_outbox, stable_key
+from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
 from procurement_bot.supplier_dialogue import (
     DEFAULT_SEND_POLICY,
     SendContext,
@@ -298,11 +299,20 @@ async def start_approved_whatsapp_send(
                       AND message.received_at >= $2) AS sent_today
             FROM supplier_conversations AS c
             JOIN supplier_contacts AS contact ON contact.id=c.supplier_contact_id
-            WHERE c.id=$1
+            JOIN source_evidence AS contact_evidence
+              ON contact_evidence.id=contact.source_evidence_id
+            WHERE c.id=$1 AND c.case_id=$3
+              AND __CONTACT_SCOPE__
             FOR UPDATE OF c,contact
-            """,
+            """.replace(
+                "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
+                    contact_alias="contact", evidence_alias="contact_evidence",
+                    case_param="$3",
+                ),
+            ),
             payload.conversation_id,
             day_started_at,
+            payload.case_id,
         )
         if conversation is None:
             raise WhatsAppSendDenied("approved WhatsApp conversation does not exist")

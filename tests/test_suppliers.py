@@ -25,6 +25,7 @@ from procurement_bot.suppliers import (
     normalize_supplier_identity,
     upsert_offer,
     upsert_offer_observation,
+    upsert_olx_supplier_by_contact,
     upsert_source_evidence,
     upsert_supplier,
     upsert_supplier_contact,
@@ -38,6 +39,60 @@ def test_normalization_is_deterministic_for_kazakhstan_supplier_identities() -> 
     assert normalize_supplier_identity("domain", "https://WWW.Example.KZ/shop") == "example.kz"
     assert normalize_supplier_identity("instagram", "https://instagram.com/Med_Snab/") == "med_snab"
     assert normalize_supplier_identity("bin_iin", "123 456 789 012") == "123456789012"
+
+
+@pytest.mark.asyncio
+async def test_olx_supplier_reuses_contact_owner_and_rejects_alias_conflict() -> None:
+    owner_id = uuid4()
+    other_id = uuid4()
+
+    class _Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _Connection:
+        def __init__(self, alias_owner=None):
+            self.alias_owner = alias_owner
+            self.commands = []
+
+        def transaction(self):
+            return _Transaction()
+
+        async def execute(self, query, *args):
+            self.commands.append((query, args))
+            return "INSERT 0 1"
+
+        async def fetchrow(self, query, *_args):
+            if "FROM supplier_aliases" in query:
+                return ({"supplier_id": self.alias_owner}
+                        if self.alias_owner is not None else None)
+            if "FROM supplier_contacts" in query:
+                return {"supplier_id": owner_id}
+            raise AssertionError(query)
+
+    supplier = SupplierInput(
+        display_name="Продавец OLX",
+        identity_type="source_record",
+        identity_value="olx_seller:abc123",
+        source_evidence_id=uuid4(),
+    )
+    connection = _Connection()
+    resolved = await upsert_olx_supplier_by_contact(
+        connection, supplier, [("phone", "8 777 123 45 67")],
+    )
+    assert resolved.id == owner_id and not resolved.created
+    assert any("INSERT INTO supplier_aliases" in query
+               for query, _args in connection.commands)
+
+    with pytest.raises(SupplierIdentityConflictError):
+        await upsert_olx_supplier_by_contact(
+            _Connection(alias_owner=other_id),
+            supplier,
+            [("phone", "8 777 123 45 67")],
+        )
 
 
 def test_location_key_uses_all_identity_fields_but_not_evidence() -> None:

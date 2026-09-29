@@ -6,10 +6,23 @@ const initData = tg?.initData || "";
 const base = new URL(".", window.location.href).pathname;
 const $ = id => document.getElementById(id);
 const state = {tab: "cases", q: "", status: "", city: "", offset: 0, loading: false, controller: null};
-const detailColumns = {spec: false, history: false, finance: false};
+const detailColumns = {spec: false, history: false, finance: true, delivery: true};
 try { Object.assign(detailColumns, JSON.parse(localStorage.getItem("tender-detail-columns") || "{}")); } catch (_) { /* private storage */ }
+const configurableFields = ["Требуется", "Этап по Notion", "Поставлено по Notion", "Техспек",
+  "Уточнение", "Местонахождение по Notion", "Принято по Notion", "Отклонено по Notion",
+  "Остаток по Notion", "Закуплено, подтверждено", "Сейчас в пути", "Принято, подтверждено",
+  "Поступило на склад, события", "Передано заказчику, события", "Отклонено заказчиком, события",
+  "Возвращено, события", "Отменено, события", "Цена тендера за единицу",
+  "Распределённая доставка", "Дополнительные расходы, факт", "Дополнительные расходы, план"];
+let hiddenFields = ["Дополнительные расходы, план"];
+try {
+  const saved = JSON.parse(localStorage.getItem("tender-hidden-fields") || "[]");
+  if (Array.isArray(saved)) hiddenFields = saved.filter(value => configurableFields.includes(value));
+} catch (_) { /* private storage */ }
 const expenseNames = {delivery: "Доставка", handling: "Погрузка", packaging: "Упаковка",
   commission: "Комиссия", travel: "Поездка", storage: "Хранение", other: "Другое"};
+const loadingNames = {unknown: "Условия погрузки неизвестны", included: "Погрузка включена в тариф",
+  separate: "Погрузка оплачивается отдельно", not_required: "Погрузка не требуется"};
 
 const labels = {
   draft: "Черновик", needs_clarification: "Нужно уточнить", ready: "Готова к поиску",
@@ -20,7 +33,18 @@ const labels = {
   lead: "Лид", confirm: "Подтвердить", exact: "Совпадает",
   mismatch: "Не подходит", not_found: "Не найден", withdrawn: "Снят",
   in_stock: "В наличии", in_stock_unquantified: "Наличие без количества",
-  out_of_stock: "Нет в наличии", preorder: "Под заказ"
+  out_of_stock: "Нет в наличии", preorder: "Под заказ",
+  untracked: "Статус не указан", planned: "Запланирована",
+  in_transit: "В пути", arrived: "Прибыла", completed: "Рейс завершён"
+};
+const comparisonBlockers = {
+  technical_not_verified: "ТЗ ещё не проверено", price_not_confirmed: "Цена не подтверждена продавцом",
+  required_quantity_unknown: "Не указано нужное количество", price_unknown: "Цена неизвестна",
+  currency_not_comparable: "Другая валюта", stock_quantity_unknown: "Количество на складе неизвестно",
+  stock_not_confirmed: "Остаток только из объявления", out_of_stock: "Нет в наличии",
+  pack_quantity_unknown: "Неизвестна фасовка", price_unit_unknown_or_mismatch: "Неясная единица цены",
+  order_multiple_unknown: "Неизвестна кратность заказа", insufficient_stock: "Не хватает на всю партию",
+  invalid_moq: "Ошибка минимальной партии", invalid_order_multiple: "Ошибка кратности заказа"
 };
 
 function el(tag, className, value) {
@@ -38,41 +62,94 @@ function fmtNumber(value) {
 function quantity(value, unit = "") {
   return value === null || value === undefined ? "—" : fmtNumber(value) + (unit ? " " + unit : "");
 }
+function applyDetailVisibility() {
+  document.querySelectorAll("[data-detail-column], [data-field-key]").forEach(node => {
+    node.hidden = Boolean((node.dataset.detailColumn && !detailColumns[node.dataset.detailColumn])
+      || (node.dataset.fieldKey && hiddenFields.includes(node.dataset.fieldKey)));
+  });
+}
 function detailOptions() {
   const panel = el("div", "detail-options");
   panel.append(el("span", "", "ПОКАЗЫВАТЬ"));
   [["spec", "Техспек"], ["history", "Этапы и количества"],
-    ["finance", "Тендерная цена и расходы"]].forEach(([key, label]) => {
+    ["delivery", "Доставки"], ["finance", "Тендерная цена и расходы"]]
+    .forEach(([key, label]) => {
     const control = el("label", "detail-option");
     const input = el("input");
     input.type = "checkbox";
     input.checked = Boolean(detailColumns[key]);
     input.addEventListener("change", () => {
       detailColumns[key] = input.checked;
-      document.querySelectorAll(`[data-detail-column="${key}"]`).forEach(node => { node.hidden = !input.checked; });
+      applyDetailVisibility();
       try { localStorage.setItem("tender-detail-columns", JSON.stringify(detailColumns)); } catch (_) { /* private storage */ }
     });
     control.append(input, el("span", "", label));
     panel.append(control);
   });
+  const fields = el("details", "field-options");
+  fields.append(el("summary", "", "Выбрать отдельные поля позиций"));
+  const choices = el("div", "field-options-grid");
+  configurableFields.forEach(key => {
+    const label = el("label", "detail-option");
+    const checkbox = el("input"); checkbox.type = "checkbox";
+    checkbox.checked = !hiddenFields.includes(key);
+    checkbox.addEventListener("change", () => {
+      hiddenFields = checkbox.checked ? hiddenFields.filter(value => value !== key)
+        : [...hiddenFields, key];
+      try { localStorage.setItem("tender-hidden-fields", JSON.stringify(hiddenFields)); } catch (_) { /* private storage */ }
+      applyDetailVisibility();
+    });
+    label.append(checkbox, el("span", "", key));
+    choices.append(label);
+  });
+  fields.append(choices);
+  panel.append(fields);
   return panel;
 }
 function detailField(key, value, column) {
   const row = el("div", "item-field");
-  if (column) { row.dataset.detailColumn = column; row.hidden = !detailColumns[column]; }
+  if (column) row.dataset.detailColumn = column;
+  if (configurableFields.includes(key)) row.dataset.fieldKey = key;
+  row.hidden = Boolean((column && !detailColumns[column]) || hiddenFields.includes(key));
   row.append(el("span", "", key), el("strong", "", value));
   return row;
 }
-function offerCard(offer) {
+function offerCard(offer, context = {}) {
   const line = el("div", "offer-line");
   const top = el("div", "offer-top");
   top.append(el("strong", "", offer.supplier_name), badge(offer.status));
+  if (offer.comparison?.rank && offer.comparison.rank <= 5) {
+    top.append(el("span", "offer-rank", "№" + offer.comparison.rank));
+  }
   line.append(top, el("div", "offer-product", offer.supplier_product_name || "Товар не указан"));
   line.append(meta(
     offer.price_amount === null ? "Цена не указана" : "Цена из источника " + fmtNumber(offer.price_amount) + " " + (offer.currency === "KZT" ? "₸" : offer.currency || ""),
-    offer.supplier_city, offer.availability_status === "unknown" ? "Наличие не подтверждено" : labels[offer.availability_status] || offer.availability_status,
+    offer.price_unit ? "за " + offer.price_unit : "Единица цены неизвестна",
+    offer.supplier_city,
+    offer.stock_source_type === "supplier_message" && offer.available_qty !== null
+      ? "Поставщик сообщил остаток: " + fmtNumber(offer.available_qty)
+      : "Остаток партии не подтверждён",
     offer.observed_at ? "Проверено " + fmtDate(offer.observed_at) : "Дата не указана"
   ));
+  const comparison = offer.comparison;
+  if (comparison?.goods_total !== null && comparison?.goods_total !== undefined) {
+    line.append(detailField("Товар на нужную партию",
+      quantity(comparison.goods_total, comparison.currency === "KZT" ? "₸" : comparison.currency)));
+    if (comparison.purchased_quantity !== null) line.append(detailField("Купить с учётом фасовки",
+      quantity(comparison.purchased_quantity, context.item?.unit || "")));
+  }
+  if (comparison?.tender_total !== null && comparison?.tender_total !== undefined) {
+    line.append(detailField("Сумма по тендеру", quantity(comparison.tender_total, "₸")));
+  }
+  if (comparison?.tender_difference !== null && comparison?.tender_difference !== undefined) {
+    line.append(detailField("Разница без доставки", quantity(comparison.tender_difference, "₸")));
+  }
+  if (comparison?.blockers?.length) {
+    line.append(el("p", "offer-blockers", "Для точного сравнения: " +
+      comparison.blockers.map(code => comparisonBlockers[code] || code).join("; ")));
+  } else if (comparison?.rank) {
+    line.append(el("p", "offer-ready", "ТЗ и количество проверены; цена получена от поставщика."));
+  }
   if (offer.moq !== null && offer.moq !== undefined) line.append(el("div", "offer-product",
     "Минимальная партия: " + quantity(offer.moq, offer.price_unit === "piece" ? "шт" : "")));
   if (offer.pack_qty !== null && offer.pack_qty !== undefined) line.append(el("div", "offer-product",
@@ -84,7 +161,265 @@ function offerCard(offer) {
     source.rel = "noopener noreferrer";
     line.append(source);
   }
+  if (offer.supplier_id) line.append(supplierDetails(offer.supplier_id, offer.id));
+  if (context.caseId && context.editable) line.append(technicalReviewPanel(offer, context));
   return line;
+}
+
+function technicalReviewPanel(offer, {caseId, item, requirements = [], reviews = []}) {
+  const panel = el("details", "technical-review");
+  panel.append(el("summary", "", "Проверить соответствие ТЗ"));
+  const description = el("p", "data-note", item.specification_text || "Техспек позиции отсутствует");
+  panel.append(description);
+  if (!item.specification_text) return panel;
+  const itemRequirements = requirements.filter(row => row.request_item_id === item.id);
+  const relevant = itemRequirements.filter(row => row.is_hard);
+  const notesByRequirement = new Map();
+  const evidenceByRequirement = new Map();
+  {
+    const wholeSpecOnly = itemRequirements.length === 0;
+    const endpoint = "/api/cases/" + caseId + "/offers/" + offer.id + "/technical-assessment";
+    const assistant = el("div", "technical-assistant");
+    const actions = el("div", "technical-actions");
+    const request = el("button", "entry-submit", "Предложить проверку по доказательствам");
+    const refresh = el("button", "entry-submit", "Обновить результат");
+    request.type = refresh.type = "button";
+    const status = el("p", "data-note", wholeSpecOnly
+      ? "ИИ проверит техспек целиком, без выдуманной разбивки на требования. Это только подсказка; решение принимает оператор."
+      : "ИИ может подготовить подсказки по отдельным требованиям; решение принимает оператор.");
+    const suggestions = el("div", "technical-suggestions");
+    let loaded = false;
+    let polls = 0;
+    let timer = null;
+    function renderAssessment(value) {
+      suggestions.replaceChildren();
+      if (!value) { status.textContent = "Подсказки ещё не запрашивались."; return; }
+      const captions = {queued: "Проверяем доказательства…", failed: "Проверка не удалась: " +
+        (value.error_code || "неизвестная причина"), stale: "Доказательства изменились. Запустите новую проверку.",
+      operator_review_required: "Подсказки готовы. Сверьте цитаты и подтвердите каждое решение сами."};
+      status.textContent = captions[value.status] || value.status;
+      (value.claims || []).forEach(claim => {
+        const requirement = relevant.find(row => row.id === claim.requirement_id);
+        const card = el("div", "technical-suggestion");
+        const verdict = {match: "Вероятно подходит", mismatch: "Возможно не подходит",
+          unknown: "Недостаточно данных"}[claim.verdict] || "Неизвестно";
+        const requirementLabel = wholeSpecOnly
+          ? "Весь техспек · без атомарной разбивки"
+          : (requirement?.requirement_key || "Требование");
+        card.append(el("strong", "", requirementLabel + " · " + verdict),
+          el("p", "data-note", claim.note || ""));
+        if (claim.evidence_quote) card.append(el("blockquote", "", claim.evidence_quote));
+        const manualRequirementId = wholeSpecOnly ? null : claim.requirement_id;
+        if (value.status === "operator_review_required" && claim.verdict !== "unknown"
+            && notesByRequirement.has(manualRequirementId)) {
+          const use = el("button", "entry-submit", "Перенести основание в ручную проверку");
+          use.type = "button";
+          use.addEventListener("click", () => {
+            const note = notesByRequirement.get(manualRequirementId);
+            if (!note) return;
+            note.value = claim.note + (claim.evidence_quote ? " Цитата: «" + claim.evidence_quote + "»" : "");
+            if (claim.source_evidence_id) evidenceByRequirement.set(
+              manualRequirementId, claim.source_evidence_id);
+            note.focus(); note.scrollIntoView({block: "center", behavior: "smooth"});
+          });
+          card.append(use);
+        }
+        suggestions.append(card);
+      });
+    }
+    async function loadAssessment() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      try {
+        const response = await api(endpoint);
+        renderAssessment(response.assessment);
+        if (response.assessment?.status === "queued" && polls < 48 && panel.isConnected) {
+          polls += 1;
+          timer = setTimeout(loadAssessment, 5000);
+        }
+      } catch (error) { status.textContent = error.message; }
+    }
+    request.addEventListener("click", async () => {
+      request.disabled = true;
+      polls = 0;
+      try {
+        await apiWrite(endpoint, {request_key: crypto.randomUUID()});
+        await loadAssessment();
+      } catch (error) { status.textContent = error.message; }
+      finally { request.disabled = false; }
+    });
+    refresh.addEventListener("click", () => { polls = 0; loadAssessment(); });
+    panel.addEventListener("toggle", () => {
+      if (panel.open && !loaded) { loaded = true; loadAssessment(); }
+      if (!panel.open && timer) { clearTimeout(timer); timer = null; }
+    });
+    actions.append(request, refresh);
+    assistant.append(actions, status, suggestions);
+    panel.append(assistant);
+  }
+  const checks = [{id: null, label: "Весь техспек"}, ...relevant.map(row => ({
+    id: row.id,
+    label: row.requirement_key + (row.expected_value?.value ? " · " + row.expected_value.value : "")
+  }))];
+  checks.forEach(check => {
+    const latest = reviews.find(row => row.offer_id === offer.id && row.requirement_id === check.id);
+    const box = el("div", "technical-check");
+    box.append(el("strong", "", check.label));
+    if (latest) box.append(el("small", "data-note", "Последняя проверка: " +
+      (latest.verdict === "match" ? "подходит" : "не подходит") + " · " + latest.note));
+    const note = el("textarea", "technical-note");
+    note.placeholder = "На основании какой характеристики, карточки или ответа?";
+    note.maxLength = 2000;
+    note.setAttribute("aria-label", "Основание проверки: " + check.label);
+    notesByRequirement.set(check.id, note);
+    box.append(note);
+    const actions = el("div", "technical-actions");
+    [["match", "Подходит"], ["mismatch", "Не подходит"]].forEach(([verdict, label]) => {
+      const button = el("button", "entry-submit", label);
+      button.type = "button";
+      button.addEventListener("click", async () => {
+        if (note.value.trim().length < 3) {
+          note.focus(); return;
+        }
+        button.disabled = true;
+        try {
+          await apiWrite("/api/cases/" + caseId + "/offers/" + offer.id + "/technical-reviews", {
+            idempotency_key: crypto.randomUUID(), requirement_id: check.id,
+            source_evidence_id: evidenceByRequirement.get(check.id) ||
+              offer.source_evidence_id || null,
+            verdict, note: note.value.trim()
+          });
+          await openDetail(caseId);
+        } catch (error) {
+          box.append(el("p", "entry-feedback", error.message));
+          button.disabled = false;
+        }
+      });
+      actions.append(button);
+    });
+    box.append(actions); panel.append(box);
+  });
+  return panel;
+}
+
+function negotiationLabel(conversation) {
+  if (conversation.opted_out || conversation.state === "opted_out") return "Попросил не писать";
+  if (conversation.state === "closed_no_reply") return "Не ответил";
+  if (conversation.last_reply_kind === "needs_time") return "Поставщик попросил подождать";
+  if (conversation.last_reply_kind === "referral") return "Дал другой контакт";
+  if (conversation.last_reply_kind === "spec_mismatch") return "Характеристики не подходят";
+  if (conversation.last_reply_kind === "unavailable") return "Товара нет в наличии";
+  if (conversation.last_reply_kind === "available") return "Наличие подтвердил, проверяем ТЗ";
+  if (conversation.last_reply_kind === "spec_confirmed") return "Характеристики подтвердил, уточняем цену";
+  if (conversation.last_reply_kind === "price_received") return "Цена получена, требуется сравнение";
+  if (conversation.state === "escalated") return "Ответ требует проверки";
+  if (!Number(conversation.outbound_count)) {
+    if (conversation.approval_status === "expired") return "Черновик истёк — обновите в заявке";
+    if (conversation.approval_status === "requested") return "Сообщение ожидает одобрения";
+    if (conversation.approval_status === "approved") return "Сообщение поставлено в очередь";
+    return "Пока не связались";
+  }
+  if (!Number(conversation.inbound_count)) return "Написали, ждём ответа";
+  if (conversation.state === "waiting_spec") return "Ответил, уточняем характеристики";
+  if (conversation.state === "waiting_price") return "Ответил, уточняем цену";
+  if (conversation.state === "complete") return "Ответ получен, проверьте результат";
+  return "Переписка ведётся";
+}
+
+function supplierDetails(supplierId, offerId = null) {
+  const details = el("details", "supplier-details");
+  details.append(el("summary", "", "Поставщик · контакты и переговоры"));
+  const content = el("div", "supplier-details-content");
+  details.append(content);
+  let loaded = false;
+  details.addEventListener("toggle", async () => {
+    if (!details.open || loaded) return;
+    loaded = true;
+    content.replaceChildren(el("p", "data-note", "Загружаем карточку…"));
+    try {
+      const data = await api("/api/suppliers/" + encodeURIComponent(supplierId));
+      content.replaceChildren();
+      content.append(el("strong", "", data.supplier.display_name));
+      if (data.supplier.legal_name) content.append(detailField(
+        "Юридическое название", data.supplier.legal_name));
+      if (["blocked", "merged"].includes(data.supplier.status)) content.append(el(
+        "p", "data-note", "Поставщик отмечен как недоступный для связи."));
+      const related = (data.conversations || []).filter(row => !offerId || row.offer_id === offerId);
+      content.append(el("p", "data-note", related.length
+        ? "Переговоры по этой позиции" : "По этой позиции переписка пока не начата"));
+      related.forEach(row => {
+        const entry = el("div", "supplier-conversation");
+        entry.append(el("strong", "", negotiationLabel(row)),
+          meta("Отправлено: " + row.outbound_count, "Ответов: " + row.inbound_count,
+            row.last_message_at ? "Последнее сообщение: " + fmtDate(row.last_message_at) : ""));
+        if (row.last_message_text) entry.append(el("p", "data-note",
+          (row.last_message_direction === "inbound" ? "Поставщик: " : "Бот: ")
+            + row.last_message_text.slice(0, 500)));
+        content.append(entry);
+      });
+      const relatedConversationIds = new Set(related.map(row => row.id));
+      (data.referrals || []).filter(row => relatedConversationIds.has(row.conversation_id))
+        .forEach(referral => {
+          const entry = el("div", "supplier-contact");
+          entry.append(el("span", "", "Поставщик предложил другой номер: "
+            + referral.normalized_phone + " · требуется проверка связи и WhatsApp"));
+          const phone = el("a", "offer-source", "Позвонить");
+          phone.href = "tel:" + referral.normalized_phone;
+          const wa = el("a", "offer-source", "Проверить WhatsApp ↗");
+          wa.href = "https://wa.me/" + referral.normalized_phone.replace(/\D/g, "");
+          wa.target = "_blank"; wa.rel = "noopener noreferrer";
+          entry.append(phone, wa); content.append(entry);
+        });
+      (data.contact_enrichment || []).slice(0, 1).forEach(check => {
+        const text = {
+          blocked: "Карточка 2GIS была недоступна: " + (check.access_issue || "неизвестная причина"),
+          contact_needs_review: "Карточка проверена: "
+            + (check.conflicting_contacts || 0) + " совпадающих с другими фирмами и "
+            + (check.invalid_contacts || 0) + " некорректных контактов требуют проверки",
+          no_phone: "Карточка проверена, доступного номера не найдено",
+          contact_found: "Контакты получены из карточки 2GIS"
+        }[check.outcome] || "Карточка 2GIS проверена";
+        const entry = el("p", "data-note", text);
+        if (check.card_url && /^https:\/\/2gis\.kz\//i.test(check.card_url)) {
+          const link = el("a", "offer-source", " Открыть карточку ↗");
+          link.href = check.card_url; link.target = "_blank";
+          link.rel = "noopener noreferrer"; entry.append(link);
+        }
+        content.append(entry);
+      });
+      if (!(data.contacts || []).length) content.append(el("p", "data-note",
+        "Контакт не найден в карточке. Нужна дополнительная проверка."));
+      (data.contacts || []).forEach(contact => {
+        const row = el("div", "supplier-contact");
+        row.append(el("span", "", (contact.label || contact.contact_type) + " · "
+          + contact.display_value));
+        if (["phone", "whatsapp"].includes(contact.contact_type)) {
+          const phone = el("a", "offer-source", "Позвонить");
+          phone.href = "tel:" + contact.normalized_value;
+          row.append(phone);
+          const wa = el("a", "offer-source", contact.is_whatsapp_confirmed
+            ? "Открыть WhatsApp ↗" : "Проверить WhatsApp ↗");
+          wa.href = "https://wa.me/" + contact.normalized_value.replace(/\D/g, "");
+          wa.target = "_blank"; wa.rel = "noopener noreferrer";
+          row.append(wa);
+          if (!contact.is_whatsapp_confirmed) row.append(el("small", "data-note",
+            "Наличие WhatsApp на этом номере ещё не подтверждено"));
+        }
+        if (contact.source_url && /^https:\/\//i.test(contact.source_url)) {
+          const source = el("a", "offer-source", "Карточка источника ↗");
+          source.href = contact.source_url; source.target = "_blank";
+          source.rel = "noopener noreferrer"; row.append(source);
+        }
+        content.append(row);
+      });
+      (data.locations || []).slice(0, 5).forEach(location => content.append(detailField(
+        "Адрес", [location.city, location.address_text, location.market_name,
+          location.pavilion].filter(Boolean).join(", ") || "Не указан")));
+    } catch (error) {
+      loaded = false;
+      content.replaceChildren(el("p", "entry-feedback", error.message));
+    }
+  });
+  return details;
 }
 function countLabel(count, one, few, many) {
   const value = Number(count);
@@ -108,8 +443,11 @@ function itemBadge(item) {
     const rejected = Number(item.rejected_quantity || 0);
     const delivered = Number(item.delivered_quantity || 0);
     const warehouse = Number(item.warehouse_received_quantity || 0);
+    const purchased = Number(item.purchased_quantity || 0);
     const label = required !== null && cancelled >= required ? "Отменено" :
-      required !== null && accepted + cancelled >= required ? "Исполнено" :
+      required !== null && accepted + cancelled >= required && purchased >= accepted
+        && delivered - rejected - Number(item.returned_quantity || 0) >= accepted
+        ? "Исполнено" :
         rejected > 0 ? "Отказ / замена" : accepted > 0 ? "Принято частично" :
           delivered > 0 ? "Передано заказчику" : warehouse > 0 ? "На складе" :
             "Закуплено";
@@ -161,7 +499,14 @@ function inputField(label, type, options = {}) {
   wrapper.append(control);
   return [wrapper, control];
 }
-function eventForm(caseId, item) {
+function artifactOptions(artifacts) {
+  return [["", "Без документа · запись пользователя"], ...artifacts.map(artifact => [
+    artifact.id,
+    (artifact.original_filename || (artifact.kind === "photo" ? "Фото" : "Документ"))
+      + " · " + fmtDate(artifact.created_at)
+  ])];
+}
+function eventForm(caseId, item, data) {
   let idempotencyKey = crypto.randomUUID();
   let previousPayload = "";
   const details = el("details", "entry-panel");
@@ -171,6 +516,7 @@ function eventForm(caseId, item) {
     ["warehouse_received", "Поступило на склад"],
     ["customer_delivered", "Передано заказчику"],
     ["customer_accepted", "Принято заказчиком"],
+    ["customer_revoked", "Отозвать приёмку"],
     ["customer_rejected", "Заказчик отклонил"],
     ["returned", "Товар возвращён"], ["cancelled", "Отменено"]
   ]);
@@ -178,19 +524,38 @@ function eventForm(caseId, item) {
     {step: "0.000001", required: true, placeholder: item.unit || "Количество"});
   const [reasonField, reasonInput] = inputField("Причина / примечание", "text",
     {maxLength: 1000, placeholder: "Обязательно для отказа, возврата и отмены"});
+  const [customerField, customer] = inputField("Заказчик", "text",
+    {maxLength: 200, placeholder: "Название организации"});
+  customer.value = data.case.customer_name || "";
+  const [artifactField, artifact] = selectField("Документ из Telegram", artifactOptions(data.artifacts || []));
+  const linkedRuns = (data.delivery_items || []).filter(line => line.request_item_id === item.id)
+    .map(line => (data.deliveries || []).find(run => run.id === line.delivery_run_id))
+    .filter(run => run && !["planned", "cancelled"].includes(run.status));
+  const [deliveryField, delivery] = selectField("Связать с рейсом", [
+    ["", "Без конкретного рейса"],
+    ...linkedRuns.map(run => [run.id, run.tracking_ref || run.carrier_name || "Рейс " + run.id.slice(0, 8)])
+  ]);
+  customerField.hidden = true;
+  kind.addEventListener("change", () => {
+    customerField.hidden = !["customer_accepted", "customer_revoked"].includes(kind.value);
+  });
   const submit = el("button", "entry-submit", "Сохранить событие");
   submit.type = "submit";
   const feedback = el("p", "entry-feedback");
   feedback.setAttribute("role", "status");
-  form.append(kindField, quantityField, reasonField, submit, feedback,
-    el("small", "data-note", "Запись будет помечена как сообщение пользователя до прикрепления документа."));
+  form.append(kindField, quantityField, customerField, deliveryField, artifactField,
+    reasonField, submit, feedback,
+    el("small", "data-note", "Если файл выбран, событие связывается с документом из Telegram. Иначе это запись пользователя."));
   form.addEventListener("submit", async event => {
     event.preventDefault();
     submit.disabled = true;
     feedback.textContent = "Сохраняем…";
     try {
       const payload = {event_kind: kind.value,
-        quantity_delta: quantityInput.value, reason: reasonInput.value.trim()
+        quantity_delta: quantityInput.value, reason: reasonInput.value.trim(),
+        customer_name: customer.value.trim(),
+        source_artifact_id: artifact.value || null,
+        delivery_run_id: delivery.value || null
       };
       const fingerprint = JSON.stringify(payload);
       if (fingerprint !== previousPayload) idempotencyKey = crypto.randomUUID();
@@ -205,14 +570,356 @@ function eventForm(caseId, item) {
   details.append(form);
   return details;
 }
-function expenseForm(caseId, items) {
+function purchaseForm(caseId, data) {
+  const details = el("details", "entry-panel purchase-entry");
+  details.append(el("summary", "", "Зафиксировать закупку"));
+  const form = el("form", "entry-form");
+  const [sellerField, seller] = inputField("Продавец", "text",
+    {maxLength: 200, required: true, placeholder: "Название поставщика или магазина"});
+  const [kindField, kind] = selectField("Тип документа", [
+    ["other", "Без документа / другое"], ["receipt", "Чек"],
+    ["cash_receipt", "Кассовый чек"], ["invoice", "Счёт"], ["waybill", "Накладная"]
+  ]);
+  const [artifactField, artifact] = selectField("Файл из Telegram", artifactOptions(data.artifacts || []));
+  const [numberField, number] = inputField("Номер документа", "text", {maxLength: 120});
+  const [noteField, note] = inputField("Основание записи", "text", {
+    maxLength: 1000, placeholder: "Обязательно, если чек или накладная не приложены"
+  });
+  const cargo = el("div", "purchase-lines");
+  const rows = data.items.map(item => {
+    const row = el("div", "purchase-line");
+    row.append(el("strong", "", item.line_number + ". " + item.name));
+    const controls = el("div", "purchase-line-controls");
+    const qty = el("input"); qty.type = "number"; qty.min = "0.000001";
+    qty.step = "0.000001"; qty.placeholder = "Количество, " + (item.unit || "ед.");
+    const remaining = Number(item.quantity || 0) - Number(item.purchased_quantity || 0);
+    if (remaining > 0) qty.placeholder = "Осталось " + fmtNumber(remaining) + " " + (item.unit || "");
+    qty.setAttribute("aria-label", "Закупленное количество: " + item.name);
+    const cost = el("input"); cost.type = "number"; cost.min = "0";
+    cost.step = "0.0001"; cost.placeholder = "Цена за ед., ₸";
+    cost.setAttribute("aria-label", "Цена за единицу: " + item.name);
+    const matching = (data.offers || []).filter(offer => offer.request_item_id === item.id);
+    const offer = el("select");
+    offer.add(new Option("Без найденного предложения", ""));
+    matching.forEach(candidate => offer.add(new Option(
+      candidate.supplier_name + " · " + (candidate.supplier_product_name || "Товар"), candidate.id
+    )));
+    offer.setAttribute("aria-label", "Предложение поставщика: " + item.name);
+    controls.append(qty, cost, offer);
+    row.append(controls);
+    cargo.append(row);
+    return {item, qty, cost, offer};
+  });
+  const submit = el("button", "entry-submit", "Сохранить закупку");
+  submit.type = "submit";
+  const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
+  let key = crypto.randomUUID();
+  let previous = "";
+  form.append(sellerField, kindField, artifactField, numberField, noteField,
+    el("span", "entry-label", "Позиции в одной закупке"), cargo, submit, feedback,
+    el("small", "data-note", "Один чек или одна запись могут охватывать несколько позиций. Закупка сама по себе не закрывает позицию."));
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const lines = rows.filter(row => row.qty.value && Number(row.qty.value) > 0)
+      .map(row => ({request_item_id: row.item.id, purchased_quantity: row.qty.value,
+        unit_cost: row.cost.value, offer_id: row.offer.value || null}));
+    if (!lines.length) { feedback.textContent = "Укажите количество хотя бы одной позиции"; return; }
+    if (lines.some(line => line.unit_cost === "")) {
+      feedback.textContent = "Укажите фактическую цену за единицу каждой закупаемой позиции"; return;
+    }
+    if (!artifact.value && !note.value.trim()) {
+      feedback.textContent = "Без файла укажите основание записи"; return;
+    }
+    const payload = {seller_name: seller.value.trim(), document_kind: kind.value,
+      source_artifact_id: artifact.value || null, document_number: number.value.trim(),
+      note: note.value.trim(), lines};
+    const fingerprint = JSON.stringify(payload);
+    if (fingerprint !== previous) key = crypto.randomUUID();
+    previous = fingerprint;
+    submit.disabled = true; feedback.textContent = "Сохраняем…";
+    try {
+      await apiWrite("/api/cases/" + caseId + "/purchases", {...payload, idempotency_key: key});
+      await openDetail(caseId);
+    } catch (error) { feedback.textContent = error.message; }
+    finally { submit.disabled = false; }
+  });
+  details.append(form);
+  return details;
+}
+function closurePanel(caseId, data) {
+  const section = el("section", "closure-panel");
+  section.append(el("h3", "", "Закрытие заявки"));
+  const financial = data.financial || {};
+  const currency = financial.currency === "KZT" ? "₸" : financial.currency || "₸";
+  const grid = el("div", "closure-finance");
+  [["Закупка", financial.product_cost_known], ["Доставка", financial.delivery_cost_known],
+    ["Другие расходы", financial.additional_cost_known],
+    ["Выручка", financial.tender_revenue_private],
+    ["Расчётная маржа", financial.provisional_margin]].forEach(([name, value]) => {
+    grid.append(detailField(name, value === null || value === undefined ? "Не указана" : quantity(value, currency)));
+  });
+  section.append(grid);
+  if (data.case.status === "cancelled") {
+    section.append(el("p", "data-note", "Заявка отменена. Закрытие исполнения недоступно."));
+    return section;
+  }
+  if (data.case.status === "closed") {
+    section.append(el("p", "data-note", "Заявка закрыта. Новые факты можно внести после повторного открытия с причиной."));
+    const reopen = el("button", "entry-submit", "Открыть повторно");
+    reopen.type = "button";
+    const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
+    reopen.addEventListener("click", async () => {
+      const reason = window.prompt("Причина повторного открытия заявки");
+      if (!reason?.trim()) return;
+      reopen.disabled = true;
+      try {
+        await apiWrite("/api/cases/" + caseId + "/closure",
+          {action: "reopened", reason: reason.trim(), idempotency_key: crypto.randomUUID()});
+        await openDetail(caseId); await refreshDashboard();
+      } catch (error) { feedback.textContent = error.message; reopen.disabled = false; }
+    });
+    section.append(reopen, feedback);
+    return section;
+  }
+  const issues = data.closure?.issues || [];
+  if (issues.length) {
+    const list = el("div", "closure-issues");
+    list.append(el("strong", "", "Пока нельзя закрыть · " + issues.length));
+    issues.forEach(issue => list.append(el("p", "", issue.message)));
+    section.append(list);
+  } else section.append(el("p", "closure-ready", "Все позиции и доставки сверены. Заявку можно закрыть."));
+  const close = el("button", "entry-submit", "Закрыть заявку");
+  close.type = "button"; close.disabled = Boolean(issues.length);
+  const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
+  close.addEventListener("click", async () => {
+    if (!window.confirm("Закрыть заявку после проверки фактов и расходов?")) return;
+    close.disabled = true;
+    try {
+      await apiWrite("/api/cases/" + caseId + "/closure",
+        {action: "closed", idempotency_key: crypto.randomUUID()});
+      await openDetail(caseId); await refreshDashboard();
+    } catch (error) { feedback.textContent = error.message; close.disabled = false; }
+  });
+  section.append(close, feedback);
+  return section;
+}
+function deliverySection(caseId, data) {
+  const section = el("section", "delivery-section");
+  section.dataset.detailColumn = "delivery";
+  section.hidden = !detailColumns.delivery;
+  section.append(el("h3", "", "Доставки"));
+  const details = el("details", "entry-panel delivery-entry");
+  details.append(el("summary", "", "Создать доставку с составом груза"));
+  const form = el("form", "entry-form");
+  const [carrierField, carrier] = inputField("Перевозчик / водитель", "text",
+    {maxLength: 200, placeholder: "Можно указать позже"});
+  const [phoneField, phone] = inputField("Телефон перевозчика", "tel",
+    {maxLength: 30, placeholder: "+7…"});
+  const [trackingField, tracking] = inputField("Номер рейса / отслеживания", "text",
+    {maxLength: 120});
+  const [expectedField, expected] = inputField("Ожидаемое прибытие", "datetime-local");
+  const [loadingField, loading] = selectField("Погрузка", Object.entries(loadingNames));
+  const [includedField, included] = inputField("Стоимость погрузки внутри тарифа, ₸", "number",
+    {min: "0", step: "0.01", placeholder: "Если известна"});
+  includedField.hidden = true;
+  loading.addEventListener("change", () => { includedField.hidden = loading.value !== "included"; });
+  const [noteField, note] = inputField("Примечание", "text", {maxLength: 1000});
+  const cargo = el("div", "delivery-cargo");
+  const rows = data.items.map(item => {
+    const row = el("div", "delivery-cargo-row");
+    const quantityInput = el("input");
+    quantityInput.type = "number"; quantityInput.min = "0.000001";
+    quantityInput.step = "0.000001"; quantityInput.placeholder = item.unit || "Кол-во";
+    quantityInput.setAttribute("aria-label", "Количество груза: " + item.name);
+    const purchase = el("select");
+    purchase.add(new Option("Без привязки к закупке", ""));
+    (data.purchase_lines || []).filter(line => line.request_item_id === item.id)
+      .forEach(line => purchase.add(new Option(
+        (line.seller_name || line.supplier_name || "Закупка") + " · "
+          + quantity(line.purchased_quantity, item.unit) + " · " + fmtDate(line.created_at),
+        line.id
+      )));
+    purchase.setAttribute("aria-label", "Строка закупки: " + item.name);
+    row.append(el("span", "", item.line_number + ". " + item.name), quantityInput, purchase);
+    cargo.append(row);
+    return {item, quantityInput, purchase};
+  });
+  const submit = el("button", "entry-submit", "Сохранить доставку");
+  submit.type = "submit";
+  const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
+  let key = crypto.randomUUID();
+  let previous = "";
+  form.append(carrierField, phoneField, trackingField, expectedField,
+    loadingField, includedField, noteField,
+    el("span", "entry-label", "Количество по позициям в этом рейсе"), cargo,
+    submit, feedback, el("small", "data-note",
+      "Создание рейса не подтверждает покупку, поступление или приёмку товара."));
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const items = rows.filter(row => row.quantityInput.value && Number(row.quantityInput.value) > 0)
+      .map(row => ({request_item_id: row.item.id, quantity: row.quantityInput.value,
+        purchase_item_id: row.purchase.value || null}));
+    if (!items.length) { feedback.textContent = "Укажите количество хотя бы одной позиции"; return; }
+    const payload = {items, carrier_name: carrier.value.trim(), carrier_phone: phone.value.trim(),
+      tracking_ref: tracking.value.trim(), note: note.value.trim(),
+      expected_at: expected.value ? new Date(expected.value).toISOString() : null,
+      loading_mode: loading.value,
+      included_loading_value: loading.value === "included" && included.value ? included.value : null};
+    const fingerprint = JSON.stringify(payload);
+    if (fingerprint !== previous) key = crypto.randomUUID();
+    previous = fingerprint;
+    submit.disabled = true; feedback.textContent = "Сохраняем…";
+    try {
+      await apiWrite("/api/cases/" + caseId + "/deliveries", {...payload, idempotency_key: key});
+      await openDetail(caseId);
+    } catch (error) { feedback.textContent = error.message; }
+    finally { submit.disabled = false; }
+  });
+  details.append(form);
+  if (!["closed", "cancelled"].includes(data.case.status)) section.append(details);
+  if (!(data.deliveries || []).length) {
+    section.append(el("p", "data-note", "Рейсов пока нет. Добавьте состав груза, чтобы видеть, что запланировано и что в пути."));
+  }
+  (data.deliveries || []).forEach(run => {
+    const card = el("div", "delivery-card");
+    const head = el("div", "delivery-card-head");
+    head.append(el("strong", "", run.tracking_ref || run.carrier_name || "Доставка " + run.id.slice(0, 8)),
+      badge(run.status));
+    card.append(head, meta(run.carrier_name, run.carrier_phone,
+      run.expected_at ? "Ожидается " + fmtDate(run.expected_at) : ""));
+    const cargoLines = (data.delivery_items || []).filter(line => line.delivery_run_id === run.id);
+    cargoLines.forEach(line => card.append(detailField(
+      line.line_number + ". " + line.name,
+      line.quantity === null ? "Количество не указано" : quantity(line.quantity, line.unit)
+    )));
+    if (run.total_cost !== null) card.append(detailField("Доставка, факт", quantity(run.total_cost, "₸")));
+    if (run.actual_cost !== null) card.append(detailField("Связанные расходы, факт", quantity(run.actual_cost, "₸")));
+    if (run.planned_cost !== null) card.append(detailField("Связанные расходы, план", quantity(run.planned_cost, "₸")));
+    card.append(detailField("Погрузка", loadingNames[run.loading_mode || "unknown"]));
+    if (run.included_loading_value !== null) card.append(detailField(
+      "Из тарифа приходится на погрузку", quantity(run.included_loading_value, "₸")));
+    if (run.loading_note) card.append(el("p", "data-note", run.loading_note));
+    card.append(detailField("Начислено за рейс", Number(run.charge_total) > 0
+      ? quantity(run.charge_total, "₸") : "Стоимость ещё не внесена"));
+    card.append(detailField("Оплачено с учётом возвратов", quantity(run.net_paid, "₸")));
+    if (Number(run.balance_due) > 0) card.append(detailField(
+      "Осталось оплатить", quantity(run.balance_due, "₸")));
+    if (Number(run.balance_due) < 0) card.append(detailField(
+      "Переплата / аванс", quantity(-Number(run.balance_due), "₸")));
+    const payments = (data.delivery_payments || []).filter(p => p.delivery_run_id === run.id);
+    if (payments.length) {
+      const history = el("details", "item-expenses");
+      history.append(el("summary", "", "Оплаты и возвраты · " + payments.length));
+      payments.forEach(payment => history.append(detailField(
+        (payment.kind === "refund" ? "Возврат" : "Оплата") + " · " + fmtDate(payment.paid_at),
+        quantity(payment.amount, "₸") + (payment.payee ? " · " + payment.payee : "")
+      )));
+      card.append(history);
+    }
+    card.append(deliveryTermsForm(caseId, run, data.artifacts || []));
+    card.append(deliveryPaymentForm(caseId, run, data.artifacts || []));
+    if (run.note) card.append(el("p", "data-note", run.note));
+    const next = {planned: [["in_transit", "Отправить"], ["cancelled", "Отменить"]],
+      in_transit: [["arrived", "Отметить прибытие"], ["completed", "Завершить рейс"], ["cancelled", "Отменить"]],
+      arrived: [["completed", "Завершить рейс"], ["cancelled", "Отменить"]]}[run.status] || [];
+    if (next.length && !["closed", "cancelled"].includes(data.case.status)) {
+      const actions = el("div", "entry-actions delivery-actions");
+      next.forEach(([status, text]) => {
+        const button = el("button", "", text); button.type = "button";
+        button.addEventListener("click", async () => {
+          const reason = status === "cancelled" ? window.prompt("Причина отмены рейса") : "";
+          if (status === "cancelled" && !reason?.trim()) return;
+          button.disabled = true;
+          try {
+            await apiWrite("/api/cases/" + caseId + "/deliveries/" + run.id + "/status",
+              {status, reason: reason || "", idempotency_key: crypto.randomUUID()});
+            await openDetail(caseId);
+          } catch (error) { card.append(el("p", "entry-feedback", error.message)); button.disabled = false; }
+        });
+        actions.append(button);
+      });
+      card.append(actions);
+    }
+    section.append(card);
+  });
+  return section;
+}
+
+function deliveryTermsForm(caseId, run, artifacts) {
+  const details = el("details", "entry-panel");
+  details.append(el("summary", "", "Уточнить условия погрузки"));
+  const form = el("form", "entry-form");
+  const [modeField, mode] = selectField("Погрузка", Object.entries(loadingNames));
+  mode.value = run.loading_mode || "unknown";
+  const [valueField, value] = inputField("Стоимость внутри тарифа, ₸", "number",
+    {min: "0", step: "0.01", placeholder: "Если известна"});
+  value.value = run.included_loading_value || "";
+  const [noteField, note] = inputField("Условия / основание", "text", {maxLength: 1000});
+  const [artifactField, artifact] = selectField("Документ из Telegram", artifactOptions(artifacts));
+  const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
+  const submit = el("button", "entry-submit", "Сохранить условия"); submit.type = "submit";
+  const toggle = () => { valueField.hidden = mode.value !== "included"; };
+  mode.addEventListener("change", toggle); toggle();
+  form.append(modeField, valueField, noteField, artifactField, submit, feedback);
+  form.addEventListener("submit", async event => {
+    event.preventDefault(); submit.disabled = true;
+    try {
+      await apiWrite("/api/cases/" + caseId + "/deliveries/" + run.id + "/terms", {
+        loading_mode: mode.value,
+        included_loading_value: mode.value === "included" && value.value ? value.value : null,
+        note: note.value.trim(), source_artifact_id: artifact.value || null,
+        idempotency_key: crypto.randomUUID()
+      });
+      await openDetail(caseId);
+    } catch (error) { feedback.textContent = error.message; submit.disabled = false; }
+  });
+  details.append(form);
+  return details;
+}
+
+function deliveryPaymentForm(caseId, run, artifacts) {
+  const details = el("details", "entry-panel");
+  details.append(el("summary", "", "Зафиксировать оплату или возврат"));
+  const form = el("form", "entry-form");
+  const [kindField, kind] = selectField("Операция", [["payment", "Оплата"], ["refund", "Возврат"]]);
+  const [amountField, amount] = inputField("Сумма, ₸", "number",
+    {min: "0.01", step: "0.01", required: true});
+  const [payeeField, payee] = inputField("Получатель", "text", {maxLength: 200});
+  const [noteField, note] = inputField("Примечание", "text", {maxLength: 1000});
+  const [artifactField, artifact] = selectField("Документ из Telegram", artifactOptions(artifacts));
+  const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
+  const submit = el("button", "entry-submit", "Сохранить оплату"); submit.type = "submit";
+  form.append(kindField, amountField, payeeField, noteField, artifactField, submit, feedback);
+  let key = crypto.randomUUID(); let previous = ""; let paidAt = new Date().toISOString();
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const payload = {kind: kind.value, amount: amount.value, payee: payee.value.trim(),
+      note: note.value.trim(), source_artifact_id: artifact.value || null};
+    const fingerprint = JSON.stringify(payload);
+    if (fingerprint !== previous) { key = crypto.randomUUID(); paidAt = new Date().toISOString(); }
+    previous = fingerprint; submit.disabled = true;
+    try {
+      await apiWrite("/api/cases/" + caseId + "/deliveries/" + run.id + "/payments",
+        {...payload, paid_at: paidAt, idempotency_key: key});
+      await openDetail(caseId);
+    } catch (error) { feedback.textContent = error.message; submit.disabled = false; }
+  });
+  details.append(form);
+  return details;
+}
+
+function expenseForm(caseId, items, deliveries, deliveryItems, artifacts) {
   let idempotencyKey = crypto.randomUUID();
   let previousPayload = "";
   const details = el("details", "entry-panel expense-entry");
-  details.append(el("summary", "", "Добавить общий расход"));
+  details.append(el("summary", "", "Добавить фактический расход"));
   const form = el("form", "entry-form");
   const [categoryField, category] = selectField("Категория", Object.entries(expenseNames));
-  const [kindField, kind] = selectField("Тип суммы", [["actual", "Факт"], ["planned", "План"]]);
+  const [deliveryField, delivery] = selectField("Связать с доставкой", [
+    ["", "Без конкретного рейса"],
+    ...deliveries.map(run => [run.id, (run.tracking_ref || run.carrier_name || "Рейс " + run.id.slice(0, 8))
+      + " · " + (labels[run.status] || run.status)])
+  ]);
   const [amountField, amount] = inputField("Общая сумма, ₸", "number",
     {min: "0", step: "0.01", required: true, placeholder: "0,00"});
   const [methodField, method] = selectField("Распределить", [
@@ -220,6 +927,7 @@ function expenseForm(caseId, items) {
   ]);
   const [noteField, note] = inputField("Основание / примечание", "text",
     {maxLength: 1000, placeholder: "Например, доставка одной машиной"});
+  const [artifactField, artifact] = selectField("Документ из Telegram", artifactOptions(artifacts));
   const itemTitle = el("span", "entry-label", "К каким позициям относится расход");
   const actions = el("div", "entry-actions");
   const selectAll = el("button", "", "Выбрать все");
@@ -237,25 +945,38 @@ function expenseForm(caseId, items) {
     itemList.append(row);
     return {item, checkbox, manual};
   });
-  selectAll.addEventListener("click", () => rows.forEach(row => { row.checkbox.checked = true; }));
+  selectAll.addEventListener("click", () => rows.forEach(row => {
+    row.checkbox.checked = !row.checkbox.disabled;
+  }));
   clear.addEventListener("click", () => rows.forEach(row => { row.checkbox.checked = false; }));
   method.addEventListener("change", () => rows.forEach(row => {
     row.manual.hidden = method.value !== "manual";
     row.manual.disabled = method.value !== "manual";
   }));
+  delivery.addEventListener("change", () => {
+    const allowed = new Set(deliveryItems.filter(line => line.delivery_run_id === delivery.value)
+      .map(line => line.request_item_id));
+    rows.forEach(row => {
+      row.checkbox.disabled = Boolean(delivery.value) && !allowed.has(row.item.id);
+      row.checkbox.checked = Boolean(delivery.value) && allowed.has(row.item.id);
+    });
+  });
   const submit = el("button", "entry-submit", "Распределить и сохранить");
   submit.type = "submit";
   const feedback = el("p", "entry-feedback"); feedback.setAttribute("role", "status");
-  form.append(categoryField, kindField, amountField, methodField, noteField,
+  form.append(categoryField, deliveryField, amountField, methodField,
+    artifactField, noteField,
     itemTitle, actions, itemList, submit, feedback,
-    el("small", "data-note", "Запись будет помечена как сообщение пользователя до прикрепления документа."));
+    el("small", "data-note", "Вносите только фактическую сумму. Запись будет помечена как сообщение пользователя до прикрепления документа."));
   form.addEventListener("submit", async event => {
     event.preventDefault();
-    const selected = rows.filter(row => row.checkbox.checked);
+    const selected = rows.filter(row => row.checkbox.checked && !row.checkbox.disabled);
     if (!selected.length) { feedback.textContent = "Выберите хотя бы одну позицию"; return; }
     const payload = {category: category.value,
-      cost_kind: kind.value, total_cost: amount.value, allocation_method: method.value,
-      request_item_ids: selected.map(row => row.item.id), note: note.value.trim()};
+      cost_kind: "actual", total_cost: amount.value, allocation_method: method.value,
+      request_item_ids: selected.map(row => row.item.id), note: note.value.trim(),
+      source_artifact_id: artifact.value || null};
+    if (delivery.value) payload.delivery_run_id = delivery.value;
     if (method.value === "manual") payload.manual_amounts = Object.fromEntries(
       selected.map(row => [row.item.id, row.manual.value]));
     const fingerprint = JSON.stringify(payload);
@@ -303,6 +1024,7 @@ function supplierCard(row, position) {
   const bottom = el("div", "record-bottom");
   bottom.append(badge(row.status), el("span", "", row.last_offer_at ? fmtDate(row.last_offer_at) : "Проверка не проводилась"));
   body.append(bottom);
+  body.append(supplierDetails(row.id));
   card.append(el("span", "record-index", String(position).padStart(2, "0")), body);
   return card;
 }
@@ -381,6 +1103,138 @@ async function load(append = false) {
     if (!signal.aborted) state.loading = false;
   }
 }
+function outreachDraftsPanel(caseId, drafts, enabled) {
+  const panel = el("details", "outreach-drafts");
+  panel.append(el("summary", "", "Черновики сообщений поставщикам · " + drafts.length));
+  const content = el("div", "outreach-drafts-content");
+  content.append(el("p", "data-note", "Проверьте получателя и текст. Нажатие «Одобрить и отправить» " +
+    "передаст выбранные сообщения в очередь WhatsApp. За раз можно выбрать до 10. " +
+    "Отправка доступна с 09:00 до 20:00 по Алматы."));
+  if (drafts.length > 300) content.append(el("p", "data-note", "Показаны первые 301 черновик."));
+  if (!enabled) content.append(el("p", "entry-feedback", "WhatsApp отправка сейчас выключена."));
+  const selected = new Set();
+  const controls = el("div", "outreach-controls");
+  const selectTen = el("button", "entry-submit", "Выбрать 10");
+  const approve = el("button", "entry-submit", "Одобрить и отправить");
+  selectTen.type = approve.type = "button";
+  approve.disabled = true;
+  const checkboxes = [];
+  function update() {
+    approve.disabled = !enabled || !selected.size;
+    approve.textContent = "Одобрить и отправить · " + selected.size;
+  }
+  selectTen.addEventListener("click", () => {
+    selected.clear();
+    checkboxes.forEach((checkbox, index) => {
+      checkbox.checked = index < 10;
+      if (checkbox.checked) selected.add(checkbox.value);
+    });
+    update();
+  });
+  approve.addEventListener("click", async () => {
+    approve.disabled = true;
+    try {
+      await apiWrite("/api/cases/" + caseId + "/outreach/approve", {
+        approval_ids: [...selected]
+      });
+      await openDetail(caseId);
+    } catch (error) {
+      content.append(el("p", "entry-feedback", error.message));
+      update();
+    }
+  });
+  controls.append(selectTen, approve);
+  content.append(controls);
+  drafts.forEach(draft => {
+    const row = el("label", "outreach-draft");
+    const checkbox = el("input");
+    checkbox.type = "checkbox";
+    checkbox.value = draft.approval_id;
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked && selected.size >= 10) {
+        checkbox.checked = false;
+        return;
+      }
+      if (checkbox.checked) selected.add(checkbox.value);
+      else selected.delete(checkbox.value);
+      update();
+    });
+    checkboxes.push(checkbox);
+    const text = el("div", "outreach-draft-text");
+    text.append(el("strong", "", draft.line_number + ". " + draft.item_name +
+      " · " + draft.supplier_name));
+    text.append(el("small", "", draft.recipient +
+      (new Date(draft.expires_at) <= new Date() ? " · прежнее одобрение истекло" : "")));
+    text.append(el("p", "", draft.text));
+    row.append(checkbox, text);
+    content.append(row);
+  });
+  panel.append(content);
+  return panel;
+}
+
+function itemRequirementsPanel(caseId, item, requirements, editable) {
+  const rows = requirements.filter(row => row.request_item_id === item.id);
+  const panel = el("details", "item-requirements-panel");
+  panel.append(el("summary", "", "Атомарные требования · " + rows.length));
+  panel.append(el("p", "data-note", "Добавляйте отдельные проверяемые характеристики и указывайте, где они записаны в исходном техспеке. Сохранённые требования не редактируются, чтобы не менять историю проверок."));
+  if (rows.length) {
+    const list = el("ul", "item-requirements-list");
+    rows.forEach(row => {
+      let expected = row.expected_value;
+      if (typeof expected === "string") {
+        try { expected = JSON.parse(expected); } catch (_) { /* keep legacy text */ }
+      }
+      const value = expected && typeof expected === "object"
+        ? [expected.value, expected.unit].filter(Boolean).join(" ") : String(expected ?? "");
+      const label = [row.requirement_key, value].filter(Boolean).join(" — ");
+      const detail = [row.operator && row.operator !== "equals" ? row.operator : "",
+        row.is_hard ? "обязательное" : "желательное", row.source_pointer].filter(Boolean).join(" · ");
+      const entry = el("li", "item-requirement-row");
+      entry.append(el("strong", "", label), el("small", "", detail));
+      list.append(entry);
+    });
+    panel.append(list);
+  }
+  if (!editable || !item.specification_text) return panel;
+
+  const form = el("form", "item-requirement-form");
+  const name = el("input"); name.required = true; name.maxLength = 160;
+  const value = el("input"); value.required = true; value.maxLength = 500;
+  const unit = el("input"); unit.maxLength = 40;
+  const source = el("input"); source.required = true; source.maxLength = 500;
+  const operator = el("select");
+  [["equals", "Точное значение"], ["contains", "Содержит"], ["minimum", "Не меньше"],
+    ["maximum", "Не больше"], ["range", "Диапазон"], ["one_of", "Одно из"],
+    ["present", "Должно быть указано"]].forEach(([key, caption]) => operator.add(new Option(caption, key)));
+  const hard = el("input"); hard.type = "checkbox"; hard.checked = true;
+  const hardLabel = el("label", "item-requirement-hard", "Обязательное требование");
+  hardLabel.append(hard);
+  const field = (caption, control) => {
+    const label = el("label", "entry-field", caption); label.append(control); return label;
+  };
+  form.append(field("Характеристика", name), field("Ожидаемое значение", value),
+    field("Единица", unit), field("Тип условия", operator),
+    field("Источник в техспеке (пункт, страница или цитата)", source), hardLabel);
+  const save = el("button", "entry-submit", "Добавить требование"); save.type = "submit";
+  form.append(save);
+  form.addEventListener("submit", async event => {
+    event.preventDefault(); save.disabled = true;
+    try {
+      await apiWrite("/api/cases/" + caseId + "/items/" + item.id + "/requirements", {
+        idempotency_key: crypto.randomUUID(), requirement_key: name.value,
+        expected_value: value.value, unit: unit.value, operator: operator.value,
+        is_hard: hard.checked, source_pointer: source.value
+      });
+      await openDetail(caseId);
+    } catch (error) {
+      form.append(el("p", "entry-feedback", error.message)); save.disabled = false;
+    }
+  });
+  panel.append(form);
+  return panel;
+}
+
 async function openDetail(id) {
   const dialog = $("detail");
   const previousScroll = dialog.open ? dialog.scrollTop : 0;
@@ -390,6 +1244,7 @@ async function openDetail(id) {
   try {
     const data = await api("/api/cases/" + encodeURIComponent(id));
     const c = data.case;
+    const editable = !["closed", "cancelled"].includes(c.status);
     const body = el("div", "detail-body");
     body.append(badge(c.status), el("h2", "", c.title || "Заявка без названия"),
       el("p", "detail-sub", [c.city, c.customer_name].filter(Boolean).join(" / ") || "Основная информация"));
@@ -400,7 +1255,13 @@ async function openDetail(id) {
       cell.append(el("small", "", key), el("strong", "", value));
       grid.append(cell);
     });
-    body.append(grid, detailOptions(), expenseForm(id, data.items), el("h3", "", "Позиции"));
+    body.append(grid, detailOptions());
+    if (editable && data.outreach_drafts?.length) {
+      body.append(outreachDraftsPanel(id, data.outreach_drafts, data.outreach_enabled));
+    }
+    body.append(el("h3", "", "Позиции и выбор поставщика"));
+    body.append(el("p", "data-note", "Сравнивается цена товара на нужную партию. " +
+      "Доставка войдёт в факт после внесения рейса; НДС отдельно не рассчитывается."));
     const itemFilter = el("div", "item-filter");
     const itemSearch = el("input", "offer-search item-search");
     itemSearch.type = "search";
@@ -420,7 +1281,16 @@ async function openDetail(id) {
       const box = el("div", "item-card");
       itemBoxes.push({item, box});
       const head = el("div", "item-head");
-      head.append(el("span", "", item.line_number + ". " + item.name), itemBadge(item));
+      const statusBadges = el("div", "item-statuses");
+      statusBadges.append(itemBadge(item));
+      if (Number(item.in_transit_quantity || 0) > 0) {
+        const transitBadge = el("span", "badge delivery-badge",
+          "В пути · " + fmtNumber(item.in_transit_quantity));
+        transitBadge.dataset.detailColumn = "delivery";
+        transitBadge.hidden = !detailColumns.delivery;
+        statusBadges.append(transitBadge);
+      }
+      head.append(el("span", "", item.line_number + ". " + item.name), statusBadges);
       box.append(head);
       box.append(detailField("Требуется", quantity(item.quantity, item.unit)));
       if (item.movement_label) box.append(detailField("Этап по Notion", item.movement_label));
@@ -428,12 +1298,14 @@ async function openDetail(id) {
         "Поставлено по Notion", quantity(item.reported_delivered_quantity, item.unit)
       ));
       if (item.specification_text) box.append(detailField("Техспек", item.specification_text, "spec"));
+      box.append(itemRequirementsPanel(id, item, data.requirements || [], editable));
       if (item.reconciliation_label) box.append(detailField("Уточнение", item.reconciliation_label, "history"));
       if (item.location_label) box.append(detailField("Местонахождение по Notion", item.location_label, "history"));
       if (item.reported_accepted_quantity !== null) box.append(detailField("Принято по Notion", quantity(item.reported_accepted_quantity, item.unit), "history"));
       if (item.reported_rejected_quantity !== null) box.append(detailField("Отклонено по Notion", quantity(item.reported_rejected_quantity, item.unit), "history"));
       if (item.reported_remaining_quantity !== null) box.append(detailField("Остаток по Notion", quantity(item.reported_remaining_quantity, item.unit), "history"));
       if (item.purchased_quantity !== null) box.append(detailField("Закуплено, подтверждено", quantity(item.purchased_quantity, item.unit), "history"));
+      if (item.in_transit_quantity !== null) box.append(detailField("Сейчас в пути", quantity(item.in_transit_quantity, item.unit), "delivery"));
       if (item.accepted_quantity !== null) box.append(detailField("Принято, подтверждено", quantity(item.accepted_quantity, item.unit), "history"));
       if (item.event_count) {
         box.append(detailField("Поступило на склад, события", quantity(item.warehouse_received_quantity, item.unit), "history"));
@@ -443,9 +1315,58 @@ async function openDetail(id) {
         box.append(detailField("Отменено, события", quantity(item.cancelled_quantity, item.unit), "history"));
       }
       if (item.tender_unit_price_private !== null) box.append(detailField("Цена тендера за единицу", quantity(item.tender_unit_price_private, "₸"), "finance"));
+      if (editable) {
+        const priceForm = el("form", "item-tender-price");
+        priceForm.dataset.detailColumn = "finance";
+        priceForm.hidden = !detailColumns.finance;
+        const priceLabel = el("label", "", "Цена тендера за единицу, ₸");
+        const priceInput = el("input");
+        priceInput.type = "number";
+        priceInput.min = "0";
+        priceInput.step = "0.0001";
+        priceInput.required = true;
+        priceInput.value = item.tender_unit_price_private ?? "";
+        priceLabel.append(priceInput);
+        const save = el("button", "entry-submit", "Сохранить цену");
+        save.type = "submit";
+        priceForm.append(priceLabel, save);
+        priceForm.addEventListener("submit", async event => {
+          event.preventDefault();
+          save.disabled = true;
+          try {
+            await apiWrite("/api/cases/" + id + "/items/" + item.id + "/tender-price", {
+              idempotency_key: crypto.randomUUID(),
+              tender_unit_price_private: priceInput.value
+            });
+            await openDetail(id);
+          } catch (error) {
+            priceForm.append(el("p", "entry-feedback", error.message));
+            save.disabled = false;
+          }
+        });
+        box.append(priceForm);
+      }
       if (item.delivery_cost !== null) box.append(detailField("Распределённая доставка", quantity(item.delivery_cost, "₸"), "finance"));
       if (item.actual_cost !== null && item.actual_cost !== undefined) box.append(detailField("Дополнительные расходы, факт", quantity(item.actual_cost, "₸"), "finance"));
       if (item.planned_cost !== null && item.planned_cost !== undefined) box.append(detailField("Дополнительные расходы, план", quantity(item.planned_cost, "₸"), "finance"));
+      const purchases = (data.purchase_lines || []).filter(line => line.request_item_id === item.id);
+      if (purchases.length) {
+        const purchaseDetails = el("details", "item-expenses");
+        purchaseDetails.append(el("summary", "", "Закупки · " + purchases.length));
+        purchases.forEach(line => {
+          const source = line.provenance === "documented" ? "Документ" : "Запись пользователя";
+          purchaseDetails.append(detailField(
+            line.seller_name || line.supplier_name || "Продавец не указан",
+            quantity(line.purchased_quantity, item.unit) + " × " +
+              (line.unit_cost === null ? "цена не указана" : quantity(line.unit_cost, line.currency === "KZT" ? "₸" : line.currency))
+          ));
+          purchaseDetails.append(el("p", "data-note", [source,
+            line.supplier_name ? "Предложение: " + line.supplier_name : "",
+            line.document_number, line.note]
+            .filter(Boolean).join(" · ")));
+        });
+        box.append(purchaseDetails);
+      }
       const itemExpenses = (data.expenses || []).filter(expense => expense.request_item_id === item.id);
       if (itemExpenses.length) {
         const expenseDetails = el("details", "item-expenses");
@@ -469,9 +1390,20 @@ async function openDetail(id) {
         box.append(notionLink);
       }
       const itemOffers = data.offers.filter(offer => offer.request_item_id === item.id);
-      const offerDetails = el("details", "item-offers");
-      offerDetails.append(el("summary", "", "Предложения · " + item.offer_count));
-      if (itemOffers.length) {
+      const offerArea = el("div", "item-offers");
+      const context = {caseId: id, item, editable,
+        requirements: data.requirements || [], reviews: data.technical_reviews || []};
+      const topFive = itemOffers.filter(offer => offer.comparison?.rank &&
+        offer.comparison.rank <= 5).sort((a, b) => a.comparison.rank - b.comparison.rank);
+      offerArea.append(el("h4", "offer-section-title", "Лучшие подтверждённые · " + topFive.length));
+      if (topFive.length) offerArea.append(...topFive.map(offer => offerCard(offer, context)));
+      else offerArea.append(el("p", "data-note", "Пока нет предложения, у которого проверены " +
+        "ТЗ, цена и количество на всю партию."));
+      const otherOffers = itemOffers.filter(offer => !offer.comparison?.rank ||
+        offer.comparison.rank > 5);
+      const offerDetails = el("details", "other-offers");
+      offerDetails.append(el("summary", "", "Остальные предложения · " + otherOffers.length));
+      if (otherOffers.length) {
         const offerSearch = el("input", "offer-search");
         offerSearch.type = "search";
         offerSearch.placeholder = "Поставщик или товар";
@@ -479,21 +1411,26 @@ async function openDetail(id) {
         const offerList = el("div", "offer-list");
         const renderOffers = () => {
           const needle = offerSearch.value.trim().toLocaleLowerCase("ru");
-          const filtered = itemOffers.filter(offer => (offer.supplier_name + " " + offer.supplier_product_name).toLocaleLowerCase("ru").includes(needle));
-          filtered.sort((a, b) => (a.price_amount === null) - (b.price_amount === null) ||
-            (a.price_amount !== null && b.price_amount !== null ? Number(a.price_amount) - Number(b.price_amount) : 0));
-          offerList.replaceChildren(...filtered.map(offerCard));
+          const filtered = otherOffers.filter(offer =>
+            (offer.supplier_name + " " + offer.supplier_product_name)
+              .toLocaleLowerCase("ru").includes(needle));
+          filtered.sort((a, b) => (a.comparison?.goods_total === null) -
+            (b.comparison?.goods_total === null) ||
+            (a.comparison?.goods_total !== null && b.comparison?.goods_total !== null
+              ? Number(a.comparison.goods_total) - Number(b.comparison.goods_total) : 0));
+          offerList.replaceChildren(...filtered.map(offer => offerCard(offer, context)));
           if (!filtered.length) offerList.append(el("p", "data-note", "Совпадений нет"));
         };
         offerSearch.addEventListener("input", renderOffers);
         offerDetails.append(offerSearch, offerList);
         renderOffers();
-      } else offerDetails.append(el("p", "data-note", "Предложений пока нет"));
-      if (c.source_kind === "notion_import" && ["ready", "evaluating", "report_ready"].includes(c.status)) {
+      } else offerDetails.append(el("p", "data-note", "Других предложений нет"));
+      offerArea.append(offerDetails);
+      if (c.item_research_enabled && ["ready", "evaluating", "report_ready"].includes(c.status)) {
         const search = el("div", "item-research");
         const button = el("button", "entry-submit", "Искать поставщиков для этой позиции");
         button.type = "button";
-        const note = el("span", "data-note", "Поиск по названию и городу. Техспек сверьте с найденными предложениями.");
+        const note = el("span", "data-note", "Поиск по товару, краткому описанию и городу. Полный техспек сверьте с предложениями.");
         button.addEventListener("click", async () => {
           button.disabled = true;
           note.textContent = "Ставим поиск в очередь…";
@@ -506,10 +1443,10 @@ async function openDetail(id) {
           }
         });
         search.append(button, note);
-        offerDetails.insertBefore(search, offerDetails.children[1] || null);
+        offerArea.append(search);
       }
-      box.append(offerDetails);
-      box.append(eventForm(id, item));
+      box.append(offerArea);
+      if (editable) box.append(eventForm(id, item, data));
       body.append(box);
     });
     const filterItems = () => {
@@ -530,6 +1467,12 @@ async function openDetail(id) {
     itemSearch.addEventListener("input", filterItems);
     offerFilter.addEventListener("change", filterItems);
     filterItems();
+    body.append(el("h3", "", "Исполнение и учёт"));
+    if (editable) body.append(purchaseForm(id, data));
+    body.append(deliverySection(id, data));
+    if (editable) body.append(expenseForm(id, data.items, data.deliveries || [],
+      data.delivery_items || [], data.artifacts || []));
+    body.append(closurePanel(id, data));
     root.replaceChildren(body);
     dialog.scrollTop = previousScroll;
   } catch (error) {

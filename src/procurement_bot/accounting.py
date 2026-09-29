@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,9 +29,13 @@ class PurchaseLine:
     offer_id: UUID | None = None
 
     def __post_init__(self) -> None:
-        if self.purchased_quantity <= 0:
+        if (not self.purchased_quantity.is_finite() or self.purchased_quantity <= 0
+                or self.purchased_quantity.as_tuple().exponent < -6):
             raise ValueError("purchased_quantity must be positive")
-        if self.unit_cost is not None and self.unit_cost < 0:
+        if self.unit_cost is not None and (
+            not self.unit_cost.is_finite() or self.unit_cost < 0
+            or self.unit_cost.as_tuple().exponent < -4
+        ):
             raise ValueError("unit_cost must be nonnegative")
 
 
@@ -58,6 +64,7 @@ class FinancialSnapshot:
     unknown_purchase_lines: int
     provisional_margin: Decimal | None
     additional_cost_known: Decimal = Decimal(0)
+    unknown_delivery_runs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +137,7 @@ async def record_case_expense(
     request_item_ids: Sequence[UUID],
     allocation_method: Literal["equal", "quantity", "manual"],
     idempotency_key: str,
+    delivery_run_id: UUID | None = None,
     manual_amounts: Mapping[UUID, Decimal] | None = None,
     source_artifact_id: UUID | None = None,
     note: str = "",
@@ -179,6 +187,7 @@ async def record_case_expense(
                 "currency": normalized_currency, "source_artifact_id": source_artifact_id,
                 "note": note.strip(), "recorded_by": owner_user_id,
                 "incurred_at": incurred_at,
+                "delivery_run_id": delivery_run_id,
             }
             if any(existing[key] != value for key, value in expected.items()):
                 raise AccountingConflict("expense idempotency key has different facts")
@@ -214,6 +223,45 @@ async def record_case_expense(
         by_id = {row["id"]: row for row in rows}
         if set(by_id) != set(unique_ids):
             raise AccountingConflict("expense contains an item from another case")
+        delivery_quantities: dict[UUID, Decimal | None] = {}
+        if delivery_run_id is not None:
+            run = await connection.fetchrow(
+                """SELECT r.total_cost FROM delivery_runs r
+                   JOIN procurement_cases c ON c.id=r.case_id
+                   WHERE r.id=$1 AND r.case_id=$2 AND c.owner_user_id=$3
+                   FOR SHARE OF r""",
+                delivery_run_id, case_id, owner_user_id,
+            )
+            if run is None:
+                raise AccountingConflict("delivery belongs to another case or owner")
+            if category == "delivery" and cost_kind == "actual" and run["total_cost"] is not None:
+                raise AccountingConflict("delivery transport cost is already recorded")
+            if category == "handling" and cost_kind == "actual":
+                latest_loading_mode = await connection.fetchval(
+                    """SELECT loading_mode FROM delivery_run_terms
+                       WHERE delivery_run_id=$1
+                       ORDER BY created_at DESC,id DESC LIMIT 1""",
+                    delivery_run_id,
+                )
+                if latest_loading_mode == "included":
+                    raise AccountingConflict(
+                        "loading is already included in this delivery tariff"
+                    )
+            cargo = await connection.fetch(
+                """SELECT request_item_id,quantity FROM delivery_run_items
+                   WHERE delivery_run_id=$1""",
+                delivery_run_id,
+            )
+            all_delivery_quantities = {
+                row["request_item_id"]: row["quantity"] for row in cargo
+            }
+            if not set(unique_ids) <= set(all_delivery_quantities):
+                raise AccountingConflict("expense includes an item outside this delivery")
+            if category == "delivery" and set(unique_ids) != set(all_delivery_quantities):
+                raise AccountingConflict("delivery transport cost must cover every cargo item")
+            delivery_quantities = {
+                item_id: all_delivery_quantities[item_id] for item_id in unique_ids
+            }
         if source_artifact_id is not None:
             valid_artifact = await connection.fetchval(
                 """
@@ -236,7 +284,8 @@ async def record_case_expense(
         else:
             weights = {
                 item_id: (Decimal(1) if allocation_method == "equal"
-                          else by_id[item_id]["quantity"])
+                          else (delivery_quantities[item_id] if delivery_run_id is not None
+                                else by_id[item_id]["quantity"]))
                 for item_id in unique_ids
             }
             if any(value is None or value <= 0 for value in weights.values()):
@@ -249,12 +298,14 @@ async def record_case_expense(
             """
             INSERT INTO case_expenses(
                 id,case_id,category,cost_kind,amount,currency,allocation_method,
-                provenance,source_artifact_id,note,incurred_at,idempotency_key,recorded_by
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                provenance,source_artifact_id,note,incurred_at,idempotency_key,recorded_by,
+                delivery_run_id
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             """,
             expense_id, case_id, category, cost_kind, total_cost, normalized_currency,
             allocation_method, "documented" if source_artifact_id else "user_reported",
             source_artifact_id, note.strip(), incurred_at, idempotency_key, owner_user_id,
+            delivery_run_id,
         )
         for allocation in allocations:
             await connection.execute(
@@ -269,12 +320,12 @@ async def record_case_expense(
         return expense_id
 
 
-async def record_evidenced_purchase(
+async def record_purchase(
     connection: asyncpg.Connection,
     *,
     case_id: UUID,
     owner_user_id: UUID,
-    source_artifact_id: UUID,
+    source_artifact_id: UUID | None,
     document_kind: Literal["receipt", "invoice", "waybill", "cash_receipt", "other"],
     lines: Sequence[PurchaseLine],
     idempotency_key: str,
@@ -283,16 +334,38 @@ async def record_evidenced_purchase(
     issued_at: datetime | None = None,
     stated_total: Decimal | None = None,
     currency: str = "KZT",
+    note: str = "",
 ) -> PurchaseRecordResult:
-    """Record a purchase only when an owner-supplied receipt/waybill artifact exists."""
+    """Record a documented or explicitly user-reported purchase."""
 
     if not lines:
         raise ValueError("at least one purchase line is required")
     if len({line.request_item_id for line in lines}) != len(lines):
         raise ValueError("purchase lines must target unique request items")
+    if document_kind not in {"receipt", "invoice", "waybill", "cash_receipt", "other"}:
+        raise ValueError("unsupported purchase document kind")
     normalized_currency = _currency(currency)
-    if stated_total is not None and stated_total < 0:
+    if stated_total is not None and (not stated_total.is_finite() or stated_total < 0):
         raise ValueError("stated_total must be nonnegative")
+    note = " ".join(note.split())
+    seller_name = " ".join(seller_name.split())
+    if source_artifact_id is None and (not note or not seller_name):
+        raise ValueError("reported purchase needs seller and note")
+    if len(note) > 1000 or len(seller_name) > 200 or len(document_number) > 120:
+        raise ValueError("purchase details are too long")
+    request_hash = hashlib.sha256(json.dumps({
+        "case": str(case_id), "owner": str(owner_user_id),
+        "artifact": str(source_artifact_id) if source_artifact_id else None,
+        "kind": document_kind, "number": document_number.strip(),
+        "seller": seller_name, "note": note,
+        "issued_at": issued_at.isoformat() if issued_at else None,
+        "stated_total": str(stated_total) if stated_total is not None else None,
+        "currency": normalized_currency,
+        "lines": sorted((str(line.request_item_id), str(line.purchased_quantity),
+                         str(line.unit_cost) if line.unit_cost is not None else None,
+                         str(line.offer_id) if line.offer_id else None)
+                        for line in lines),
+    }, sort_keys=True).encode()).hexdigest()
 
     async with connection.transaction():
         await connection.execute(
@@ -300,7 +373,7 @@ async def record_evidenced_purchase(
             f"purchase:{idempotency_key}",
         )
         existing = await connection.fetchrow(
-            "SELECT id,case_id,source_artifact_id FROM purchase_documents "
+            "SELECT id,case_id,source_artifact_id,request_hash FROM purchase_documents "
             "WHERE idempotency_key=$1",
             idempotency_key,
         )
@@ -308,6 +381,8 @@ async def record_evidenced_purchase(
             if (
                 existing["case_id"] != case_id
                 or existing["source_artifact_id"] != source_artifact_id
+                or (existing["request_hash"] is not None
+                    and existing["request_hash"] != request_hash)
             ):
                 raise AccountingConflict("purchase idempotency key has different provenance")
             return await _existing_purchase_result(connection, existing["id"])
@@ -320,7 +395,8 @@ async def record_evidenced_purchase(
         )
         if owner_ok is not True:
             raise AccountingConflict("case does not belong to the acting owner")
-        artifact_ok = await connection.fetchval(
+        if source_artifact_id is not None:
+            artifact_ok = await connection.fetchval(
             """
             SELECT EXISTS(
                 SELECT 1
@@ -331,11 +407,11 @@ async def record_evidenced_purchase(
                 WHERE artifact.id=$1 AND message.user_id=$2
             )
             """,
-            source_artifact_id,
-            owner_user_id,
-        )
-        if artifact_ok is not True:
-            raise AccountingConflict("receipt artifact is absent or owned by another user")
+                source_artifact_id,
+                owner_user_id,
+            )
+            if artifact_ok is not True:
+                raise AccountingConflict("receipt artifact is absent or owned by another user")
 
         item_rows = await connection.fetch(
             """
@@ -349,26 +425,39 @@ async def record_evidenced_purchase(
         )
         if {row["id"] for row in item_rows} != {line.request_item_id for line in lines}:
             raise AccountingConflict("a purchase line belongs to another case or is absent")
+        offer_ids = [line.offer_id for line in lines if line.offer_id is not None]
+        if offer_ids:
+            offers = await connection.fetch(
+                "SELECT id,request_item_id FROM offers WHERE id=ANY($1::uuid[])", offer_ids,
+            )
+            offer_items = {row["id"]: row["request_item_id"] for row in offers}
+            if any(line.offer_id is not None and offer_items.get(line.offer_id)
+                   != line.request_item_id for line in lines):
+                raise AccountingConflict("selected supplier offer does not match purchase item")
 
         document_id = uuid4()
         await connection.execute(
             """
             INSERT INTO purchase_documents(
                 id,case_id,source_artifact_id,document_kind,document_number,
-                seller_name,issued_at,stated_total,currency,idempotency_key,created_by
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                seller_name,issued_at,stated_total,currency,idempotency_key,created_by,
+                provenance,note,request_hash
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             """,
             document_id,
             case_id,
             source_artifact_id,
             document_kind,
             document_number.strip(),
-            seller_name.strip(),
+            seller_name,
             issued_at,
             stated_total,
             normalized_currency,
             idempotency_key,
             owner_user_id,
+            "documented" if source_artifact_id else "user_reported",
+            note,
+            request_hash,
         )
         for line in lines:
             await connection.execute(
@@ -389,31 +478,21 @@ async def record_evidenced_purchase(
                 stable_key("purchase-line", idempotency_key, line.request_item_id),
             )
 
-        closed: list[UUID] = []
         needs_review: list[UUID] = []
         for item in item_rows:
             if item["quantity"] is None:
                 needs_review.append(item["id"])
-                continue
-            purchased = await connection.fetchval(
-                "SELECT COALESCE(sum(purchased_quantity),0) FROM purchase_items "
-                "WHERE request_item_id=$1",
-                item["id"],
-            )
-            if Decimal(purchased) >= Decimal(item["quantity"]):
-                await connection.execute(
-                    "UPDATE request_items SET status='closed',updated_at=now() "
-                    "WHERE id=$1 AND status<>'closed'",
-                    item["id"],
-                )
-                closed.append(item["id"])
         return PurchaseRecordResult(
             document_id=document_id,
             recorded_lines=len(lines),
-            closed_item_ids=tuple(closed),
+            closed_item_ids=(),
             needs_quantity_review=tuple(needs_review),
             created=True,
         )
+
+
+# Existing callers keep the evidenced name and still pass a source artifact.
+record_evidenced_purchase = record_purchase
 
 
 async def record_equal_delivery(
@@ -511,6 +590,12 @@ async def record_equal_delivery(
                 allocation.request_item_id,
                 allocation.amount,
             )
+            await connection.execute(
+                """INSERT INTO delivery_run_items(
+                       delivery_run_id,case_id,request_item_id
+                   ) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING""",
+                run_id, case_id, allocation.request_item_id,
+            )
         return run_id
 
 
@@ -525,14 +610,24 @@ async def record_customer_acceptance(
     event_type: Literal["accepted", "revoked"],
     idempotency_key: str,
     source_artifact_id: UUID | None = None,
+    delivery_run_id: UUID | None = None,
+    reason: str = "",
 ) -> CustomerAcceptanceResult:
     """Append one recipient acceptance fact without rewriting its history."""
 
     normalized_name = " ".join(customer_name.split())
     if not normalized_name:
         raise ValueError("customer_name must be non-empty")
-    if accepted_quantity <= 0:
+    if event_type not in {"accepted", "revoked"}:
+        raise ValueError("unsupported acceptance event type")
+    if (not accepted_quantity.is_finite() or accepted_quantity <= 0
+            or accepted_quantity.as_tuple().exponent < -6):
         raise ValueError("accepted_quantity must be positive")
+    reason = " ".join(reason.split())
+    if event_type == "revoked" and not reason:
+        raise ValueError("acceptance revocation needs a reason")
+    if len(reason) > 1000:
+        raise ValueError("acceptance reason is too long")
     async with connection.transaction():
         await connection.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
@@ -549,6 +644,8 @@ async def record_customer_acceptance(
                 "event_type": event_type,
                 "accepted_quantity": accepted_quantity,
                 "source_artifact_id": source_artifact_id,
+                "delivery_run_id": delivery_run_id,
+                "reason": reason,
                 "recorded_by": owner_user_id,
             }
             if any(existing[key] != value for key, value in expected.items()):
@@ -613,13 +710,23 @@ async def record_customer_acceptance(
             )
             if artifact_ok is not True:
                 raise AccountingConflict("acceptance evidence belongs to another user")
+        if delivery_run_id is not None:
+            linked = await connection.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM delivery_run_items di
+                   JOIN delivery_runs r ON r.id=di.delivery_run_id
+                   WHERE di.delivery_run_id=$1 AND di.request_item_id=$2
+                     AND di.case_id=$3 AND r.status NOT IN ('planned','cancelled'))""",
+                delivery_run_id, request_item_id, case_id,
+            )
+            if not linked:
+                raise AccountingConflict("delivery does not contain this item or has not departed")
         event_id = uuid4()
         await connection.execute(
             """
             INSERT INTO customer_acceptance_events(
                 id,case_id,customer_id,request_item_id,event_type,accepted_quantity,
-                source_artifact_id,idempotency_key,recorded_by
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                source_artifact_id,idempotency_key,recorded_by,delivery_run_id,reason
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             """,
             event_id,
             case_id,
@@ -630,6 +737,8 @@ async def record_customer_acceptance(
             source_artifact_id,
             idempotency_key,
             owner_user_id,
+            delivery_run_id,
+            reason,
         )
         net = await _net_customer_acceptance(
             connection, case_id, customer_id, request_item_id
@@ -706,6 +815,15 @@ async def load_financial_snapshot(
                            WHERE expense.case_id=procurement_case.id
                              AND expense.cost_kind='actual'
                              AND expense.category='delivery'),0) AS delivery_cost,
+               (SELECT count(*) FROM delivery_runs AS run
+                WHERE run.case_id=procurement_case.id AND run.status<>'cancelled'
+                  AND run.total_cost IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM case_expenses AS expense
+                      WHERE expense.delivery_run_id=run.id
+                        AND expense.cost_kind='actual'
+                        AND expense.category='delivery'
+                  )) AS unknown_delivery_runs,
                COALESCE((SELECT sum(expense.amount) FROM case_expenses AS expense
                          WHERE expense.case_id=procurement_case.id
                            AND expense.cost_kind='actual'
@@ -727,7 +845,8 @@ async def load_financial_snapshot(
     delivery = Decimal(row["delivery_cost"])
     additional = Decimal(row["additional_cost"])
     unknown = int(row["unknown_lines"])
-    margin = (None if revenue is None or unknown
+    unknown_delivery_runs = int(row["unknown_delivery_runs"])
+    margin = (None if revenue is None or unknown or unknown_delivery_runs
               else Decimal(revenue) - product - delivery - additional)
     return FinancialSnapshot(
         case_id=case_id,
@@ -738,6 +857,7 @@ async def load_financial_snapshot(
         unknown_purchase_lines=unknown,
         provisional_margin=margin,
         additional_cost_known=additional,
+        unknown_delivery_runs=unknown_delivery_runs,
     )
 
 
