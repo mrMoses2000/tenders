@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 import procurement_bot.waha_webhook_http as webhook_module
+from procurement_bot.supplier_media import WhatsAppMediaInput
 from procurement_bot.waha_webhook_http import (
     MAX_WEBHOOK_BODY_BYTES,
     WAHA_WEBHOOK_AUTH_HEADER,
@@ -126,6 +127,41 @@ async def test_valid_message_is_normalized_and_durably_accepted(
     assert pool.acquire_count == 1
 
 
+@pytest.mark.parametrize(
+    ("media_type", "mimetype", "expected_kind", "placeholder"),
+    [
+        ("image", "image/jpeg", "image", "[Фотография поставщика]"),
+        (None, "audio/ogg; codecs=opus", "audio", "[Голосовое сообщение поставщика]"),
+        ("ptt", None, "audio", "[Голосовое сообщение поставщика]"),
+    ],
+)
+def test_supported_media_is_accepted_with_empty_caption(
+    media_type: str | None,
+    mimetype: str | None,
+    expected_kind: str,
+    placeholder: str,
+) -> None:
+    media: dict[str, object] = {"url": None, "mimetype": mimetype, "filename": None, "error": None}
+    payload = _document(body="", hasMedia=True, media=media)
+    if media_type is not None:
+        payload["payload"]["type"] = media_type  # type: ignore[index]
+
+    event = parse_waha_message_event(payload)
+
+    assert event.media == WhatsAppMediaInput(kind=expected_kind, mimetype=mimetype)
+    assert event.text == ""
+    assert event.stored_text == placeholder
+    assert event.evidence_payload()["text"] == ""
+    assert event.evidence_payload()["original_caption"] == ""
+    assert event.evidence_payload()["media"]["url"] is None
+
+
+def test_missing_mime_and_unknown_type_media_is_acknowledged_as_unsupported() -> None:
+    event = parse_waha_message_event(_document(body="", hasMedia=True, media={"url": None}))
+
+    assert getattr(event, "reason", None) == "unsupported_media_type"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("document", "reason"),
@@ -133,7 +169,7 @@ async def test_valid_message_is_normalized_and_durably_accepted(
         ({"event": "session.status", "session": "procurement", "payload": {}}, "unsupported_event"),
         (_document(fromMe=True), "own_message"),
         (_document(**{"from": "status@broadcast"}), "status_message"),
-        (_document(type="image", hasMedia=True), "non_text_message"),
+        (_document(type="document", hasMedia=True), "unsupported_media_type"),
         (_document(**{"from": "120363@g.us"}), "group_message"),
     ],
 )

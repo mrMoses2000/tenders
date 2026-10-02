@@ -6,8 +6,9 @@ import re
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
+from uuid import UUID
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 
@@ -260,6 +261,33 @@ class SourcePlan(StrictModel):
     result_ttl_hours: int = Field(ge=1, le=24 * 90)
     empty_page_limit: int = Field(ge=1, le=20)
     blocked_reason: CleanText | None = Field(default=None, max_length=500)
+    execution_query_id: UUID | None = Field(default=None, exclude=True)
+    execution_generation: int | None = Field(default=None, ge=0, exclude=True)
+    execution_intent_ordinal: int | None = Field(default=None, ge=0, exclude=True)
+    # Execution cursors are never part of the immutable, approved plan hash.
+    batch_candidate_limit: int | None = Field(default=None, ge=1, le=2, exclude=True)
+    execution_scope_revision_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", exclude=True,
+    )
+    preferred_area_text: CleanText | None = Field(default=None, max_length=500, exclude=True)
+    search_cursor: str | None = Field(default=None, max_length=2_000, exclude=True)
+    excluded_external_ids: list[CleanText] = Field(
+        default_factory=list, max_length=200, exclude=True,
+    )
+
+    def browser_payload(self) -> dict[str, Any]:
+        payload = self.model_dump(mode="json")
+        if self.batch_candidate_limit is not None:
+            payload["batch_candidate_limit"] = self.batch_candidate_limit
+        if self.search_cursor is not None:
+            payload["search_cursor"] = self.search_cursor
+        if self.excluded_external_ids:
+            payload["excluded_external_ids"] = list(self.excluded_external_ids)
+        if self.execution_scope_revision_sha256 is not None:
+            payload["execution_scope_revision_sha256"] = self.execution_scope_revision_sha256
+        if self.preferred_area_text is not None:
+            payload["preferred_area_text"] = self.preferred_area_text
+        return payload
 
     @model_validator(mode="after")
     def supplier_safe(self) -> SourcePlan:
@@ -557,6 +585,12 @@ class SupplierCandidate(StrictModel):
     evidence: list[SupplierEvidence] = Field(min_length=1, max_length=100)
     product_availability: AvailabilityStatus = AvailabilityStatus.UNKNOWN
     field_confidence: dict[str, float] = Field(default_factory=dict, max_length=50)
+    contact_discovery_reason: Literal[
+        "phone_found", "not_attempted", "button_not_found", "click_failed",
+        "login_required", "captcha", "revealed_empty", "format_invalid",
+        "provider_timeout", "mcp_disconnected", "permission_denied",
+        "contact_not_published", "phone_not_visible", "access_blocked", "attempt_failed",
+    ] | None = None
 
     @field_validator("field_confidence", mode="before")
     @classmethod

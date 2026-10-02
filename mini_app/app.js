@@ -5,7 +5,10 @@ tg?.expand();
 const initData = tg?.initData || "";
 const base = new URL(".", window.location.href).pathname;
 const $ = id => document.getElementById(id);
-const state = {tab: "cases", q: "", status: "", city: "", offset: 0, loading: false, controller: null};
+const state = {tab: "cases", q: "", status: "", city: "", offset: 0, loading: false,
+  controller: null, listRevision: 0, detailId: null, detailRevision: 0,
+  detailController: null, detailRefreshController: null, detailSnapshot: null,
+  authenticated: false};
 const detailColumns = {spec: false, history: false, finance: true, delivery: true};
 try { Object.assign(detailColumns, JSON.parse(localStorage.getItem("tender-detail-columns") || "{}")); } catch (_) { /* private storage */ }
 const configurableFields = ["Требуется", "Этап по Notion", "Поставлено по Notion", "Техспек",
@@ -67,6 +70,38 @@ function applyDetailVisibility() {
     node.hidden = Boolean((node.dataset.detailColumn && !detailColumns[node.dataset.detailColumn])
       || (node.dataset.fieldKey && hiddenFields.includes(node.dataset.fieldKey)));
   });
+}
+function canRefreshDetailInPlace(root, activeElement = document.activeElement) {
+  if (root.contains(activeElement) && /^(INPUT|SELECT|TEXTAREA)$/.test(activeElement.tagName)) {
+    return false;
+  }
+  return Array.from(root.querySelectorAll("input,select,textarea")).every(control =>
+    control.dataset.freshValue !== undefined
+      && control.value === control.dataset.freshValue
+      && String(Boolean(control.checked)) === control.dataset.freshChecked);
+}
+function captureDetailFormBaseline(root) {
+  root.querySelectorAll("input,select,textarea").forEach(control => {
+    control.dataset.freshValue = control.value;
+    control.dataset.freshChecked = String(Boolean(control.checked));
+  });
+}
+function freshnessAction(visible, caseId = state.detailId) {
+  const top = document.querySelector(".detail-top");
+  if (!top) return;
+  let action = top.querySelector("[data-freshness-action]");
+  if (!action) {
+    action = el("button", "entry-submit freshness-action", "Есть новые данные · обновить");
+    action.type = "button";
+    action.dataset.freshnessAction = "true";
+    action.addEventListener("click", () => {
+      const id = state.detailId;
+      action.hidden = true;
+      if (id && $("detail").open) openDetail(id);
+    });
+    top.append(action);
+  }
+  action.hidden = !visible || !caseId || caseId !== state.detailId;
 }
 function detailOptions() {
   const panel = el("div", "detail-options");
@@ -135,7 +170,9 @@ function offerCard(offer, context = {}) {
   }
   line.append(top, el("div", "offer-product", offer.supplier_product_name || "Товар не указан"));
   line.append(meta(
-    offer.price_amount === null ? "Цена не указана" : "Цена из источника " + fmtNumber(offer.price_amount) + " " + (offer.currency === "KZT" ? "₸" : offer.currency || ""),
+    offer.price_amount === null
+      ? (offer.quote_snapshot_version ? "Цена требует уточнения" : "Цена не указана")
+      : "Цена из источника " + fmtNumber(offer.price_amount) + " " + (offer.currency === "KZT" ? "₸" : offer.currency || ""),
     offer.price_unit ? "за " + offer.price_unit : "Единица цены неизвестна",
     offer.supplier_city,
     offer.stock_source_type === "supplier_message" && offer.available_qty !== null
@@ -143,6 +180,16 @@ function offerCard(offer, context = {}) {
       : "Остаток партии не подтверждён",
     offer.observed_at ? "Проверено " + fmtDate(offer.observed_at) : "Дата не указана"
   ));
+  if (offer.quote_snapshot_version) {
+    const priceFact = offer.quote_snapshot_facts?.price_amount;
+    const priceSource = {supplier_message: "ответ поставщика", manual: "запись оператора"}
+      [priceFact?.source_type] || "источник";
+    const snapshotText = priceFact
+      ? `Снимок условий v${offer.quote_snapshot_version} · цена: ${priceSource}` +
+        (priceFact.observed_at ? ` · ${fmtDate(priceFact.observed_at)}` : "")
+      : `Цена требует уточнения · актуальный снимок v${offer.quote_snapshot_version} не содержит цену.`;
+    line.append(el("p", "data-note", snapshotText));
+  }
   const comparison = offer.comparison;
   if (comparison?.goods_total !== null && comparison?.goods_total !== undefined) {
     line.append(detailField("Товар на нужную партию",
@@ -376,9 +423,17 @@ function supplierDetails(supplierId, offerId = null) {
         if (row.last_message_text) entry.append(el("p", "data-note",
           (row.last_message_direction === "inbound" ? "Поставщик: " : "Бот: ")
             + row.last_message_text.slice(0, 500)));
+        renderSupplierMedia(row, entry);
         content.append(entry);
       });
       const relatedConversationIds = new Set(related.map(row => row.id));
+      (data.media_messages || []).filter(row => relatedConversationIds.has(row.conversation_id))
+        .forEach(row => {
+          const entry = el("div", "supplier-conversation");
+          entry.append(meta("Медиа поставщика", fmtDate(row.received_at)));
+          renderSupplierMedia(row, entry);
+          content.append(entry);
+        });
       (data.referrals || []).filter(row => relatedConversationIds.has(row.conversation_id))
         .forEach(referral => {
           const entry = el("div", "supplier-contact");
@@ -489,6 +544,50 @@ function itemBadge(item) {
   if (item.source_record_url) return el("span", "badge warn", "История из Notion");
   return badge(item.status);
 }
+function renderSupplierMedia(row, entry) {
+        if (row.media_kind) {
+          entry.append(meta(row.media_kind === "audio" ? "Голосовое" : "Фото",
+            "Обработка: " + row.media_state,
+            row.media_language ? "Язык: " + row.media_language : ""));
+          if (row.media_text) entry.append(el("p", "data-note",
+            "Распознанный текст: " + row.media_text.slice(0, 2000)));
+          if (row.media_needs_clarification) entry.append(el("p", "data-note",
+            "Нужны уточнения поставщика; распознавание не подтверждает предложение."));
+          if (row.media_error) entry.append(el("p", "data-note", "Ошибка: " + row.media_error));
+          const openMedia = el("button", "entry-submit",
+            row.media_kind === "audio" ? "Прослушать" : "Показать фото");
+          openMedia.type = "button";
+          openMedia.addEventListener("click", async () => {
+              openMedia.disabled = true;
+              let objectUrl;
+              try {
+                const response = await fetch(base + "api/supplier-messages/"
+                  + encodeURIComponent(row.last_message_id) + "/media", {
+                  headers: {Authorization: "tma " + initData}
+                });
+                if (!response.ok) throw new Error("Не удалось загрузить медиа");
+                objectUrl = URL.createObjectURL(await response.blob());
+                const preview = el(row.media_kind === "audio" ? "audio" : "img", "supplier-media");
+                if (row.media_kind === "audio") preview.controls = true;
+                else preview.alt = "Фото поставщика";
+                preview.src = objectUrl;
+                entry.append(preview);
+                const revokeWhenRemoved = new MutationObserver(() => {
+                  if (!preview.isConnected) {
+                    URL.revokeObjectURL(objectUrl); revokeWhenRemoved.disconnect();
+                  }
+                });
+                revokeWhenRemoved.observe(document.body, {childList: true, subtree: true});
+              } catch (error) {
+                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                entry.append(el("p", "data-note", error.message));
+                openMedia.disabled = false;
+              }
+            });
+          entry.append(openMedia);
+        }
+}
+
 async function api(path, signal) {
   let response;
   try {
@@ -1089,6 +1188,7 @@ function setTab(tab) {
   else $("list").replaceChildren(empty("Вход через Telegram", "Откройте Mini App из меню вашего бота, чтобы увидеть заявки."));
 }
 async function load(append = false) {
+  const revision = ++state.listRevision;
   state.controller?.abort();
   state.controller = new AbortController();
   const signal = state.controller.signal;
@@ -1105,7 +1205,7 @@ async function load(append = false) {
   }
   try {
     const data = await api("/api/" + state.tab + "?" + params, signal);
-    if (signal.aborted) return;
+    if (signal.aborted || revision !== state.listRevision) return false;
     if (!append) $("list").replaceChildren();
     data.rows.forEach((row, index) => $("list").append(state.tab === "cases"
       ? caseCard(row, state.offset + index + 1) : supplierCard(row, state.offset + index + 1)));
@@ -1127,13 +1227,15 @@ async function load(append = false) {
     state.offset += data.rows.length;
     $("load-more").hidden = !data.has_more;
     $("result-count").textContent = state.offset ? String(state.offset).padStart(2, "0") + " / ПОКАЗАНО" : "";
+    return true;
   } catch (error) {
-    if (!signal.aborted) {
+    if (!signal.aborted && revision === state.listRevision) {
       $("list").replaceChildren(empty(error.message, "Проверьте подключение и повторите попытку."));
       $("load-more").hidden = true;
     }
+    return false;
   } finally {
-    if (!signal.aborted) state.loading = false;
+    if (!signal.aborted && revision === state.listRevision) state.loading = false;
   }
 }
 function outreachDraftsPanel(caseId, drafts, enabled) {
@@ -1287,14 +1389,65 @@ function itemRequirementsPanel(caseId, item, requirements, editable) {
   return panel;
 }
 
-async function openDetail(id) {
+function researchGeographyText(decision) {
+  const labels = {
+    city_verified: "Город соответствует заданной территории",
+    accepted_by_address: "Адрес подтверждает соответствие заданной территории",
+    outside_area: "Адрес вне заданной территории",
+    unknown: "Территория не подтверждена",
+    not_applicable: "Проверка территории не применяется"
+  };
+  return typeof decision === "string" && Object.prototype.hasOwnProperty.call(labels, decision)
+    ? labels[decision] : null;
+}
+
+function researchIssueText(code) {
+  const labels = {source_exhausted: "Просмотренные результаты закончились",
+    target_reached: "Цель поиска достигнута", no_new_candidates: "Новых продавцов в этой порции нет",
+    batch_limit_reached: "Нужен дополнительный поиск", own_database_reused: "Проверена сохранённая база",
+    phone_found: "Телефон найден", not_attempted: "Получение телефона не подтверждено",
+    button_not_found: "Кнопка показа телефона не найдена", click_failed: "Не удалось открыть телефон",
+    login_required: "Для телефона требуется вход", revealed_empty: "После нажатия номер не показан",
+    format_invalid: "Не удалось прочитать номер", phone_not_visible: "Телефон не виден в карточке",
+    contact_not_published: "В просмотренной карточке контакт не опубликован",
+    permission_denied: "Браузер не получил разрешение", mcp_disconnected: "Соединение с браузером прервалось",
+    cli_usage_limit: "Исчерпан лимит использования браузерного провайдера",
+    cli_rate_limit: "Провайдер временно ограничил частоту запросов",
+    cli_auth_failed: "Не удалось авторизовать браузерный провайдер",
+    resource_wait_timeout: "Браузер занят другим заданием; ожидание истекло",
+    access_blocked: "Источник ограничил доступ", attempt_failed: "Контакт не удалось проверить",
+    provider_timeout: "Источник не ответил вовремя", captcha: "Источник требует CAPTCHA"};
+  if (labels[code]) return labels[code];
+  const diagnosticCodes = ["cli_usage_limit", "cli_rate_limit", "cli_auth_failed", "resource_wait_timeout"];
+  const diagnosticCode = diagnosticCodes.find(value => typeof code === "string" && code.includes(value));
+  if (diagnosticCode) return labels[diagnosticCode];
+  if (/timeout/i.test(code)) return "Источник не ответил вовремя";
+  if (/captcha/i.test(code)) return "Источник требует CAPTCHA";
+  if (/login/i.test(code)) return "Источник требует вход";
+  if (/provider_failure/i.test(code)) return "Не удалось прочитать ответ источника";
+  if (/access_issue/i.test(code)) return "Источник ограничил доступ";
+  return "Поиск требует проверки";
+}
+
+async function openDetail(id, options = {}) {
+  const quiet = Boolean(options.quiet);
   const dialog = $("detail");
   const previousScroll = dialog.open ? dialog.scrollTop : 0;
   const root = $("detail-content");
-  root.replaceChildren(empty("Загружаем заявку", "Сверяем позиции и предложения."));
+  const requestRevision = ++state.detailRevision;
+  state.detailId = id;
+  state.detailController?.abort();
+  state.detailRefreshController?.abort();
+  const controller = new AbortController();
+  state.detailController = controller;
+  if (!quiet) root.replaceChildren(empty("Загружаем заявку", "Сверяем позиции и предложения."));
   if (!dialog.open) dialog.showModal();
   try {
-    const data = await api("/api/cases/" + encodeURIComponent(id));
+    const data = options.data || await api("/api/cases/" + encodeURIComponent(id), controller.signal);
+    if (controller.signal.aborted || requestRevision !== state.detailRevision
+      || state.detailId !== id || !dialog.open) return;
+    state.detailSnapshot = JSON.stringify(data);
+    freshnessAction(false, id);
     const c = data.case;
     const editable = !["closed", "cancelled"].includes(c.status);
     const body = el("div", "detail-body");
@@ -1308,6 +1461,61 @@ async function openDetail(id) {
       grid.append(cell);
     });
     body.append(grid, detailOptions());
+    const progressRows = data.research_progress || [];
+    const progressByItem = new Map(progressRows.map(row => [row.request_item_id, row]));
+    if (progressRows.length) {
+      const active = progressRows.filter(row => row.status === "researching").length;
+      const complete = progressRows.filter(row => ["succeeded", "partial", "failed"].includes(row.status)).length;
+      body.append(el("p", "data-note", `Поиск: ${complete} из ${progressRows.length} позиций обработано; ${active} сейчас в работе. ` +
+        "Найденный контакт ещё не подтверждает цену, наличие и соответствие техспеку."));
+      const discoveryTotals = progressRows.reduce((totals, row) => {
+        (row.sources || []).forEach(source => {
+          totals.discovered += Number(source.discovered_cards || 0);
+          totals.extracted += Number(source.extracted_cards || 0);
+        });
+        return totals;
+      }, {discovered: 0, extracted: 0});
+      if (discoveryTotals.discovered || discoveryTotals.extracted) {
+        body.append(el("p", "data-note",
+          `В выдаче найдено карточек ${discoveryTotals.discovered}; проверено ${discoveryTotals.extracted}. ` +
+          "Карточки источников ещё не являются предложениями или подтверждёнными ценами."));
+      }
+      const refresh = el("button", "entry-submit", "Обновить ход поиска");
+      refresh.type = "button";
+      refresh.addEventListener("click", () => openDetail(id));
+      body.append(refresh);
+      if (progressRows.some(row => ["queued", "researching", "paused"].includes(row.status))) {
+        const paused = progressRows.some(row => row.status === "paused");
+        const control = el("button", "entry-submit", paused ? "Продолжить поиск" : "Приостановить поиск");
+        control.type = "button";
+        control.addEventListener("click", async () => {
+          control.disabled = true;
+          try {
+            await apiWrite("/api/cases/" + encodeURIComponent(id) + "/research-control",
+              {action: paused ? "resume" : "pause"});
+            await openDetail(id);
+          } catch (error) { body.append(el("p", "entry-feedback", error.message)); control.disabled = false; }
+        });
+        body.append(control);
+        if (!paused && progressRows.some(row => Number(row.branches_failed || 0) > 0)) {
+          const retry = el("button", "entry-submit", "Повторить технические ошибки");
+          retry.type = "button";
+          retry.addEventListener("click", async () => {
+            retry.disabled = true;
+            try {
+              const result = await apiWrite("/api/cases/" + encodeURIComponent(id) + "/research-control",
+                {action: "retry_failed"});
+              if (result.retried_count) await openDetail(id);
+              else {
+                body.append(el("p", "data-note", "Нет ошибок, доступных для повторной попытки."));
+                retry.disabled = false;
+              }
+            } catch (error) { body.append(el("p", "entry-feedback", error.message)); retry.disabled = false; }
+          });
+          body.append(retry);
+        }
+      }
+    }
     if (editable && data.outreach_drafts?.length) {
       body.append(outreachDraftsPanel(id, data.outreach_drafts, data.outreach_enabled));
     }
@@ -1344,6 +1552,55 @@ async function openDetail(id) {
       }
       head.append(el("span", "", item.line_number + ". " + item.name), statusBadges);
       box.append(head);
+      const progress = progressByItem.get(item.id);
+      if (progress) {
+        const stages = {queued: "В очереди", researching: "Ищем", paused: "Приостановлено",
+          succeeded: "Поиск завершён", partial: "Найдено частично", failed: "Источники недоступны"};
+        box.append(detailField("Поиск", `${stages[progress.status] || progress.status} · контактов ${progress.eligible_suppliers}/${progress.target_suppliers}`));
+        box.append(detailField("Результаты", `Карточек ${progress.found_leads || 0} · цен от поставщиков ${progress.qualified_price_suppliers || 0}`));
+        if (progress.scope_policy?.scope === "citywide") {
+          box.append(detailField("Территория",
+            `Весь город ${progress.scope_policy.city} · приоритет: ${progress.scope_policy.preferred_area_text}`));
+        }
+        const categories = Array.isArray(progress.search_profile_categories)
+          ? progress.search_profile_categories.filter(value => typeof value === "string") : [];
+        const intentCount = Number(progress.search_profile_intent_count || 0);
+        if (categories.length || intentCount) {
+          const categoryText = categories.length ? categories.join(", ") : "не указаны";
+          box.append(detailField("Профиль поиска",
+            `Категории: ${categoryText} · вариантов запроса: ${intentCount}`));
+        }
+        if (progress.branches_failed || progress.branches_blocked) {
+          box.append(el("p", "data-note", "Часть источников не ответила. Найденные карточки сохранены."));
+        }
+        const issues = (progress.sources || []).filter(source => source.error || source.reason
+          || source.failure_code || source.contact_attempts?.length
+          || Number(source.discovered_cards || 0) > 0);
+        if (issues.length) {
+          const details = el("details", "supplier-details");
+          details.append(el("summary", "", "Источники и найденные карточки"));
+          issues.forEach(source => {
+            const sourceName = {"2gis_web": "2GIS", marketplace: "OLX", web: "Сайты", own_database: "Своя база"}[source.source] || "Источник";
+            if (Number(source.discovered_cards || 0) > 0) {
+              details.append(el("p", "data-note",
+                `${sourceName}: карточек найдено ${source.discovered_cards || 0} · ` +
+                `проверено ${source.extracted_cards || 0} · ожидают ${source.pending_cards || 0} · ` +
+                `ошибка ${source.failed_cards || 0}`));
+            }
+            if (source.failure_code) details.append(el("p", "data-note",
+              `${sourceName}: ${researchIssueText(source.failure_code)}`));
+            if (source.error || source.reason) details.append(el("p", "data-note",
+              `${sourceName}: ${researchIssueText(source.error || source.reason)} · порция ${source.batch}`));
+            (source.contact_attempts || []).forEach(attempt => {
+              const geography = researchGeographyText(attempt.geographic_decision);
+              details.append(el("p", "data-note",
+                `${sourceName} · ${attempt.external_id || "карточка"}: ${researchIssueText(attempt.contact_discovery_reason)}` +
+                (geography ? ` · ${geography}` : "")));
+            });
+          });
+          box.append(details);
+        }
+      }
       box.append(detailField("Требуется", quantity(item.quantity, item.unit)));
       if (item.movement_label) box.append(detailField("Этап по Notion", item.movement_label));
       if (item.reported_delivered_quantity !== null) box.append(detailField(
@@ -1525,22 +1782,71 @@ async function openDetail(id) {
     if (editable) body.append(expenseForm(id, data.items, data.deliveries || [],
       data.delivery_items || [], data.artifacts || []));
     body.append(closurePanel(id, data));
+    captureDetailFormBaseline(body);
     root.replaceChildren(body);
     dialog.scrollTop = previousScroll;
   } catch (error) {
-    root.replaceChildren(empty(error.message, "Повторите попытку позже."));
+    if (!quiet && !controller.signal.aborted && requestRevision === state.detailRevision
+      && state.detailId === id && dialog.open) {
+      root.replaceChildren(empty(error.message, "Повторите попытку позже."));
+    }
   }
 }
-async function refreshDashboard() {
-  if (!initData) return;
+async function refreshDashboard({background = false} = {}) {
+  if (!initData || !state.authenticated) return;
+  if ($("detail").open && !background) return;
   try {
     const summary = await api("/api/summary");
     $("active-count").textContent = summary.active_cases;
     $("items-count").textContent = summary.items;
     $("attention-count").textContent = summary.needs_attention;
-    await load();
+    if (!background) {
+      await load();
+      return;
+    }
+    if ($("detail").open || state.loading) return;
+    const active = document.activeElement;
+    if (active && /^(INPUT|SELECT|TEXTAREA)$/.test(active.tagName)) return;
+    const loadedCount = state.offset;
+    const previousScroll = window.scrollY;
+    let expectedRevision;
+    if (!await load()) return;
+    expectedRevision = state.listRevision;
+    while (state.offset < loadedCount && !$("load-more").hidden
+      && expectedRevision === state.listRevision) {
+      if (!await load(true)) return;
+      expectedRevision = state.listRevision;
+    }
+    if (expectedRevision === state.listRevision) window.scrollTo(0, previousScroll);
   } catch (error) {
-    $("list").replaceChildren(empty(error.message, "Повторите попытку позже."));
+    if (!background) $("list").replaceChildren(empty(error.message, "Повторите попытку позже."));
+  }
+}
+
+async function refreshOpenDetail() {
+  const dialog = $("detail");
+  const id = state.detailId;
+  const snapshot = state.detailSnapshot;
+  const revision = state.detailRevision;
+  if (!dialog.open || !id || !snapshot || !initData || !state.authenticated) return;
+  state.detailRefreshController?.abort();
+  const controller = new AbortController();
+  state.detailRefreshController = controller;
+  try {
+    const data = await api("/api/cases/" + encodeURIComponent(id), controller.signal);
+    if (controller.signal.aborted || !dialog.open || id !== state.detailId
+      || revision !== state.detailRevision || snapshot !== state.detailSnapshot) return;
+    if (JSON.stringify(data) === snapshot) return;
+    const root = $("detail-content");
+    if (canRefreshDetailInPlace(root)) {
+      await openDetail(id, {data, quiet: true});
+    } else {
+      freshnessAction(true, id);
+    }
+  } catch (_) {
+    // Background refresh failures stay quiet; manual refresh remains available.
+  } finally {
+    if (state.detailRefreshController === controller) state.detailRefreshController = null;
   }
 }
 
@@ -1555,6 +1861,19 @@ $("city-filter").addEventListener("change", event => { state.city = event.target
 $("load-more").addEventListener("click", () => { if (!state.loading) load(true); });
 $("refresh").addEventListener("click", refreshDashboard);
 $("close-detail").addEventListener("click", () => $("detail").close());
+$("detail").addEventListener("close", () => {
+  state.detailRevision += 1;
+  state.detailId = null;
+  state.detailSnapshot = null;
+  state.detailController?.abort();
+  state.detailRefreshController?.abort();
+  freshnessAction(false, null);
+});
+setInterval(() => {
+  if (!state.authenticated || document.visibilityState !== "visible") return;
+  if ($("detail").open) refreshOpenDetail();
+  else refreshDashboard({background: true});
+}, 30000);
 
 async function start() {
   if (!initData) {
@@ -1566,6 +1885,7 @@ async function start() {
   }
   try {
     const user = await api("/api/me");
+    state.authenticated = true;
     $("account-name").textContent = user.display_name || "Мой кабинет";
     await refreshDashboard();
   } catch (error) {

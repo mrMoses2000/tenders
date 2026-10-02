@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -41,13 +44,17 @@ class AssemblyAITranscriber:
             "User-Agent": "procurement-agent-bot/0.1",
         }
 
+    @staticmethod
+    def _request_timeout() -> httpx.Timeout:
+        # Every network operation is bounded, including durable one-shot polls.
+        return httpx.Timeout(connect=30.0, read=120.0, write=300.0, pool=30.0)
+
     async def transcribe(self, path: Path, language: str = "auto") -> Transcript:
         if not path.is_file() or path.stat().st_size <= 0:
             raise PermanentProviderError("audio file is missing or empty")
-        timeout = httpx.Timeout(connect=60.0, read=180.0, write=300.0, pool=60.0)
         try:
             async with httpx.AsyncClient(
-                timeout=timeout,
+                timeout=self._request_timeout(),
                 transport=self._transport,
                 follow_redirects=False,
             ) as client:
@@ -62,6 +69,60 @@ class AssemblyAITranscriber:
             raise PermanentProviderError("AssemblyAI returned malformed JSON") from exc
         raise AssertionError("unreachable")
 
+    async def submit(self, path: Path, language: str = "auto") -> str:
+        """Upload audio and create a transcript job without waiting for completion."""
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise PermanentProviderError("audio file is missing or empty")
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._request_timeout(),
+                transport=self._transport,
+                follow_redirects=False,
+            ) as client:
+                upload_url = await self._upload(client, path)
+                return await self._submit(client, upload_url, language)
+        except httpx.HTTPStatusError as exc:
+            self._classify_http(exc)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise RetryableProviderError("AssemblyAI network error") from exc
+        except (TypeError, ValueError) as exc:
+            raise PermanentProviderError("AssemblyAI returned malformed JSON") from exc
+        raise AssertionError("unreachable")
+
+    async def poll(self, transcript_id: str) -> Transcript | None:
+        """Fetch one transcript status; queued work returns ``None`` immediately."""
+        safe_id = self._validate_transcript_id(transcript_id)
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._request_timeout(),
+                transport=self._transport,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(
+                    f"{self._base_url}/v2/transcript/{quote(safe_id, safe='')}",
+                    headers=self._headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                return self._parse_result(data, safe_id)
+        except httpx.HTTPStatusError as exc:
+            self._classify_http(exc)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise RetryableProviderError("AssemblyAI network error") from exc
+        except (TypeError, ValueError) as exc:
+            raise PermanentProviderError("AssemblyAI returned malformed JSON") from exc
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _validate_transcript_id(transcript_id: str) -> str:
+        # AssemblyAI IDs are UUIDs. Permit safe provider/test identifiers while
+        # rejecting path, query, fragment, and percent-encoding delimiters.
+        if not isinstance(transcript_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,200}", transcript_id
+        ):
+            raise PermanentProviderError("invalid AssemblyAI transcript ID")
+        return transcript_id
+
     async def _upload(self, client: httpx.AsyncClient, path: Path) -> str:
         response = await client.post(
             f"{self._base_url}/v2/upload",
@@ -69,7 +130,10 @@ class AssemblyAITranscriber:
             content=self._stream_file(path),
         )
         response.raise_for_status()
-        upload_url = str(response.json().get("upload_url") or "")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise PermanentProviderError("AssemblyAI returned malformed upload JSON")
+        upload_url = str(payload.get("upload_url") or "")
         if not upload_url.startswith("https://"):
             raise PermanentProviderError("AssemblyAI upload response has no HTTPS URL")
         return upload_url
@@ -103,10 +167,13 @@ class AssemblyAITranscriber:
             json=payload,
         )
         response.raise_for_status()
-        transcript_id = str(response.json().get("id") or "")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise PermanentProviderError("AssemblyAI returned malformed transcript JSON")
+        transcript_id = str(payload.get("id") or "")
         if not transcript_id:
             raise PermanentProviderError("AssemblyAI response has no transcript ID")
-        return transcript_id
+        return self._validate_transcript_id(transcript_id)
 
     async def _wait(self, client: httpx.AsyncClient, transcript_id: str) -> Transcript:
         deadline = asyncio.get_running_loop().time() + self._timeout_seconds
@@ -117,37 +184,70 @@ class AssemblyAITranscriber:
             )
             response.raise_for_status()
             data = response.json()
-            status = data.get("status")
-            if status == "completed":
-                text = str(data.get("text") or "").strip()
-                if not text:
-                    raise PermanentProviderError("AssemblyAI returned an empty transcript")
-                language = str(data.get("language_code") or "unknown")
-                confidence = data.get("language_confidence")
-                if confidence is not None:
-                    confidence = float(confidence)
-                    if not 0 <= confidence <= 1:
-                        raise PermanentProviderError(
-                            "AssemblyAI returned invalid language confidence"
-                        )
-                model = str(
-                    data.get("speech_model_used")
-                    or data.get("speech_model")
-                    or "unknown"
-                )
-                return Transcript(
-                    text=text,
-                    language=language,
-                    confidence=confidence,
-                    provider=f"assemblyai:{model}:{transcript_id}",
-                )
-            if status == "error":
-                error = str(data.get("error") or "AssemblyAI transcription failed")
-                raise PermanentProviderError(error[:500])
-            if status not in {"queued", "processing"}:
-                raise PermanentProviderError("unexpected AssemblyAI transcript status")
+            result = self._parse_result(data, transcript_id)
+            if result is not None:
+                return result
             await asyncio.sleep(self._poll_interval_seconds)
         raise RetryableProviderError("AssemblyAI polling timeout")
+
+    @staticmethod
+    def _confidence(value: Any, label: str) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise PermanentProviderError(f"AssemblyAI returned invalid {label}")
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PermanentProviderError(f"AssemblyAI returned invalid {label}") from exc
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise PermanentProviderError(f"AssemblyAI returned invalid {label}")
+        return confidence
+
+    @classmethod
+    def _parse_result(cls, data: Any, transcript_id: str) -> Transcript | None:
+        if not isinstance(data, dict):
+            raise PermanentProviderError("AssemblyAI returned malformed JSON")
+        status = data.get("status")
+        if status in {"queued", "processing"}:
+            return None
+        if status == "error":
+            error = str(data.get("error") or "AssemblyAI transcription failed")
+            raise PermanentProviderError(error[:500])
+        if status != "completed":
+            raise PermanentProviderError("unexpected AssemblyAI transcript status")
+        text = str(data.get("text") or "").strip()
+        if not text:
+            raise PermanentProviderError("AssemblyAI returned an empty transcript")
+        language_confidence = cls._confidence(
+            data.get("language_confidence"), "language confidence"
+        )
+        speech_confidence = cls._confidence(data.get("confidence"), "speech confidence")
+        words = data.get("words") or []
+        if not isinstance(words, list):
+            raise PermanentProviderError("AssemblyAI returned invalid word confidence data")
+        low_confidence_words: list[str] = []
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            token = word.get("text")
+            confidence = cls._confidence(word.get("confidence"), "word confidence")
+            if (
+                isinstance(token, str)
+                and token.strip()
+                and confidence is not None
+                and confidence < 0.8
+            ):
+                low_confidence_words.append(token.strip())
+        model = str(data.get("speech_model_used") or data.get("speech_model") or "unknown")
+        return Transcript(
+            text=text,
+            language=str(data.get("language_code") or "unknown"),
+            confidence=language_confidence,
+            provider=f"assemblyai:{model}:{transcript_id}",
+            speech_confidence=speech_confidence,
+            low_confidence_words=tuple(low_confidence_words),
+        )
 
     @staticmethod
     async def _stream_file(path: Path, chunk_size: int = 1024 * 1024):

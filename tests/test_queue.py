@@ -11,12 +11,16 @@ import pytest
 
 from procurement_bot.db import run_migrations
 from procurement_bot.queue import (
+    ClaimedJob,
+    ClaimedOutbox,
     IncomingAttachment,
     bounded_backoff_seconds,
     claim_job,
     claim_outbox,
     complete_job,
     complete_outbox,
+    defer_job,
+    defer_outbox,
     persist_telegram_message,
     renew_job_lease,
     stable_key,
@@ -39,10 +43,7 @@ def test_stable_key_rejects_ambiguous_namespace(namespace: str) -> None:
 
 
 def test_bounded_backoff_grows_but_never_exceeds_cap() -> None:
-    delays = [
-        bounded_backoff_seconds(i, cap_seconds=60, random_value=1)
-        for i in range(1, 20)
-    ]
+    delays = [bounded_backoff_seconds(i, cap_seconds=60, random_value=1) for i in range(1, 20)]
     assert delays == sorted(delays)
     assert delays[0] == pytest.approx(2.4)
     assert delays[-1] == 60
@@ -57,6 +58,7 @@ async def test_atomic_ingress_and_leased_job_roundtrip() -> None:
     schema = f"test_procurement_{uuid4().hex}"
     admin = await asyncpg.connect(dsn)
     await admin.execute(f'CREATE SCHEMA "{schema}"')
+
     async def init_connection(connection: asyncpg.Connection) -> None:
         for type_name in ("json", "jsonb"):
             await connection.set_type_codec(
@@ -119,9 +121,7 @@ async def test_atomic_ingress_and_leased_job_roundtrip() -> None:
         assert await pool.fetchval("SELECT count(*) FROM jobs") == 1
         assert await pool.fetchval("SELECT count(*) FROM outbox_events") == 1
         assert (
-            await pool.fetchval(
-                "SELECT status FROM processed_updates WHERE update_id=7001"
-            )
+            await pool.fetchval("SELECT status FROM processed_updates WHERE update_id=7001")
             == "completed"
         )
 
@@ -130,9 +130,7 @@ async def test_atomic_ingress_and_leased_job_roundtrip() -> None:
         assert job.kind == "download_attachment"
         assert job.payload["attachment_id"] == str(accepted.attachment_id)
         assert job.attempts == 1
-        assert await renew_job_lease(
-            pool, job.id, "test-worker", lease_seconds=60
-        )
+        assert await renew_job_lease(pool, job.id, "test-worker", lease_seconds=60)
         assert not await complete_job(pool, job.id, "wrong-worker")
         assert await complete_job(pool, job.id, "test-worker")
         assert await pool.fetchval("SELECT status FROM jobs WHERE id=$1", job.id) == "succeeded"
@@ -156,3 +154,93 @@ async def test_atomic_ingress_and_leased_job_roundtrip() -> None:
         await pool.close()
         await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
         await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["job", "outbox"])
+async def test_deferral_is_lease_fenced_and_does_not_consume_attempt(kind: str) -> None:
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.sql = ""
+            self.args: tuple[object, ...] = ()
+            self.result = "UPDATE 1"
+
+        async def execute(self, sql: str, *args: object) -> str:
+            self.sql = sql
+            self.args = args
+            return self.result
+
+    pool = RecordingPool()
+    identifier = uuid4()
+    available_at = datetime(2026, 9, 23, 9, tzinfo=UTC)
+    if kind == "job":
+        claimed = ClaimedJob(
+            id=identifier,
+            kind="enqueue_whatsapp_send",
+            payload={"approval_id": str(uuid4())},
+            attempts=5,
+            max_attempts=5,
+            idempotency_key="job:test",
+            locked_by="worker-a",
+            lease_expires_at=datetime(2026, 9, 23, 8, tzinfo=UTC),
+        )
+        deferred = await defer_job(pool, claimed, available_at=available_at, reason="quiet hours")
+        assert "UPDATE jobs" in pool.sql
+        assert "status='running'" in pool.sql
+    else:
+        claimed = ClaimedOutbox(
+            id=identifier,
+            event_type="whatsapp.send_text",
+            payload={"text": "hello"},
+            attempts=3,
+            max_attempts=3,
+            idempotency_key="outbox:test",
+            locked_by="worker-a",
+            lease_expires_at=datetime(2026, 9, 23, 8, tzinfo=UTC),
+            approval_id=uuid4(),
+        )
+        deferred = await defer_outbox(
+            pool, claimed, available_at=available_at, reason="daily limit"
+        )
+        assert "UPDATE outbox_events" in pool.sql
+        assert "status='sending'" in pool.sql
+    assert deferred is True
+    assert "attempts=GREATEST(attempts-1,0)" in pool.sql
+    assert "locked_by=$2" in pool.sql
+    assert "lease_expires_at>now()" in pool.sql
+    assert pool.args[0] == identifier
+    assert pool.args[1] == "worker-a"
+    assert pool.args[2] == available_at
+    assert pool.args[3] in {"quiet hours", "daily limit"}
+
+
+@pytest.mark.asyncio
+async def test_deferral_rejects_lost_lease_and_naive_deadline() -> None:
+    class RecordingPool:
+        async def execute(self, _sql: str, *_args: object) -> str:
+            return "UPDATE 0"
+
+    job = ClaimedJob(
+        id=uuid4(),
+        kind="enqueue_whatsapp_send",
+        payload={},
+        attempts=1,
+        max_attempts=5,
+        idempotency_key="job:test",
+        locked_by="worker-a",
+        lease_expires_at=datetime(2026, 9, 23, 8, tzinfo=UTC),
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await defer_job(
+            RecordingPool(),  # type: ignore[arg-type]
+            job,
+            available_at=datetime(2026, 9, 23, 9),
+            reason="quiet hours",
+        )
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        await defer_job(
+            RecordingPool(),  # type: ignore[arg-type]
+            job,
+            available_at=datetime(2026, 9, 23, 9, tzinfo=UTC),
+            reason="quiet hours",
+        )

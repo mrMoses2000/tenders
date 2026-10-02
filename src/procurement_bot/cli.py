@@ -23,12 +23,15 @@ from procurement_bot.intake import IntakeService
 from procurement_bot.logging import configure_logging
 from procurement_bot.mini_app import create_mini_app, validate_public_url
 from procurement_bot.outbox import TelegramOutboxWorker, WhatsAppOutboxWorker
+from procurement_bot.parallel_research import ParallelResearchRunExecutor
 from procurement_bot.providers.agy import AgyExtractor
 from procurement_bot.providers.agy_browser import AgyBrowserMcpExecutor
 from procurement_bot.providers.assemblyai import AssemblyAITranscriber
 from procurement_bot.providers.browser import BrowserResearchPort, StructuredBrowserProvider
 from procurement_bot.providers.codex_chrome import CodexChromeExecutor
 from procurement_bot.providers.olx_fallback import OlxFallbackProvider
+from procurement_bot.providers.supplier_audio import KazakhAudioTranscriber
+from procurement_bot.providers.supplier_image import CodexSupplierImageReader
 from procurement_bot.providers.two_gis_fallback import TwoGisFallbackProvider
 from procurement_bot.providers.waha import WahaClient
 from procurement_bot.research_execution import ResearchRunExecutor
@@ -229,6 +232,25 @@ async def _run_mini_app(settings: Settings) -> None:
         await pool.close()
 
 
+_BROWSER_HEAVY_JOB_KINDS = (
+    "parallel_research_task",
+    "enrich_2gis_contact",
+    "resolve_locality",
+)
+
+
+def _excluded_job_kinds_for_worker(settings: Settings, index: int) -> tuple[str, ...]:
+    """Reserve only the configured browser budget for browser-heavy jobs."""
+
+    browser_research_enabled = (
+        settings.parallel_research_enabled or settings.staged_research_enabled
+    )
+    if not browser_research_enabled or settings.worker_concurrency <= 1:
+        return ()
+    heavy_workers = min(settings.browser_cli_concurrency, settings.worker_concurrency)
+    return _BROWSER_HEAVY_JOB_KINDS if index >= heavy_workers else ()
+
+
 def _start_worker_tasks(
     tasks: asyncio.TaskGroup,
     settings: Settings,
@@ -245,7 +267,7 @@ def _start_worker_tasks(
         home_dir=agy_home,
     )
     intake = IntakeService(extractor, scope_policy=SearchScopePolicy.require_explicit())
-    research_executor = _build_research_executor(settings, pool)
+    research_executor = _build_research_executor(settings, pool, profile_extractor=extractor)
     if settings.voice_provider == "assemblyai":
         transcriber = AssemblyAITranscriber(
             settings.require_assemblyai_api_key(),
@@ -262,9 +284,22 @@ def _start_worker_tasks(
             enabled=True,
             timeout_seconds=settings.waha_timeout_seconds,
         )
-        if settings.waha_enabled else None
+        if settings.waha_enabled
+        else None
     )
     download_limit = settings.max_source_file_bytes
+    image_reader = (
+        CodexSupplierImageReader(
+            settings.codex_2gis_executable, model=settings.codex_2gis_model,
+            timeout_seconds=settings.supplier_image_timeout_seconds,
+        ) if settings.supplier_media_enabled else None
+    )
+    kazakh_transcriber = (
+        KazakhAudioTranscriber(
+            executable=settings.agy_executable, model=settings.agy_model,
+            timeout_seconds=settings.agy_timeout_seconds, home_dir=agy_home,
+        ) if settings.supplier_media_enabled else None
+    )
     if not settings.telegram_api_base_url:
         download_limit = min(download_limit, settings.telegram_cloud_download_limit_bytes)
     for index in range(settings.worker_concurrency):
@@ -282,11 +317,15 @@ def _start_worker_tasks(
             locality_browser=(research_executor.browser if research_executor else None),
             results_root=settings.results_root,
             whatsapp_enabled=settings.waha_enabled,
-            transcription_min_language_confidence=(
-                settings.transcription_min_language_confidence
-            ),
+            semantic_supplier_reply_enabled=settings.semantic_supplier_reply_enabled,
+            research_auto_prepare_outreach=settings.research_auto_prepare_outreach,
+            transcription_min_language_confidence=(settings.transcription_min_language_confidence),
             waha_session=settings.waha_session,
             waha_client=waha,
+            excluded_job_kinds=_excluded_job_kinds_for_worker(settings, index),
+            supplier_image_reader=image_reader,
+            supplier_kazakh_transcriber=kazakh_transcriber,
+            supplier_media_max_bytes=settings.supplier_media_max_bytes,
         )
         tasks.create_task(worker.run_forever())
     outbox = TelegramOutboxWorker(
@@ -309,7 +348,9 @@ def _start_worker_tasks(
 def _build_research_executor(
     settings: Settings,
     pool,
-) -> ResearchRunExecutor | None:
+    *,
+    profile_extractor=None,
+) -> ResearchRunExecutor | ParallelResearchRunExecutor | None:
     if not settings.browser_research_enabled:
         return None
     browser_home, server = settings.prepare_isolated_agy_browser_home()
@@ -324,6 +365,7 @@ def _build_research_executor(
         for name in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
         if name in os.environ
     }
+    resource_budget = asyncio.Semaphore(settings.browser_cli_concurrency)
     transport = AgyBrowserMcpExecutor(
         executable=executable.resolve(),
         home_dir=browser_home,
@@ -334,22 +376,89 @@ def _build_research_executor(
         timeout_seconds=settings.agy_browser_timeout_seconds,
         concurrency=settings.agy_browser_concurrency,
         runtime_environment=runtime_environment,
+        resource_budget=resource_budget,
+        diagnostics_root=settings.browser_diagnostics_root,
+        batch_timeout_seconds=settings.browser_batch_timeout_seconds,
+        captcha_cooldown_seconds=(
+            settings.browser_source_cooldown_seconds
+            if settings.staged_research_enabled
+            else 60
+        ),
     )
     browser: BrowserResearchPort = StructuredBrowserProvider(transport)
-    if settings.codex_2gis_fallback_enabled or settings.codex_olx_fallback_enabled:
+    codex_transport = None
+    codex_needed = (
+        settings.codex_2gis_fallback_enabled
+        or settings.codex_olx_fallback_enabled
+        or (
+            settings.staged_research_enabled
+            and settings.staged_research_primary == "codex"
+        )
+    )
+    if codex_needed:
         codex = settings.codex_2gis_executable.expanduser()
-        if not codex.is_absolute() or not codex.is_file():
-            raise ValueError(f"Codex Chrome fallback executable was not found: {codex}")
-        fallback = StructuredBrowserProvider(CodexChromeExecutor(
+        if not codex.is_absolute() or not codex.is_file() or not os.access(codex, os.X_OK):
+            raise ValueError(f"Codex Chrome executable was not found: {codex}")
+        codex_transport = CodexChromeExecutor(
             executable=codex,
             model=settings.codex_2gis_model,
             reasoning_effort=settings.codex_2gis_reasoning_effort,
             timeout_seconds=settings.codex_2gis_timeout_seconds,
-        ))
+            resource_budget=resource_budget,
+            diagnostics_root=settings.browser_diagnostics_root,
+            batch_timeout_seconds=settings.browser_batch_timeout_seconds,
+            resource_wait_seconds=settings.browser_resource_wait_seconds,
+            retain_failure_trace=settings.browser_failure_trace_enabled,
+            chrome_plugin_root=settings.codex_chrome_plugin_root,
+            chrome_node_executable=settings.codex_chrome_node_executable,
+        )
+        fallback = StructuredBrowserProvider(codex_transport)
         if settings.codex_2gis_fallback_enabled:
-            browser = TwoGisFallbackProvider(browser, fallback)
+            browser = TwoGisFallbackProvider(
+                browser,
+                fallback,
+                web_fallback_enabled=settings.parallel_research_enabled,
+            )
         if settings.codex_olx_fallback_enabled:
             browser = OlxFallbackProvider(browser, fallback)
+    if settings.staged_research_enabled:
+        from procurement_bot.providers.staged_research import StagedResearchProvider
+
+        staged_primary = (
+            codex_transport
+            if settings.staged_research_primary == "codex"
+            else transport
+        )
+        staged_fallback = (
+            None
+            if settings.staged_research_primary == "codex"
+            else codex_transport
+        )
+        browser = StagedResearchProvider(
+            pool,
+            browser,
+            staged_primary,
+            staged_fallback,
+            separate_contacts=True,
+        )
+    if settings.staged_research_enabled and profile_extractor is None:
+        profile_extractor = AgyExtractor(
+            executable=settings.agy_executable,
+            timeout_seconds=settings.agy_timeout_seconds,
+            model=settings.agy_model,
+            concurrency=settings.agy_concurrency,
+            home_dir=settings.prepare_isolated_agy_home(),
+        )
+    if settings.parallel_research_enabled:
+        return ParallelResearchRunExecutor(
+            pool,
+            browser,
+            max_active_groups=settings.research_active_groups,
+            target_suppliers=settings.research_target_suppliers,
+            max_batches=settings.research_max_batches,
+            profile_extractor=profile_extractor if settings.staged_research_enabled else None,
+            card_candidate_limit=1 if settings.staged_research_enabled else None,
+        )
     return ResearchRunExecutor(pool, browser)
 
 

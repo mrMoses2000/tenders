@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from pydantic import BaseModel, Field
 
@@ -73,6 +74,8 @@ class SupplierBrowserResult(StrictModel):
     candidates: list[SupplierCandidate] = Field(default_factory=list, max_length=100)
     exhausted: bool
     pages_examined: int = Field(ge=0, le=1_000)
+    next_cursor: str | None = Field(default=None, max_length=2_000)
+    progress_token: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     access_issue: Literal[
         "captcha", "access_denied", "login_wall", "mcp_error",
         "browser_start_failed", "no_results", "unknown",
@@ -117,7 +120,9 @@ _BROWSER_SPEC: dict[str, Any] = {
 
 
 def _canonical(value: Any) -> tuple[str, str]:
-    if isinstance(value, BaseModel):
+    if isinstance(value, SourcePlan):
+        value = value.browser_payload()
+    elif isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return encoded, hashlib.sha256(encoded.encode()).hexdigest()
@@ -151,6 +156,77 @@ def _assert_olx_url(url: str) -> None:
     hostname = (parsed.hostname or "").casefold()
     if parsed.scheme != "https" or hostname not in {"olx.kz", "www.olx.kz"}:
         raise UnsafeBrowserResult("OLX evidence must use an official HTTPS olx.kz URL")
+
+
+def _assert_web_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise UnsafeBrowserResult("WEB evidence must use a public HTTPS URL without credentials")
+
+
+def normalize_search_cursor(
+    url: str,
+    source: ResearchSource,
+    *,
+    current_url: str | None = None,
+) -> str:
+    """Validate and canonicalize a provider-supplied next-page URL."""
+    if len(url) > 2_000:
+        raise UnsafeBrowserResult("search cursor URL is too long")
+    try:
+        parsed = urlparse(url.strip())
+        hostname = (parsed.hostname or "").rstrip(".").casefold()
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsafeBrowserResult("search cursor URL is malformed") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        raise UnsafeBrowserResult("search cursor must be a public HTTPS URL")
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise UnsafeBrowserResult("search cursor hostname is invalid") from exc
+
+    if source == ResearchSource.TWO_GIS:
+        if hostname != "2gis.kz" and not hostname.endswith(".2gis.kz"):
+            raise UnsafeBrowserResult("2GIS search cursor must use an official 2gis.kz URL")
+    elif source == ResearchSource.OLX:
+        if hostname != "olx.kz" and not hostname.endswith(".olx.kz"):
+            raise UnsafeBrowserResult("OLX search cursor must use an official olx.kz URL")
+    elif source == ResearchSource.WEB:
+        blocked_suffixes = (".localhost", ".local", ".internal", ".test", ".invalid")
+        if hostname == "localhost" or hostname.endswith(blocked_suffixes) or "." not in hostname:
+            raise UnsafeBrowserResult("WEB search cursor must use a public hostname")
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise UnsafeBrowserResult("WEB search cursor must use a public hostname")
+        search_hosts = {
+            "google.com", "www.google.com", "google.kz", "www.google.kz",
+            "bing.com", "www.bing.com", "duckduckgo.com", "www.duckduckgo.com",
+            "yandex.kz", "www.yandex.kz", "yandex.com", "www.yandex.com",
+        }
+        same_as_current = False
+        if current_url is not None:
+            current = normalize_search_cursor(current_url, source)
+            same_as_current = urlparse(current).hostname == hostname
+        if hostname not in search_hosts and not same_as_current:
+            raise UnsafeBrowserResult(
+                "WEB search cursor must stay on the current search host or "
+                "an approved search engine"
+            )
+    else:
+        raise UnsafeBrowserResult("search cursors are not supported for this source")
+
+    netloc = f"[{hostname}]" if ":" in hostname else hostname
+    return urlunparse(("https", netloc, parsed.path or "/", "", parsed.query, ""))
 
 
 def _is_olx_listing(url: str) -> bool:
@@ -200,6 +276,10 @@ class StructuredBrowserProvider:
                 "rendered_query": plan.rendered_query,
             }
         )
+        if plan.search_cursor is not None:
+            plan = plan.model_copy(update={
+                "search_cursor": normalize_search_cursor(plan.search_cursor, plan.source),
+            })
         return self._prepare(
             BrowserOperation.SEARCH_SUPPLIERS,
             plan,
@@ -254,6 +334,27 @@ class StructuredBrowserProvider:
             )
         if len(result.candidates) > plan.minimum_unique_candidates * 5:
             raise UnsafeBrowserResult("browser returned an unexpectedly large candidate set")
+        batch_limit = getattr(plan, "batch_candidate_limit", None)
+        if batch_limit is not None and len(result.candidates) > batch_limit:
+            raise UnsafeBrowserResult(
+                "browser result exceeded its bounded batch candidate limit",
+                access_issue="unknown",
+            )
+        if result.next_cursor is not None:
+            next_cursor = normalize_search_cursor(
+                result.next_cursor,
+                plan.source,
+                current_url=plan.search_cursor,
+            )
+            result = result.model_copy(update={"next_cursor": next_cursor})
+        excluded_ids = set(getattr(plan, "excluded_external_ids", ()))
+        if excluded_ids and any(
+            candidate.external_id in excluded_ids for candidate in result.candidates
+        ):
+            raise UnsafeBrowserResult(
+                "browser result repeated an excluded provider candidate",
+                access_issue="unknown",
+            )
         accepted_candidates: list[SupplierCandidate] = []
         for candidate in result.candidates:
             if candidate.source != plan.source:
@@ -297,6 +398,8 @@ class StructuredBrowserProvider:
                     _assert_2gis_url(evidence.source_url)
                 if plan.source == ResearchSource.OLX:
                     _assert_olx_url(evidence.source_url)
+                if plan.source == ResearchSource.WEB:
+                    _assert_web_url(evidence.source_url)
                 if evidence.evidence_type == EvidenceType.SUPPLIER_STATEMENT:
                     raise UnsafeBrowserResult(
                         "browser research cannot manufacture a supplier statement"
@@ -313,6 +416,8 @@ class StructuredBrowserProvider:
             return result.model_copy(update={
                 "candidates": accepted_candidates, "exhausted": False,
             })
+        if batch_limit is not None and len(accepted_candidates) >= batch_limit:
+            return result.model_copy(update={"exhausted": False})
         return result
 
     @staticmethod
@@ -340,7 +445,12 @@ class StructuredBrowserProvider:
             "that listing URL. Do not infer WhatsApp from a phone number; use "
             "kind=whatsapp only for an explicit WhatsApp link. If the phone still "
             "requires login or is blocked, keep the listing as a lead with no "
-            "invented contact. "
+            "invented contact. For each candidate set contact_discovery_reason from "
+            "what you observed: phone_found when revealed; button_not_found when the "
+            "public phone control is absent; contact_not_published or phone_not_visible "
+            "only after inspecting the phone area and finding no number; login_required "
+            "when a login wall blocks it. A timed out or inaccessible attempt is not "
+            "evidence that no phone exists. "
             "For a 2GIS source, infer relevant store or supplier categories from the "
             "product clues and technical requirements in query_terms. Do not paste "
             "rendered_query as a literal product search. Search those categories in "
@@ -368,6 +478,12 @@ class StructuredBrowserProvider:
             "page, or price hidden in an image you cannot read yields no price. "
             "Keep leads with no visible phone. Cite the "
             "firm-specific URL and add a contact claim when a number is captured. "
+            "For each candidate set contact_discovery_reason from observed contact "
+            "outcome: phone_found when revealed; button_not_found when the public "
+            "Show phones control is absent; contact_not_published or phone_not_visible "
+            "only after inspecting the phone area and finding no number; login_required "
+            "when a login wall blocks it. A timed out or inaccessible attempt is not "
+            "evidence that no phone exists. "
             "Never infer stock, exact product match, or WhatsApp availability from "
             "the shop category or an ordinary phone number. "
             "Return only JSON matching the supplied schema and echo both hashes exactly.\n"

@@ -39,6 +39,49 @@ def test_codex_browser_timeout_covers_eight_listing_fallback() -> None:
     assert settings.codex_2gis_timeout_seconds == 900
 
 
+def test_codex_chrome_node_executable_is_optional_path_configuration(tmp_path: Path):
+    assert Settings(_env_file=None).codex_chrome_node_executable is None
+    node = tmp_path / "node"
+
+    settings = Settings(_env_file=None, CODEX_CHROME_NODE_EXECUTABLE=node)
+
+    assert settings.codex_chrome_node_executable == node
+
+
+def test_browser_batch_timeout_can_be_raised_to_300_without_changing_default():
+    assert Settings(_env_file=None).browser_batch_timeout_seconds == 180
+    settings = Settings(_env_file=None, BROWSER_BATCH_TIMEOUT_SECONDS=300)
+    assert settings.browser_batch_timeout_seconds == 300
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, BROWSER_BATCH_TIMEOUT_SECONDS=301)
+
+
+def test_browser_source_cooldown_has_bounded_default_and_configuration():
+    assert Settings(_env_file=None).browser_source_cooldown_seconds == 900
+    assert (
+        Settings(_env_file=None, BROWSER_SOURCE_COOLDOWN_SECONDS=1200)
+        .browser_source_cooldown_seconds
+        == 1200
+    )
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, BROWSER_SOURCE_COOLDOWN_SECONDS=59)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, BROWSER_SOURCE_COOLDOWN_SECONDS=3601)
+
+
+def test_staged_research_primary_defaults_to_agy_and_accepts_codex():
+    assert Settings(_env_file=None).staged_research_primary == "agy"
+    assert (
+        Settings(_env_file=None, STAGED_RESEARCH_PRIMARY="codex")
+        .staged_research_primary
+        == "codex"
+    )
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, STAGED_RESEARCH_PRIMARY="web")
+
+
 def test_telegram_allowlist_parses_comma_separated_ids():
     settings = Settings(_env_file=None, TELEGRAM_ALLOWED_USER_IDS="123, 456,123")
     assert settings.require_telegram_allowed_user_ids() == {123, 456}

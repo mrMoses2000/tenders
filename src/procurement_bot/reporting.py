@@ -42,6 +42,16 @@ class SupplierReportCard(StrictModel):
     questions_remaining: list[str] = Field(default_factory=list)
 
 
+class ReportItem(StrictModel):
+    """A request line shown even when no supplier offer has been recorded."""
+
+    item_number: int = Field(ge=1)
+    item_name: str = Field(min_length=1, max_length=500)
+    quantity: Decimal | None = Field(default=None, ge=0)
+    unit: str | None = Field(default=None, max_length=100)
+    specification_text: str | None = None
+
+
 class ProcurementReport(StrictModel):
     case_reference: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=500)
@@ -54,11 +64,13 @@ class ProcurementReport(StrictModel):
     whatsapp_failed: int = Field(default=0, ge=0)
     exact_matches: int = Field(default=0, ge=0)
     cards: list[SupplierReportCard] = Field(default_factory=list)
+    items: list[ReportItem] = Field(default_factory=list)
+    notice: str | None = Field(default=None, max_length=1000)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 def render_report_html(report: ProcurementReport) -> str:
-    cards = _render_groups(_ordered_cards(report.cards))
+    cards = _render_groups(_ordered_cards(report.cards), report.items)
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -75,6 +87,7 @@ def render_report_html(report: ProcurementReport) -> str:
 <div><b>{report.exact_matches}</b><span>точных вариантов</span></div>
 <div><b>{report.whatsapp_unavailable}</b><span>без подтверждённого WhatsApp</span></div>
 <div><b>{report.whatsapp_failed}</b><span>ошибок отправки</span></div></section>
+{f'<section class="notice">{_escape(report.notice)}</section>' if report.notice else ""}
 <section class="cards">{cards}</section>
 <footer>Сформировано: {_escape(report.generated_at.isoformat())}.
 Не является заказом, резервом или обязательством купить.</footer></main></body></html>"""
@@ -92,15 +105,46 @@ def _ordered_cards(cards: list[SupplierReportCard]) -> list[SupplierReportCard]:
     )
 
 
-def _render_groups(cards: list[SupplierReportCard]) -> str:
-    if not cards:
+def _render_groups(cards: list[SupplierReportCard], items: list[ReportItem]) -> str:
+    if not cards and not items:
         return '<div class="empty">Предложений пока нет.</div>'
     groups: dict[tuple[int, str], list[SupplierReportCard]] = {}
     for card in cards:
         groups.setdefault((card.item_number, card.item_name), []).append(card)
+    item_keys = [(item.item_number, item.item_name) for item in items]
+    for key in groups:
+        if key not in item_keys:
+            item_keys.append(key)
     parts: list[str] = []
-    for (number, name), values in groups.items():
+    for number, name in item_keys:
+        values = groups.get((number, name), [])
         heading = f"Позиция {number}: {name}" if number else (name or "Предложения")
+        if not values:
+            item = next(
+                (item for item in items
+                 if item.item_number == number and item.item_name == name),
+                None,
+            )
+            context = ""
+            if item is not None:
+                required = " ".join(
+                    part for part in (
+                        str(item.quantity) if item.quantity is not None else "",
+                        item.unit or "",
+                    ) if part
+                )
+                if required:
+                    context += f'<p>Требуется: {_escape(required)}</p>'
+                if item.specification_text:
+                    context += (
+                        '<details><summary>Техспек</summary><p>'
+                        f'{_escape(item.specification_text)}</p></details>'
+                    )
+            parts.append(
+                f'<section class="item-group"><h2>{_escape(heading)}</h2>'
+                f'<div class="empty">Предложений пока нет.{context}</div></section>'
+            )
+            continue
         ranked = [card for card in values if card.rank is not None and card.rank <= 5]
         others = [card for card in values if card not in ranked]
         top = (

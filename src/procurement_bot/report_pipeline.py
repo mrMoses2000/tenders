@@ -17,6 +17,7 @@ from procurement_bot.report_artifacts import persist_report_artifact
 from procurement_bot.reporting import (
     ProcurementReport,
     ReportEvidence,
+    ReportItem,
     SupplierReportCard,
     render_report_html,
 )
@@ -51,6 +52,7 @@ async def build_case_report(
     case_id: UUID,
     research_run_id: UUID | None = None,
     refresh_key: str | None = None,
+    partial_research_snapshot: bool = False,
 ) -> ReportBuildResult:
     """Build one conservative HTML report and publish its metadata atomically.
 
@@ -65,6 +67,9 @@ async def build_case_report(
         raise TypeError("research_run_id must be a UUID or None")
     if refresh_key is not None and (not refresh_key.strip() or len(refresh_key) > 200):
         raise ValueError("refresh_key must be a short nonempty value")
+
+    if partial_research_snapshot and not refresh_key:
+        raise ValueError("partial research report requires a distinct refresh key")
 
     async with connection.transaction():
         await connection.execute(
@@ -91,10 +96,23 @@ async def build_case_report(
             connection,
             case_id=case_id,
             research_run_id=research_run_id,
+            allow_running=partial_research_snapshot,
         )
         selected_run_id = run["id"] if run is not None else None
+        scope_revision = (
+            await connection.fetchrow(
+                "SELECT city,preferred_area_text,revision_sha256 FROM research_scope_revisions "
+                "WHERE research_run_id=$1 ORDER BY revision DESC LIMIT 1", selected_run_id,
+            ) if selected_run_id is not None else None
+        )
+        if scope_revision is not None:
+            case = {**dict(case), "effective_search_scope_label": (
+                f"Весь город {scope_revision['city']}; приоритет: "
+                f"{scope_revision['preferred_area_text']}"
+            )}
         event_key = stable_key(
             "workflow.report-built", case_id, selected_run_id or "no-run",
+            *((scope_revision["revision_sha256"],) if scope_revision else ()),
             *((refresh_key,) if refresh_key else ()),
         )
         existing = await _load_existing_result(
@@ -109,6 +127,8 @@ async def build_case_report(
             {"evaluating", "contacting", "report_ready", "selected"}
             if refresh_key else {"evaluating"}
         )
+        if partial_research_snapshot:
+            allowed_statuses = {*allowed_statuses, "researching"}
         if case["status"] not in allowed_statuses:
             raise ReportBuildRejected("procurement case is not ready for reporting")
 
@@ -137,25 +157,58 @@ async def build_case_report(
                 ri.specification_text,ri.quantity,ri.unit,ri.analogs_allowed,
                 location.city AS location_city,location.address_text,
                 location.district,location.market_name,location.pavilion,
-                priced.price_amount,priced.currency,
-                COALESCE(terms.price_unit,priced.price_unit) AS price_unit,
-                COALESCE(terms.pack_qty,priced.pack_qty) AS pack_qty,
-                COALESCE(terms.moq,priced.moq) AS moq,
-                COALESCE(terms.order_multiple,priced.order_multiple) AS order_multiple,
-                stock.available_qty,
-                COALESCE(stock.availability_status,'unknown') AS availability_status,
-                stock.source_type AS stock_source_type,
-                priced.source_type,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,price_amount,value}','')::numeric
+                     ELSE priced.price_amount END AS price_amount,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,currency,value}'
+                     ELSE priced.currency END AS currency,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,price_unit,value}'
+                     ELSE COALESCE(terms.price_unit,priced.price_unit) END AS price_unit,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,pack_qty,value}','')::numeric
+                     ELSE COALESCE(terms.pack_qty,priced.pack_qty) END AS pack_qty,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,moq,value}','')::numeric
+                     ELSE COALESCE(terms.moq,priced.moq) END AS moq,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,order_multiple,value}','')::numeric
+                     ELSE COALESCE(terms.order_multiple,priced.order_multiple)
+                END AS order_multiple,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,available_qty,value}','')::numeric
+                     ELSE stock.available_qty END AS available_qty,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN COALESCE(
+                         snapshot.snapshot #>> '{facts,availability_status,value}','unknown'
+                     )
+                     ELSE COALESCE(stock.availability_status,'unknown') END AS availability_status,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,availability_status,source_type}'
+                     ELSE stock.source_type END AS stock_source_type,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,price_amount,source_type}'
+                     ELSE priced.source_type END AS source_type,
                 contact.normalized_value AS supplier_phone,
                 contact.is_whatsapp_confirmed,
                 COALESCE(priced.vat_status,latest.vat_status) AS vat_status,
                 COALESCE(priced.delivery_status,latest.delivery_status) AS delivery_status,
-                COALESCE(priced.observed_at,latest.observed_at) AS observed_at,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(
+                         snapshot.snapshot #>> '{facts,price_amount,observed_at}',''
+                     )::timestamptz
+                     ELSE COALESCE(priced.observed_at,latest.observed_at) END AS observed_at,
                 evidence.title AS evidence_title,evidence.source_locator,evidence.source_url
             FROM offers AS o
             JOIN request_items AS ri ON ri.id=o.request_item_id
             JOIN suppliers AS s ON s.id=o.supplier_id
             LEFT JOIN supplier_locations AS location ON location.id=o.supplier_location_id
+            LEFT JOIN quote_snapshot_current AS current_snapshot ON current_snapshot.offer_id=o.id
+            LEFT JOIN quote_snapshot_versions AS snapshot
+              ON snapshot.id=current_snapshot.snapshot_id
+             AND snapshot.offer_id=o.id
+             AND snapshot.request_item_id=ri.id
             LEFT JOIN LATERAL (
                 SELECT contact.normalized_value,
                        CASE WHEN (
@@ -281,7 +334,11 @@ async def build_case_report(
                 ORDER BY ob.observed_at DESC,ob.created_at DESC,ob.id DESC LIMIT 1
             ) stock ON TRUE
             LEFT JOIN source_evidence AS evidence
-                ON evidence.id=COALESCE(priced.source_evidence_id,latest.source_evidence_id)
+                ON evidence.id=CASE WHEN snapshot.id IS NOT NULL
+                    THEN NULLIF(
+                        snapshot.snapshot #>> '{facts,price_amount,source_evidence_id}',''
+                    )::uuid
+                    ELSE COALESCE(priced.source_evidence_id,latest.source_evidence_id) END
             WHERE ri.case_id=$1 AND o.status<>'withdrawn'
             ORDER BY ri.line_number,s.display_name,o.created_at,o.id
             """,
@@ -377,6 +434,31 @@ async def build_case_report(
             contact_metrics=contact_metrics,
             generated_at=generated_at,
         )
+        report.items = [
+            ReportItem(
+                item_number=int(item["line_number"]),
+                item_name=str(item["name"]),
+                quantity=item["quantity"],
+                unit=item["unit"],
+                specification_text=item["specification_text"],
+            )
+            for item in items
+        ]
+        if partial_research_snapshot:
+            covered = len({row["request_item_id"] for row in offers})
+            contact_covered = len({
+                row["request_item_id"] for row in offers if row["supplier_phone"]
+            })
+            report.notice = (
+                f"Промежуточный срез. Сохранённые лиды заявки: по {covered} из {len(items)} "
+                f"позиций; телефоны указаны у лидов по {contact_covered} позициям. "
+                "Это сохранённые предложения заявки и они могут относиться к более ранним "
+                "поискам, а не к текущему запуску. "
+                "Поиск ещё не завершён. Контактный лид и публичная цена не подтверждают "
+                "наличие нужного товара, количество или соответствие техспеку."
+            )
+            summary.update(partial_research_snapshot=True, items_total=len(items),
+                           items_with_leads=covered, items_with_contacts=contact_covered)
         html = render_report_html(report)
         artifact = await persist_report_artifact(
             connection,
@@ -392,7 +474,7 @@ async def build_case_report(
                 *((refresh_key,) if refresh_key else ()),
             ),
         )
-        if case["status"] == "evaluating":
+        if case["status"] == "evaluating" and not partial_research_snapshot:
             transitioned = await connection.execute(
                 """UPDATE procurement_cases SET status='report_ready',updated_at=now()
                    WHERE id=$1 AND status='evaluating'""",
@@ -432,7 +514,9 @@ async def build_case_report(
                 "chat_id": int(case["telegram_id"]),
                 "storage_path": artifact.storage_path,
                 "filename": "otchet-po-zayavke.html",
-                "caption": _telegram_announcement(summary),
+                "caption": (("Промежуточный отчёт — поиск ещё не завершён.\n"
+                             if partial_research_snapshot else "")
+                            + _telegram_announcement(summary)),
             },
             idempotency_key=stable_key("telegram.report-ready", artifact.id),
         )
@@ -487,6 +571,7 @@ async def _load_research_run(
     *,
     case_id: UUID,
     research_run_id: UUID | None,
+    allow_running: bool = False,
 ) -> Mapping[str, Any] | None:
     if research_run_id is None:
         return await connection.fetchrow(
@@ -498,7 +583,7 @@ async def _load_research_run(
             LIMIT 1
             """,
             case_id,
-            list(_TERMINAL_RESEARCH_STATUSES),
+            [*_TERMINAL_RESEARCH_STATUSES, *(["running"] if allow_running else [])],
         )
     run = await connection.fetchrow(
         """
@@ -512,7 +597,8 @@ async def _load_research_run(
         raise ReportBuildRejected("research run does not exist")
     if run["case_id"] != case_id:
         raise ReportBuildRejected("research run belongs to a different case")
-    if run["status"] not in _TERMINAL_RESEARCH_STATUSES:
+    if run["status"] not in {*_TERMINAL_RESEARCH_STATUSES,
+                              *(["running"] if allow_running else [])}:
         raise ReportBuildRejected("research run is not complete enough for reporting")
     return run
 
@@ -643,7 +729,7 @@ def _build_report_projection(
         title=title[:500],
         city=str(case["city"] or "").strip() or "Город не указан",
         search_scope=(
-            str(case["search_area_text"] or "").strip()
+            str(case.get("effective_search_scope_label") or case["search_area_text"] or "").strip()
             or "Область поиска не указана"
         ),
         suppliers_found=suppliers_found,

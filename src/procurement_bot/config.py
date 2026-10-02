@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     poll_timeout_seconds: int = Field(default=30, ge=1, le=60)
     telegram_ingress_concurrency: int = Field(default=8, ge=1, le=64)
     worker_concurrency: int = Field(default=4, ge=1, le=32)
+    parallel_research_enabled: bool = False
+    research_auto_prepare_outreach: bool = True
+    research_active_groups: int = Field(default=3, ge=1, le=3)
+    research_target_suppliers: int = Field(default=20, ge=1, le=100)
+    research_max_batches: int = Field(default=20, ge=1, le=100)
+    browser_cli_concurrency: int = Field(default=1, ge=1, le=4)
+    browser_failure_trace_enabled: bool = False
+    browser_resource_wait_seconds: int = Field(default=120, ge=1, le=1800)
+    browser_source_cooldown_seconds: int = Field(default=900, ge=60, le=3600)
+    staged_research_enabled: bool = False
+    staged_research_primary: Literal["agy", "codex"] = "agy"
+    semantic_supplier_reply_enabled: bool = False
+    browser_batch_timeout_seconds: int = Field(default=180, ge=30, le=300)
+    browser_diagnostics_root: Path = Path("./var/provider-diagnostics")
     job_lease_seconds: int = Field(default=300, ge=30, le=3600)
     max_job_attempts: int = Field(default=5, ge=1, le=20)
 
@@ -78,6 +92,11 @@ class Settings(BaseSettings):
     assemblyai_key_name: str = "ASSEMBLI_AI_5"
     assemblyai_timeout_seconds: int = Field(default=10_800, ge=30, le=21_600)
     transcription_min_language_confidence: float = Field(default=0.55, ge=0, le=1)
+    supplier_media_enabled: bool = False
+    supplier_media_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=20 * 1024 * 1024)
+    codex_chrome_plugin_root: Path | None = None
+    codex_chrome_node_executable: Path | None = None
+    supplier_image_timeout_seconds: int = Field(default=120, ge=30, le=300)
 
     waha_enabled: bool = False
     waha_base_url: str = "http://127.0.0.1:3000"

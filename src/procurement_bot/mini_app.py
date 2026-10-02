@@ -65,12 +65,23 @@ from procurement_bot.outreach_batch import (
 from procurement_bot.queue import enqueue_job, stable_key
 from procurement_bot.research_workflow import ResearchStartDenied
 from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
+from procurement_bot.supplier_media import media_storage_path
 
 STATIC = Path(__file__).resolve().parents[2] / "mini_app"
 MAX_AGE_SECONDS = 24 * 60 * 60
 CASE_STATUSES = frozenset(
-    ("draft", "needs_clarification", "ready", "researching", "contacting",
-     "evaluating", "report_ready", "selected", "closed", "cancelled")
+    (
+        "draft",
+        "needs_clarification",
+        "ready",
+        "researching",
+        "contacting",
+        "evaluating",
+        "report_ready",
+        "selected",
+        "closed",
+        "cancelled",
+    )
 )
 
 
@@ -78,8 +89,14 @@ def validate_public_url(value: str) -> str:
     if not value:
         return ""
     parsed = urlparse(value)
-    if (parsed.scheme != "https" or not parsed.hostname or parsed.username
-            or parsed.password or parsed.query or parsed.fragment):
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ValueError("MINI_APP_PUBLIC_URL must be an HTTPS URL without credentials")
     return value.rstrip("/") + "/"
 
@@ -115,9 +132,11 @@ def verify_init_data(raw: str, bot_token: str, *, now: int | None = None) -> int
 
 
 def _json(request: web.Request, payload: object, *, status: int = 200) -> web.Response:
-    response = web.json_response(payload, status=status, dumps=lambda value: json.dumps(
-        value, ensure_ascii=False, default=_serialize
-    ))
+    response = web.json_response(
+        payload,
+        status=status,
+        dumps=lambda value: json.dumps(value, ensure_ascii=False, default=_serialize),
+    )
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -137,7 +156,7 @@ async def security_headers(request: web.Request, handler):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; script-src 'self' https://telegram.org; "
-        "style-src 'self'; connect-src 'self'; img-src 'self' data:; "
+        "style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src blob:; "
         "base-uri 'none'; frame-ancestors https://web.telegram.org"
     )
     return response
@@ -227,6 +246,242 @@ async def summary(request: web.Request) -> web.Response:
     return _json(request, {**dict(row), "items": items})
 
 
+async def _load_research_progress(connection: asyncpg.Connection, case_id: UUID) -> list[dict]:
+    """Read item, source, discovery-card, and saved-profile progress additively."""
+
+    rows = await connection.fetch(
+        """
+        SELECT grp.request_item_id,grp.status,grp.target_suppliers,
+               grp.eligible_suppliers,grp.reason,grp.updated_at,
+               grp.found_leads,grp.qualified_price_suppliers,
+               grp.branches_succeeded,grp.branches_failed,
+               grp.branches_blocked,grp.branches_total,
+               (SELECT jsonb_build_object('scope',revision.scope,'city',revision.city,
+                    'preferred_area_text',revision.preferred_area_text,
+                    'revision',revision.revision)
+                FROM research_scope_revisions revision
+                WHERE revision.research_run_id=grp.research_run_id
+                ORDER BY revision.revision DESC LIMIT 1) AS scope_policy,
+               COALESCE(search_profile.categories,'[]'::jsonb)
+                   AS search_profile_categories,
+               COALESCE(search_profile.intent_count,0)::int
+                   AS search_profile_intent_count,
+               COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                   'source',q.provider,'status',cp.status,
+                   'batch',cp.current_batch_no+1,
+                   'error',cp.last_error_code,'reason',cp.stop_reason,
+                   'failure_code',COALESCE(discovery.failure_code,NULLIF(cp.last_error_code,'')),
+                   'discovered_cards',COALESCE(discovery.discovered_cards,0),
+                   'pending_cards',COALESCE(discovery.pending_cards,0),
+                   'extracted_cards',COALESCE(discovery.extracted_cards,0),
+                   'failed_cards',COALESCE(discovery.failed_cards,0),
+                   'contact_attempts',cp.candidate_receipts
+               ) ORDER BY cp.lane_no)
+               FROM research_branch_checkpoints cp
+               JOIN research_queries q ON q.id=cp.query_id
+               LEFT JOIN LATERAL (
+                   WITH latest_cards AS (
+                       SELECT DISTINCT ON(card.external_id)
+                              card.external_id,card.status,card.failure_code,card.updated_at
+                       FROM research_discovery_pages page
+                       JOIN research_discovery_cards card ON card.page_id=page.id
+                       WHERE page.query_id=cp.query_id
+                       ORDER BY card.external_id,card.updated_at DESC,
+                                page.created_at DESC,page.id DESC,card.ordinal DESC
+                   )
+                   SELECT count(*)::int AS discovered_cards,
+                          count(*) FILTER (WHERE status='pending')::int AS pending_cards,
+                          count(*) FILTER (WHERE status='extracted')::int AS extracted_cards,
+                          count(*) FILTER (WHERE status='failed')::int AS failed_cards,
+                          (array_agg(failure_code ORDER BY updated_at DESC)
+                              FILTER (WHERE failure_code IS NOT NULL))[1] AS failure_code
+                   FROM latest_cards
+               ) discovery ON TRUE
+               WHERE cp.group_id=grp.id),'[]'::jsonb) AS sources
+        FROM research_item_groups grp
+        LEFT JOIN LATERAL (
+            SELECT profile.profile->'categories' AS categories,
+                   count(intent.id)::int AS intent_count
+            FROM (
+                SELECT id,profile,profile_version
+                FROM research_search_profiles
+                WHERE research_run_id=grp.research_run_id
+                  AND request_item_id=grp.request_item_id
+                ORDER BY profile_version DESC
+                LIMIT 1
+            ) profile
+            LEFT JOIN research_search_intents intent ON intent.profile_id=profile.id
+            GROUP BY profile.id,profile.profile
+        ) search_profile ON TRUE
+        WHERE grp.research_run_id=(SELECT id FROM research_runs
+            WHERE case_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)
+        ORDER BY grp.created_at,grp.id
+        """,
+        case_id,
+    )
+    return [dict(row) for row in rows]
+
+
+def _public_quote_facts(raw_facts: object) -> dict[str, dict[str, object]]:
+    """Expose fact values and provenance without leaking database identifiers."""
+
+    if isinstance(raw_facts, str):
+        try:
+            raw_facts = json.loads(raw_facts)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw_facts, dict):
+        return {}
+    public: dict[str, dict[str, object]] = {}
+    for name, fact in raw_facts.items():
+        if name not in {
+            "price_amount",
+            "currency",
+            "price_unit",
+            "pack_qty",
+            "moq",
+            "order_multiple",
+            "availability_status",
+            "available_qty",
+            "availability_date",
+        } or not isinstance(fact, dict):
+            continue
+        public[name] = {
+            key: fact[key] for key in ("value", "source_type", "observed_at") if key in fact
+        }
+    return public
+
+
+async def _load_case_offer_rows(connection: asyncpg.Connection, case_id: UUID) -> list[dict]:
+    rows = await connection.fetch(
+        """
+        SELECT o.id,o.request_item_id,o.supplier_id,o.status,
+               o.supplier_product_name,o.model_sku,
+               s.display_name AS supplier_name,sl.city AS supplier_city,
+               sl.source_provider,sl.provider_place_id,
+               location_evidence.source_url AS location_source_url,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN NULLIF(quote.snapshot#>>'{facts,price_amount,value}','')::numeric
+                    ELSE priced.price_amount END AS price_amount,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN quote.snapshot#>>'{facts,currency,value}'
+                    ELSE priced.currency END AS currency,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN quote.snapshot#>>'{facts,price_unit,value}'
+                    ELSE COALESCE(terms.price_unit,priced.price_unit) END AS price_unit,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN NULLIF(quote.snapshot#>>'{facts,pack_qty,value}','')::numeric
+                    ELSE COALESCE(terms.pack_qty,priced.pack_qty) END AS pack_qty,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN NULLIF(quote.snapshot#>>'{facts,moq,value}','')::numeric
+                    ELSE COALESCE(terms.moq,priced.moq) END AS moq,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN NULLIF(quote.snapshot#>>'{facts,order_multiple,value}','')::numeric
+                    ELSE COALESCE(terms.order_multiple,priced.order_multiple) END AS order_multiple,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN NULLIF(quote.snapshot#>>'{facts,available_qty,value}','')::numeric
+                    ELSE stock.available_qty END AS available_qty,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN COALESCE(quote.snapshot#>>'{facts,availability_status,value}','unknown')
+                    ELSE COALESCE(stock.availability_status,'unknown') END AS availability_status,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN COALESCE(quote.snapshot#>>'{facts,availability_status,source_type}',
+                                  quote.snapshot#>>'{facts,available_qty,source_type}')
+                    ELSE stock.source_type END AS stock_source_type,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN COALESCE(
+                        NULLIF(quote.snapshot#>>'{facts,availability_status,observed_at}','')::timestamptz,
+                        NULLIF(quote.snapshot#>>'{facts,available_qty,observed_at}','')::timestamptz)
+                    ELSE stock.observed_at END AS stock_observed_at,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN COALESCE(
+                        NULLIF(quote.snapshot#>>'{facts,price_amount,observed_at}','')::timestamptz,
+                        NULLIF(quote.snapshot#>>'{facts,availability_status,observed_at}','')::timestamptz,
+                        NULLIF(quote.snapshot#>>'{facts,available_qty,observed_at}','')::timestamptz)
+                    ELSE COALESCE(priced.observed_at,latest.observed_at) END AS observed_at,
+               COALESCE(priced.evidence_level,latest.evidence_level) AS evidence_level,
+               COALESCE(priced.document_status,latest.document_status) AS document_status,
+               COALESCE(priced.delivery_status,latest.delivery_status) AS delivery_status,
+               COALESCE(priced.vat_status,latest.vat_status) AS vat_status,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN quote.snapshot#>>'{facts,price_amount,source_type}'
+                    ELSE priced.source_type END AS source_type,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN snapshot_price_evidence.source_url
+                    ELSE COALESCE(priced.source_url,latest.source_url) END AS source_url,
+               CASE WHEN quote.version IS NOT NULL
+                    THEN NULLIF(quote.snapshot#>>'{facts,price_amount,source_evidence_id}','')::uuid
+                    ELSE COALESCE(priced.source_evidence_id,latest.source_evidence_id)
+                    END AS source_evidence_id,
+               quote.version AS quote_snapshot_version,
+               quote.created_at AS quote_snapshot_created_at,
+               quote.snapshot->'facts' AS quote_snapshot_facts_raw
+        FROM offers o
+        JOIN request_items i ON i.id=o.request_item_id
+        JOIN suppliers s ON s.id=o.supplier_id
+        LEFT JOIN supplier_locations sl ON sl.id=o.supplier_location_id
+        LEFT JOIN source_evidence location_evidence
+          ON location_evidence.id=sl.source_evidence_id
+        LEFT JOIN quote_snapshot_current current_quote
+          ON current_quote.offer_id=o.id AND current_quote.request_item_id=o.request_item_id
+        LEFT JOIN quote_snapshot_versions quote
+          ON quote.id=current_quote.snapshot_id AND quote.offer_id=o.id
+         AND quote.request_item_id=o.request_item_id
+        LEFT JOIN source_evidence snapshot_price_evidence
+          ON snapshot_price_evidence.id=
+             NULLIF(quote.snapshot#>>'{facts,price_amount,source_evidence_id}','')::uuid
+        LEFT JOIN LATERAL (
+            SELECT ob.*,se.source_url
+            FROM offer_observations ob
+            JOIN source_evidence se ON se.id=ob.source_evidence_id
+            WHERE ob.offer_id=o.id ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
+        ) latest ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT ob.*,se.source_url
+            FROM offer_observations ob
+            JOIN source_evidence se ON se.id=ob.source_evidence_id
+            WHERE ob.offer_id=o.id AND ob.price_amount IS NOT NULL
+            ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
+        ) priced ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+                (array_agg(ob.price_unit ORDER BY ob.observed_at DESC,
+                    ob.created_at DESC,ob.id DESC)
+                    FILTER (WHERE ob.price_unit IS NOT NULL))[1] AS price_unit,
+                (array_agg(ob.pack_qty ORDER BY ob.observed_at DESC,
+                    ob.created_at DESC,ob.id DESC)
+                    FILTER (WHERE ob.pack_qty IS NOT NULL))[1] AS pack_qty,
+                (array_agg(ob.moq ORDER BY ob.observed_at DESC,
+                    ob.created_at DESC,ob.id DESC)
+                    FILTER (WHERE ob.moq IS NOT NULL))[1] AS moq,
+                (array_agg(ob.order_multiple ORDER BY ob.observed_at DESC,
+                    ob.created_at DESC,ob.id DESC)
+                    FILTER (WHERE ob.order_multiple IS NOT NULL))[1] AS order_multiple
+            FROM offer_observations ob
+            WHERE ob.offer_id=o.id AND ob.observed_at>=priced.observed_at
+              AND ob.source_type IN ('supplier_message','manual')
+        ) terms ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT ob.available_qty,ob.availability_status,ob.source_type,ob.observed_at
+            FROM offer_observations ob
+            WHERE ob.offer_id=o.id AND
+              (ob.availability_status<>'unknown' OR ob.available_qty IS NOT NULL)
+            ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
+        ) stock ON TRUE
+        WHERE i.case_id=$1 ORDER BY i.line_number,o.updated_at DESC LIMIT 1001
+        """,
+        case_id,
+    )
+    result: list[dict] = []
+    for row in rows:
+        offer = dict(row)
+        offer["quote_snapshot_facts"] = _public_quote_facts(
+            offer.pop("quote_snapshot_facts_raw", None)
+        )
+        result.append(offer)
+    return result
+
+
 async def cases(request: web.Request) -> web.Response:
     limit, offset = _page_params(request)
     status = request.query.get("status", "")
@@ -267,16 +522,26 @@ async def cases(request: web.Request) -> web.Response:
             ORDER BY c.updated_at DESC, c.id DESC
             LIMIT $5 OFFSET $6
             """,
-            request["owner_id"], status, city, query, limit, offset,
+            request["owner_id"],
+            status,
+            city,
+            query,
+            limit,
+            offset,
         )
         cities = await connection.fetch(
             "SELECT DISTINCT city FROM procurement_cases "
             "WHERE owner_user_id=$1 AND city<>'' ORDER BY city",
             request["owner_id"],
         )
-    return _json(request, {"rows": [dict(row) for row in rows],
-                           "cities": [row["city"] for row in cities],
-                           "has_more": len(rows) == limit})
+    return _json(
+        request,
+        {
+            "rows": [dict(row) for row in rows],
+            "cities": [row["city"] for row in cities],
+            "has_more": len(rows) == limit,
+        },
+    )
 
 
 async def case_detail(request: web.Request) -> web.Response:
@@ -298,7 +563,8 @@ async def case_detail(request: web.Request) -> web.Response:
             LEFT JOIN customers customer ON customer.id=c.customer_id
             WHERE c.id=$1 AND c.owner_user_id=$2
             """,
-            case_id, request["owner_id"],
+            case_id,
+            request["owner_id"],
         )
         if case is None:
             raise web.HTTPNotFound
@@ -394,84 +660,8 @@ async def case_detail(request: web.Request) -> web.Response:
             """,
             case_id,
         )
-        offers = await connection.fetch(
-            """
-            SELECT o.id,o.request_item_id,o.supplier_id,o.status,
-                   o.supplier_product_name,o.model_sku,
-                   s.display_name AS supplier_name,sl.city AS supplier_city,
-                   sl.source_provider,sl.provider_place_id,
-                   location_evidence.source_url AS location_source_url,
-                   priced.price_amount,priced.currency,
-                   COALESCE(terms.price_unit,priced.price_unit) AS price_unit,
-                   COALESCE(terms.pack_qty,priced.pack_qty) AS pack_qty,
-                   COALESCE(terms.moq,priced.moq) AS moq,
-                   COALESCE(terms.order_multiple,priced.order_multiple) AS order_multiple,
-                   stock.available_qty,
-                   COALESCE(stock.availability_status,'unknown') AS availability_status,
-                   stock.source_type AS stock_source_type,
-                   stock.observed_at AS stock_observed_at,
-                   COALESCE(priced.observed_at,latest.observed_at) AS observed_at,
-                   COALESCE(priced.evidence_level,latest.evidence_level) AS evidence_level,
-                   COALESCE(priced.document_status,latest.document_status) AS document_status,
-                   COALESCE(priced.delivery_status,latest.delivery_status) AS delivery_status,
-                   COALESCE(priced.vat_status,latest.vat_status) AS vat_status,
-                   priced.source_type,
-                   COALESCE(priced.source_url,latest.source_url) AS source_url,
-                   COALESCE(priced.source_evidence_id,latest.source_evidence_id)
-                     AS source_evidence_id
-            FROM offers o
-            JOIN request_items i ON i.id=o.request_item_id
-            JOIN suppliers s ON s.id=o.supplier_id
-            LEFT JOIN supplier_locations sl ON sl.id=o.supplier_location_id
-            LEFT JOIN source_evidence location_evidence
-              ON location_evidence.id=sl.source_evidence_id
-            LEFT JOIN LATERAL (
-                SELECT ob.*,se.source_url
-                FROM offer_observations ob
-                JOIN source_evidence se ON se.id=ob.source_evidence_id
-                WHERE ob.offer_id=o.id ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
-            ) latest ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT ob.*,se.source_url
-                FROM offer_observations ob
-                JOIN source_evidence se ON se.id=ob.source_evidence_id
-                WHERE ob.offer_id=o.id AND ob.price_amount IS NOT NULL
-                ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
-            ) priced ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT
-                    (array_agg(ob.price_unit ORDER BY ob.observed_at DESC,
-                        ob.created_at DESC,ob.id DESC)
-                        FILTER (WHERE ob.price_unit IS NOT NULL))[1] AS price_unit,
-                    (array_agg(ob.pack_qty ORDER BY ob.observed_at DESC,
-                        ob.created_at DESC,ob.id DESC)
-                        FILTER (WHERE ob.pack_qty IS NOT NULL))[1] AS pack_qty,
-                    (array_agg(ob.moq ORDER BY ob.observed_at DESC,
-                        ob.created_at DESC,ob.id DESC)
-                        FILTER (WHERE ob.moq IS NOT NULL))[1] AS moq,
-                    (array_agg(ob.order_multiple ORDER BY ob.observed_at DESC,
-                        ob.created_at DESC,ob.id DESC)
-                        FILTER (WHERE ob.order_multiple IS NOT NULL))[1] AS order_multiple
-                FROM offer_observations ob
-                WHERE ob.offer_id=o.id AND ob.observed_at>=priced.observed_at
-                  AND ob.source_type IN ('supplier_message','manual')
-            ) terms ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT ob.available_qty,ob.availability_status,ob.source_type,
-                       ob.observed_at
-                FROM offer_observations ob
-                WHERE ob.offer_id=o.id AND
-                  (ob.availability_status<>'unknown' OR ob.available_qty IS NOT NULL)
-                ORDER BY ob.observed_at DESC,ob.id DESC LIMIT 1
-            ) stock ON TRUE
-            WHERE i.case_id=$1 ORDER BY i.line_number,o.updated_at DESC
-            LIMIT 1001
-            """,
-            case_id,
-        )
-        requirements, technical_reviews = await load_case_technical_reviews(
-            connection, case_id
-        )
+        offers = await _load_case_offer_rows(connection, case_id)
+        requirements, technical_reviews = await load_case_technical_reviews(connection, case_id)
         technical_by_offer = technical_states(offers, requirements, technical_reviews)
         items_by_id = {row["id"]: row for row in items}
         comparison_rows = [
@@ -488,10 +678,12 @@ async def case_detail(request: web.Request) -> web.Response:
             for offer in offers
         ]
         comparisons = {
-            entry.offer_id: entry.as_dict()
-            for entry in rank_goods_offers(comparison_rows)
+            entry.offer_id: entry.as_dict() for entry in rank_goods_offers(comparison_rows)
         }
         outreach_drafts = await load_initial_outreach_drafts(connection, case_id)
+        research_progress = []
+        if getattr(request.app["settings"], "parallel_research_enabled", False):
+            research_progress = await _load_research_progress(connection, case_id)
         expense_rows = await connection.fetch(
             """
             SELECT a.request_item_id,a.allocated_amount,e.category,e.cost_kind,
@@ -575,52 +767,130 @@ async def case_detail(request: web.Request) -> web.Response:
             request["owner_id"],
         )
         readiness = await load_case_closure_readiness(
-            connection, case_id=case_id, owner_user_id=request["owner_id"],
+            connection,
+            case_id=case_id,
+            owner_user_id=request["owner_id"],
         )
         financial = await load_financial_snapshot(
-            connection, case_id=case_id, owner_user_id=request["owner_id"],
+            connection,
+            case_id=case_id,
+            owner_user_id=request["owner_id"],
         )
         last_closure = await connection.fetchrow(
             "SELECT event_kind,reason,created_at FROM case_closure_events "
-            "WHERE case_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1", case_id,
+            "WHERE case_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1",
+            case_id,
         )
-    return _json(request, {"case": dict(case), "items": [dict(row) for row in items],
-                           "offers": [
-                               {**dict(row),
-                                "technical_state": technical_by_offer[str(row["id"])],
-                                "comparison": comparisons[str(row["id"])]}
-                               for row in offers[:1000]
-                           ],
-                           "requirements": [dict(row) for row in requirements],
-                           "technical_reviews": [dict(row) for row in technical_reviews],
-                           "outreach_drafts": outreach_drafts,
-                           "outreach_enabled": request.app["settings"].waha_enabled,
-                           "offers_truncated": len(offers) > 1000,
-                           "expenses": [dict(row) for row in expense_rows],
-                           "deliveries": [dict(row) for row in deliveries],
-                           "delivery_payments": [dict(row) for row in delivery_payments],
-                           "delivery_items": [dict(row) for row in delivery_items],
-                           "purchase_lines": [dict(row) for row in purchase_lines],
-                           "artifacts": [dict(row) for row in artifacts],
-                           "closure": {"ready": readiness.ready,
-                                       "issues": [vars_issue(issue) for issue in readiness.issues],
-                                       "item_count": readiness.item_count,
-                                       "last_event": dict(last_closure) if last_closure else None},
-                           "financial": {
-                               "currency": financial.currency,
-                               "tender_revenue_private": financial.tender_revenue_private,
-                               "product_cost_known": financial.product_cost_known,
-                               "delivery_cost_known": financial.delivery_cost_known,
-                               "additional_cost_known": financial.additional_cost_known,
-                               "unknown_purchase_lines": financial.unknown_purchase_lines,
-                               "unknown_delivery_runs": financial.unknown_delivery_runs,
-                               "provisional_margin": financial.provisional_margin,
-                           }})
+    return _json(
+        request,
+        {
+            "case": dict(case),
+            "items": [dict(row) for row in items],
+            "offers": [
+                {
+                    **dict(row),
+                    "technical_state": technical_by_offer[str(row["id"])],
+                    "comparison": comparisons[str(row["id"])],
+                }
+                for row in offers[:1000]
+            ],
+            "requirements": [dict(row) for row in requirements],
+            "technical_reviews": [dict(row) for row in technical_reviews],
+            "outreach_drafts": outreach_drafts,
+            "research_progress": research_progress,
+            "outreach_enabled": request.app["settings"].waha_enabled,
+            "offers_truncated": len(offers) > 1000,
+            "expenses": [dict(row) for row in expense_rows],
+            "deliveries": [dict(row) for row in deliveries],
+            "delivery_payments": [dict(row) for row in delivery_payments],
+            "delivery_items": [dict(row) for row in delivery_items],
+            "purchase_lines": [dict(row) for row in purchase_lines],
+            "artifacts": [dict(row) for row in artifacts],
+            "closure": {
+                "ready": readiness.ready,
+                "issues": [vars_issue(issue) for issue in readiness.issues],
+                "item_count": readiness.item_count,
+                "last_event": dict(last_closure) if last_closure else None,
+            },
+            "financial": {
+                "currency": financial.currency,
+                "tender_revenue_private": financial.tender_revenue_private,
+                "product_cost_known": financial.product_cost_known,
+                "delivery_cost_known": financial.delivery_cost_known,
+                "additional_cost_known": financial.additional_cost_known,
+                "unknown_purchase_lines": financial.unknown_purchase_lines,
+                "unknown_delivery_runs": financial.unknown_delivery_runs,
+                "provisional_margin": financial.provisional_margin,
+            },
+        },
+    )
 
 
 def vars_issue(issue) -> dict[str, object]:
-    return {"code": issue.code, "message": issue.message,
-            "request_item_id": issue.request_item_id}
+    return {"code": issue.code, "message": issue.message, "request_item_id": issue.request_item_id}
+
+
+async def control_research(request: web.Request) -> web.Response:
+    """Control checkpoints within an already authorized research run."""
+    if not getattr(request.app["settings"], "parallel_research_enabled", False):
+        raise web.HTTPNotFound
+    from procurement_bot.parallel_research import ParallelResearchRunExecutor
+    from procurement_bot.research_execution import ResearchExecutionRejected
+
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        body = await _body(request)
+        action = body.get("action")
+        if action not in {"pause", "resume", "retry_failed"}:
+            raise ValueError("Выберите приостановку, продолжение или повтор технических ошибок")
+        pool = request.app["pool"]
+        run_id = await pool.fetchval(
+            """SELECT run.id FROM research_runs run
+               JOIN procurement_cases c ON c.id=run.case_id
+               WHERE c.id=$1 AND c.owner_user_id=$2 AND run.status='running'
+                 AND c.status NOT IN ('closed','cancelled')
+               ORDER BY run.created_at DESC,run.id DESC LIMIT 1""",
+            case_id,
+            request["owner_id"],
+        )
+        if run_id is None:
+            return _json(request, {"error": "Нет активного поиска для этой заявки"}, status=409)
+        settings = request.app["settings"]
+        async with pool.acquire() as connection, connection.transaction():
+            executor = ParallelResearchRunExecutor(
+                connection,
+                None,
+                max_active_groups=getattr(settings, "research_active_groups", 3),
+                target_suppliers=getattr(settings, "research_target_suppliers", 20),
+                max_batches=getattr(settings, "research_max_batches", 20),
+            )
+            retried: list[UUID] = []
+            if action == "pause":
+                await executor.pause_run(run_id)
+            elif action == "resume":
+                await executor.resume_run(run_id)
+            else:
+                retried = await executor.retry_failed(run_id)
+            await connection.execute(
+                """INSERT INTO audit_log(
+                       actor_user_id,actor_kind,action,entity_type,entity_id,metadata)
+                   VALUES ($1,'user',$2,'research_run',$3,$4::jsonb)""",
+                request["owner_id"],
+                "research_" + action,
+                str(run_id),
+                {"case_id": str(case_id), "task_ids": [str(task_id) for task_id in retried]},
+            )
+        return _json(
+            request, {"action": action, "research_run_id": run_id, "retried_count": len(retried)}
+        )
+    except ValueError as exc:
+        return _json(request, {"error": str(exc)}, status=400)
+    except ResearchExecutionRejected:
+        return _json(
+            request,
+            {"error": "Поиск приостановлен или завершён. Сначала продолжите его."},
+            status=409,
+        )
 
 
 async def add_offer_technical_review(request: web.Request) -> web.Response:
@@ -633,19 +903,20 @@ async def add_offer_technical_review(request: web.Request) -> web.Response:
         note = body.get("note")
         if not isinstance(verdict, str) or not isinstance(note, str):
             raise ValueError("Укажите итог проверки и основание")
-        requirement_id = (
-            _uuid(body["requirement_id"]) if body.get("requirement_id") else None
-        )
-        evidence_id = (
-            _uuid(body["source_evidence_id"]) if body.get("source_evidence_id") else None
-        )
+        requirement_id = _uuid(body["requirement_id"]) if body.get("requirement_id") else None
+        evidence_id = _uuid(body["source_evidence_id"]) if body.get("source_evidence_id") else None
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection, connection.transaction():
             review_id = await record_technical_review(
                 connection,
-                case_id=case_id, offer_id=offer_id, requirement_id=requirement_id,
-                owner_user_id=request["owner_id"], verdict=verdict, note=note,
-                source_evidence_id=evidence_id, idempotency_key=key,
+                case_id=case_id,
+                offer_id=offer_id,
+                requirement_id=requirement_id,
+                owner_user_id=request["owner_id"],
+                verdict=verdict,
+                note=note,
+                source_evidence_id=evidence_id,
+                idempotency_key=key,
             )
             await enqueue_job(
                 connection,
@@ -713,7 +984,13 @@ def parse_item_requirement(body: dict[str, object]) -> dict[str, object]:
     if not isinstance(source_pointer, str) or not 1 <= len(source_pointer.strip()) <= 500:
         raise ValueError("Укажите источник в техспеке (страницу, пункт или цитату)")
     if not isinstance(operator, str) or operator not in {
-        "equals", "contains", "minimum", "maximum", "range", "one_of", "present"
+        "equals",
+        "contains",
+        "minimum",
+        "maximum",
+        "range",
+        "one_of",
+        "present",
     }:
         raise ValueError("Недопустимый оператор требования")
     if not isinstance(is_hard, bool):
@@ -744,7 +1021,9 @@ async def add_item_requirement(request: web.Request) -> web.Response:
                    WHERE i.id=$1 AND c.id=$2 AND c.owner_user_id=$3
                      AND c.status NOT IN ('closed','cancelled')
                      FOR UPDATE OF i,c""",
-                item_id, case_id, request["owner_id"],
+                item_id,
+                case_id,
+                request["owner_id"],
             )
             if item is None:
                 raise ValueError("Позиция не найдена или заявка закрыта")
@@ -772,21 +1051,28 @@ async def add_item_requirement(request: web.Request) -> web.Response:
                    ) VALUES ($1,$2,$3,$4::jsonb,$5,$6)
                    ON CONFLICT (request_item_id,requirement_key,source_pointer)
                    DO NOTHING RETURNING id""",
-                item_id, requirement["requirement_key"], requirement["operator"],
-                requirement["expected_value"], requirement["is_hard"],
+                item_id,
+                requirement["requirement_key"],
+                requirement["operator"],
+                requirement["expected_value"],
+                requirement["is_hard"],
                 requirement["source_pointer"],
             )
             if requirement_id is None:
                 existing = await connection.fetchrow(
                     """SELECT id,operator,expected_value,is_hard FROM item_requirements
                        WHERE request_item_id=$1 AND requirement_key=$2 AND source_pointer=$3""",
-                    item_id, requirement["requirement_key"], requirement["source_pointer"],
+                    item_id,
+                    requirement["requirement_key"],
+                    requirement["source_pointer"],
                 )
-                if existing is None or any((
-                    existing["operator"] != requirement["operator"],
-                    existing["expected_value"] != requirement["expected_value"],
-                    existing["is_hard"] != requirement["is_hard"],
-                )):
+                if existing is None or any(
+                    (
+                        existing["operator"] != requirement["operator"],
+                        existing["expected_value"] != requirement["expected_value"],
+                        existing["is_hard"] != requirement["is_hard"],
+                    )
+                ):
                     raise ValueError(
                         "Требование с таким источником уже существует с другими данными"
                     )
@@ -798,7 +1084,11 @@ async def add_item_requirement(request: web.Request) -> web.Response:
                      case_id,request_item_id,event_type,actor_type,actor_id,
                      idempotency_key,data
                    ) VALUES ($1,$2,'item_requirement_added','user',$3,$4,$5)""",
-                case_id, item_id, str(request["owner_id"]), event_key, facts,
+                case_id,
+                item_id,
+                str(request["owner_id"]),
+                event_key,
+                facts,
             )
             await enqueue_job(
                 connection,
@@ -829,7 +1119,9 @@ async def set_item_tender_price(request: web.Request) -> web.Response:
                      JOIN procurement_cases c ON c.id=i.case_id
                      WHERE i.id=$1 AND c.id=$2 AND c.owner_user_id=$3
                        AND c.status NOT IN ('closed','cancelled'))""",
-                item_id, case_id, request["owner_id"],
+                item_id,
+                case_id,
+                request["owner_id"],
             )
             if not owned:
                 raise ValueError("Позиция не найдена или заявка закрыта")
@@ -852,25 +1144,27 @@ async def set_item_tender_price(request: web.Request) -> web.Response:
                        ON CONFLICT (request_item_id) DO UPDATE SET
                            tender_unit_price_private=EXCLUDED.tender_unit_price_private,
                            currency='KZT',source_system='manual',updated_at=now()""",
-                    item_id, price,
+                    item_id,
+                    price,
                 )
                 await connection.execute(
                     """INSERT INTO workflow_events(
                            case_id,request_item_id,event_type,actor_type,actor_id,
                            idempotency_key,data)
                        VALUES ($1,$2,'tender_unit_price_set','user',$3,$4,$5::jsonb)""",
-                    case_id, item_id, str(request["owner_id"]), event_key,
-                    {"request_item_id": str(item_id),
-                     "tender_unit_price_private": str(price)},
+                    case_id,
+                    item_id,
+                    str(request["owner_id"]),
+                    event_key,
+                    {"request_item_id": str(item_id), "tender_unit_price_private": str(price)},
                 )
                 await enqueue_job(
-                    connection, kind="refresh_report",
-                    payload={"case_id": str(case_id),
-                             "trigger_id": f"tender-price:{key}"},
+                    connection,
+                    kind="refresh_report",
+                    payload={"case_id": str(case_id), "trigger_id": f"tender-price:{key}"},
                     idempotency_key=stable_key("refresh-report-tender-price", key),
                 )
-        return _json(request, {"request_item_id": item_id,
-                               "tender_unit_price_private": price})
+        return _json(request, {"request_item_id": item_id, "tender_unit_price_private": price})
     except (ValueError, InvalidOperation) as exc:
         return _json(request, {"error": str(exc)}, status=400)
 
@@ -890,7 +1184,9 @@ async def approve_outreach_drafts(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection:
             approved = await approve_initial_outreach_batch(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
                 approval_ids=approval_ids,
             )
         return _json(request, {"approved": approved})
@@ -911,7 +1207,9 @@ async def refresh_outreach_drafts(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection:
             refreshed = await refresh_initial_outreach_drafts(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
                 approval_ids=approval_ids,
             )
         return _json(request, {"drafts": [asdict(draft) for draft in refreshed]})
@@ -962,14 +1260,18 @@ async def add_item_event(request: web.Request) -> web.Response:
         reason = body.get("reason", "")
         if not isinstance(reason, str) or len(reason) > 1000:
             raise ValueError("Причина слишком длинная")
-        artifact_id = (None if body.get("source_artifact_id") is None
-                       else _uuid(body["source_artifact_id"]))
-        delivery_id = (None if body.get("delivery_run_id") is None
-                       else _uuid(body["delivery_run_id"]))
+        artifact_id = (
+            None if body.get("source_artifact_id") is None else _uuid(body["source_artifact_id"])
+        )
+        delivery_id = (
+            None if body.get("delivery_run_id") is None else _uuid(body["delivery_run_id"])
+        )
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection, connection.transaction():
             await ensure_case_editable(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
             )
             if kind in {"customer_accepted", "customer_revoked"}:
                 if quantity <= 0:
@@ -980,26 +1282,39 @@ async def add_item_event(request: web.Request) -> web.Response:
                 existing_customer = await connection.fetchval(
                     "SELECT customer.display_name FROM procurement_cases c "
                     "JOIN customers customer ON customer.id=c.customer_id "
-                    "WHERE c.id=$1 AND c.owner_user_id=$2", case_id, request["owner_id"],
+                    "WHERE c.id=$1 AND c.owner_user_id=$2",
+                    case_id,
+                    request["owner_id"],
                 )
                 customer_name = customer_name.strip() or existing_customer
                 if not customer_name:
                     raise AccountingConflict("У заявки не указан заказчик")
                 result = await record_customer_acceptance(
-                    connection, case_id=case_id, request_item_id=item_id,
-                    owner_user_id=request["owner_id"], customer_name=customer_name,
+                    connection,
+                    case_id=case_id,
+                    request_item_id=item_id,
+                    owner_user_id=request["owner_id"],
+                    customer_name=customer_name,
                     accepted_quantity=quantity,
                     event_type="accepted" if kind == "customer_accepted" else "revoked",
-                    idempotency_key=key, source_artifact_id=artifact_id,
-                    delivery_run_id=delivery_id, reason=reason,
+                    idempotency_key=key,
+                    source_artifact_id=artifact_id,
+                    delivery_run_id=delivery_id,
+                    reason=reason,
                 )
                 event_id = result.event_id
             else:
                 event_id = await record_item_execution_event(
-                    connection, case_id=case_id, request_item_id=item_id,
-                    owner_user_id=request["owner_id"], event_kind=kind,
-                    quantity_delta=quantity, idempotency_key=key, reason=reason,
-                    source_artifact_id=artifact_id, delivery_run_id=delivery_id,
+                    connection,
+                    case_id=case_id,
+                    request_item_id=item_id,
+                    owner_user_id=request["owner_id"],
+                    event_kind=kind,
+                    quantity_delta=quantity,
+                    idempotency_key=key,
+                    reason=reason,
+                    source_artifact_id=artifact_id,
+                    delivery_run_id=delivery_id,
                 )
         return _json(request, {"id": event_id}, status=201)
     except (ValueError, ItemExecutionConflict, AccountingConflict, CaseClosureConflict) as exc:
@@ -1018,34 +1333,45 @@ async def add_purchase(request: web.Request) -> web.Response:
         for value in values:
             if not isinstance(value, dict):
                 raise ValueError("Неверная строка закупки")
-            lines.append(PurchaseLine(
-                request_item_id=_uuid(value.get("request_item_id")),
-                purchased_quantity=_decimal(value.get("purchased_quantity")),
-                unit_cost=_decimal(value.get("unit_cost")),
-                offer_id=(None if value.get("offer_id") is None
-                          else _uuid(value["offer_id"])),
-            ))
+            lines.append(
+                PurchaseLine(
+                    request_item_id=_uuid(value.get("request_item_id")),
+                    purchased_quantity=_decimal(value.get("purchased_quantity")),
+                    unit_cost=_decimal(value.get("unit_cost")),
+                    offer_id=(None if value.get("offer_id") is None else _uuid(value["offer_id"])),
+                )
+            )
         kind = body.get("document_kind", "other")
         seller = body.get("seller_name", "")
         number = body.get("document_number", "")
         note = body.get("note", "")
         if not all(isinstance(value, str) for value in (kind, seller, number, note)):
             raise ValueError("Неверные сведения о закупке")
-        artifact_id = (None if body.get("source_artifact_id") is None
-                       else _uuid(body["source_artifact_id"]))
+        artifact_id = (
+            None if body.get("source_artifact_id") is None else _uuid(body["source_artifact_id"])
+        )
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection, connection.transaction():
             await ensure_case_editable(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
             )
             result = await record_purchase(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
-                source_artifact_id=artifact_id, document_kind=kind,
-                lines=tuple(lines), idempotency_key=key,
-                document_number=number, seller_name=seller, note=note,
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
+                source_artifact_id=artifact_id,
+                document_kind=kind,
+                lines=tuple(lines),
+                idempotency_key=key,
+                document_number=number,
+                seller_name=seller,
+                note=note,
             )
-        return _json(request, {"id": result.document_id,
-                               "recorded_lines": result.recorded_lines}, status=201)
+        return _json(
+            request, {"id": result.document_id, "recorded_lines": result.recorded_lines}, status=201
+        )
     except (ValueError, AccountingConflict, CaseClosureConflict) as exc:
         return _json(request, {"error": str(exc)}, status=400)
 
@@ -1062,8 +1388,12 @@ async def change_case_status(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection:
             event_id = await change_case_closure(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
-                action=action, idempotency_key=key, reason=reason,
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
+                action=action,
+                idempotency_key=key,
+                reason=reason,
             )
         return _json(request, {"id": event_id}, status=201)
     except (ValueError, CaseClosureConflict) as exc:
@@ -1080,7 +1410,9 @@ async def start_item_research(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection:
             run_id = await start_imported_item_research(
-                connection, case_id=case_id, item_id=item_id,
+                connection,
+                case_id=case_id,
+                item_id=item_id,
                 owner_user_id=request["owner_id"],
             )
         return _json(request, {"research_run_id": run_id, "status": "running"}, status=202)
@@ -1097,9 +1429,13 @@ async def add_case_expense(request: web.Request) -> web.Response:
         cost_kind = body.get("cost_kind")
         method = body.get("allocation_method")
         item_values = body.get("request_item_ids")
-        if not isinstance(category, str) or not isinstance(cost_kind, str) \
-                or not isinstance(method, str) or not isinstance(item_values, list) \
-                or len(item_values) > 200:
+        if (
+            not isinstance(category, str)
+            or not isinstance(cost_kind, str)
+            or not isinstance(method, str)
+            or not isinstance(item_values, list)
+            or len(item_values) > 200
+        ):
             raise ValueError("Проверьте категорию, тип и позиции расхода")
         item_ids = [_uuid(value) for value in item_values]
         manual_values = body.get("manual_amounts")
@@ -1111,22 +1447,32 @@ async def add_case_expense(request: web.Request) -> web.Response:
         note = body.get("note", "")
         if not isinstance(note, str) or len(note) > 1000:
             raise ValueError("Примечание слишком длинное")
-        delivery_run_id = (None if body.get("delivery_run_id") is None
-                           else _uuid(body["delivery_run_id"]))
-        source_artifact_id = (None if body.get("source_artifact_id") is None
-                              else _uuid(body["source_artifact_id"]))
+        delivery_run_id = (
+            None if body.get("delivery_run_id") is None else _uuid(body["delivery_run_id"])
+        )
+        source_artifact_id = (
+            None if body.get("source_artifact_id") is None else _uuid(body["source_artifact_id"])
+        )
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection, connection.transaction():
             await ensure_case_editable(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
             )
             expense_id = await record_case_expense(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
-                category=category, cost_kind=cost_kind,
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
+                category=category,
+                cost_kind=cost_kind,
                 total_cost=_decimal(body.get("total_cost")),
-                request_item_ids=item_ids, allocation_method=method,
-                idempotency_key=key, delivery_run_id=delivery_run_id,
-                manual_amounts=manual, note=note,
+                request_item_ids=item_ids,
+                allocation_method=method,
+                idempotency_key=key,
+                delivery_run_id=delivery_run_id,
+                manual_amounts=manual,
+                note=note,
                 source_artifact_id=source_artifact_id,
             )
         return _json(request, {"id": expense_id}, status=201)
@@ -1146,12 +1492,17 @@ async def add_delivery(request: web.Request) -> web.Response:
         for value in values:
             if not isinstance(value, dict):
                 raise ValueError("Неверная строка груза")
-            lines.append(DeliveryLine(
-                request_item_id=_uuid(value.get("request_item_id")),
-                quantity=_decimal(value.get("quantity")),
-                purchase_item_id=(None if value.get("purchase_item_id") is None
-                                  else _uuid(value["purchase_item_id"])),
-            ))
+            lines.append(
+                DeliveryLine(
+                    request_item_id=_uuid(value.get("request_item_id")),
+                    quantity=_decimal(value.get("quantity")),
+                    purchase_item_id=(
+                        None
+                        if value.get("purchase_item_id") is None
+                        else _uuid(value["purchase_item_id"])
+                    ),
+                )
+            )
         fields = {}
         for name in ("carrier_name", "carrier_phone", "tracking_ref", "note"):
             value = body.get(name, "")
@@ -1166,11 +1517,17 @@ async def add_delivery(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection, connection.transaction():
             await ensure_case_editable(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
             )
             run_id = await create_delivery_run(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
-                lines=tuple(lines), idempotency_key=key, expected_at=expected_at,
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
+                lines=tuple(lines),
+                idempotency_key=key,
+                expected_at=expected_at,
                 **fields,
             )
             if "loading_mode" in body:
@@ -1179,16 +1536,18 @@ async def add_delivery(request: web.Request) -> web.Response:
                     raise ValueError("Неверные условия погрузки")
                 included = body.get("included_loading_value")
                 await record_delivery_terms(
-                    connection, case_id=case_id, delivery_run_id=run_id,
-                    owner_user_id=request["owner_id"], loading_mode=loading_mode,
-                    included_loading_value=(None if included in (None, "")
-                                            else _decimal(included)),
-                    note="", source_artifact_id=None,
+                    connection,
+                    case_id=case_id,
+                    delivery_run_id=run_id,
+                    owner_user_id=request["owner_id"],
+                    loading_mode=loading_mode,
+                    included_loading_value=(None if included in (None, "") else _decimal(included)),
+                    note="",
+                    source_artifact_id=None,
                     idempotency_key=f"{key}:loading",
                 )
         return _json(request, {"id": run_id}, status=201)
-    except (ValueError, DeliveryConflict, DeliverySettlementConflict,
-            CaseClosureConflict) as exc:
+    except (ValueError, DeliveryConflict, DeliverySettlementConflict, CaseClosureConflict) as exc:
         return _json(request, {"error": str(exc)}, status=400)
 
 
@@ -1207,12 +1566,14 @@ async def add_delivery_terms(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection:
             event_id = await record_delivery_terms(
-                connection, case_id=case_id, delivery_run_id=delivery_id,
-                owner_user_id=request["owner_id"], loading_mode=mode,
-                included_loading_value=(None if included in (None, "")
-                                        else _decimal(included)),
-                note=note, source_artifact_id=(None if artifact is None
-                                               else _uuid(artifact)),
+                connection,
+                case_id=case_id,
+                delivery_run_id=delivery_id,
+                owner_user_id=request["owner_id"],
+                loading_mode=mode,
+                included_loading_value=(None if included in (None, "") else _decimal(included)),
+                note=note,
+                source_artifact_id=(None if artifact is None else _uuid(artifact)),
                 idempotency_key=key,
             )
         return _json(request, {"id": event_id}, status=201)
@@ -1230,18 +1591,26 @@ async def add_delivery_payment(request: web.Request) -> web.Response:
         payee = body.get("payee", "")
         note = body.get("note", "")
         kind = body.get("kind")
-        if not isinstance(paid_at, str) or not isinstance(payee, str) \
-                or not isinstance(note, str) or not isinstance(kind, str):
+        if (
+            not isinstance(paid_at, str)
+            or not isinstance(payee, str)
+            or not isinstance(note, str)
+            or not isinstance(kind, str)
+        ):
             raise ValueError("Неверные данные оплаты")
         artifact = body.get("source_artifact_id")
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection:
             payment_id = await record_delivery_payment(
-                connection, case_id=case_id, delivery_run_id=delivery_id,
-                owner_user_id=request["owner_id"], kind=kind,
+                connection,
+                case_id=case_id,
+                delivery_run_id=delivery_id,
+                owner_user_id=request["owner_id"],
+                kind=kind,
                 amount=_decimal(body.get("amount")),
                 paid_at=datetime.fromisoformat(paid_at.replace("Z", "+00:00")),
-                payee=payee, note=note,
+                payee=payee,
+                note=note,
                 source_artifact_id=(None if artifact is None else _uuid(artifact)),
                 idempotency_key=key,
             )
@@ -1263,12 +1632,18 @@ async def change_delivery_status(request: web.Request) -> web.Response:
         pool: asyncpg.Pool = request.app["pool"]
         async with pool.acquire() as connection, connection.transaction():
             await ensure_case_editable(
-                connection, case_id=case_id, owner_user_id=request["owner_id"],
+                connection,
+                case_id=case_id,
+                owner_user_id=request["owner_id"],
             )
             event_id = await transition_delivery_run(
-                connection, case_id=case_id, delivery_run_id=delivery_id,
-                owner_user_id=request["owner_id"], to_status=status,
-                idempotency_key=key, reason=reason,
+                connection,
+                case_id=case_id,
+                delivery_run_id=delivery_id,
+                owner_user_id=request["owner_id"],
+                to_status=status,
+                idempotency_key=key,
+                reason=reason,
             )
         return _json(request, {"id": event_id}, status=201)
     except (ValueError, DeliveryConflict, CaseClosureConflict) as exc:
@@ -1294,10 +1669,12 @@ async def suppliers(request: web.Request) -> web.Response:
             GROUP BY s.id ORDER BY max(o.updated_at) DESC,s.id DESC
             LIMIT $3 OFFSET $4
             """,
-            request["owner_id"], query, limit, offset,
+            request["owner_id"],
+            query,
+            limit,
+            offset,
         )
-    return _json(request, {"rows": [dict(row) for row in rows],
-                           "has_more": len(rows) == limit})
+    return _json(request, {"rows": [dict(row) for row in rows], "has_more": len(rows) == limit})
 
 
 async def supplier_detail(request: web.Request) -> web.Response:
@@ -1316,7 +1693,8 @@ async def supplier_detail(request: web.Request) -> web.Response:
                    JOIN procurement_cases c ON c.id=i.case_id
                    WHERE o.supplier_id=s.id AND c.owner_user_id=$2
                )""",
-            supplier_id, request["owner_id"],
+            supplier_id,
+            request["owner_id"],
         )
         if supplier is None:
             raise web.HTTPNotFound
@@ -1329,11 +1707,13 @@ async def supplier_detail(request: web.Request) -> web.Response:
                WHERE sc.supplier_id=$1 AND sc.active
                  AND __CONTACT_SCOPE__
                ORDER BY sc.is_whatsapp_confirmed DESC,sc.last_seen_at DESC,sc.id""".replace(
-                "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
-                     contact_alias="sc", evidence_alias="se", scope="owner"
-                 ),
+                "__CONTACT_SCOPE__",
+                case_owned_supplier_contact_evidence(
+                    contact_alias="sc", evidence_alias="se", scope="owner"
+                ),
             ),
-            supplier_id, request["owner_id"],
+            supplier_id,
+            request["owner_id"],
         )
         locations = await connection.fetch(
             """SELECT l.city,l.address_text,l.district,l.market_name,l.pavilion,
@@ -1355,12 +1735,16 @@ async def supplier_detail(request: web.Request) -> web.Response:
                    )
                  )
                ORDER BY l.last_seen_at DESC,l.id LIMIT 30""".replace(
-                "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
-                       contact_alias="l", evidence_alias="se", scope="owner",
-                       include_enrichment=False,
-                 ),
+                "__CONTACT_SCOPE__",
+                case_owned_supplier_contact_evidence(
+                    contact_alias="l",
+                    evidence_alias="se",
+                    scope="owner",
+                    include_enrichment=False,
+                ),
             ),
-            supplier_id, request["owner_id"],
+            supplier_id,
+            request["owner_id"],
         )
         offers = await connection.fetch(
             """SELECT o.id,o.status,o.supplier_product_name,
@@ -1370,7 +1754,8 @@ async def supplier_detail(request: web.Request) -> web.Response:
                JOIN procurement_cases c ON c.id=i.case_id
                WHERE o.supplier_id=$1 AND c.owner_user_id=$2
                ORDER BY o.updated_at DESC,o.id LIMIT 100""",
-            supplier_id, request["owner_id"],
+            supplier_id,
+            request["owner_id"],
         )
         conversations = await connection.fetch(
             """SELECT sc.id,sc.case_id,sc.state,sc.inbound_count,sc.outbound_count,
@@ -1380,6 +1765,10 @@ async def supplier_detail(request: web.Request) -> web.Response:
                       approval.status AS approval_status,
                       latest.direction AS last_message_direction,
                       latest.text_content AS last_message_text,
+                      latest.media_kind,latest.media_state,latest.media_text,
+                      latest.media_language,latest.media_needs_clarification,
+                      latest.media_error,
+                      latest.id AS last_message_id,
                       latest.received_at AS last_message_at
                FROM supplier_conversations sc
                JOIN procurement_cases c ON c.id=sc.case_id
@@ -1402,13 +1791,34 @@ async def supplier_detail(request: web.Request) -> web.Response:
                    ORDER BY a.requested_at DESC,a.id DESC LIMIT 1
                ) approval ON TRUE
                LEFT JOIN LATERAL (
-                   SELECT m.direction,m.text_content,m.received_at
+                   SELECT m.id,m.direction,m.text_content,m.received_at,
+                          media.kind AS media_kind,media.state AS media_state,
+                          media.extracted_text AS media_text,media.language AS media_language,
+                          media.needs_clarification AS media_needs_clarification,
+                          media.last_error_code AS media_error
                    FROM supplier_conversation_messages m
+                   LEFT JOIN supplier_message_media media ON media.message_id=m.id
                    WHERE m.conversation_id=sc.id
                    ORDER BY m.received_at DESC,m.id DESC LIMIT 1
                ) latest ON TRUE
                WHERE sc.supplier_id=$1 AND c.owner_user_id=$2
                ORDER BY sc.updated_at DESC,sc.id LIMIT 100""",
+            supplier_id,
+            request["owner_id"],
+        )
+        media_messages = await connection.fetch(
+            """SELECT m.id AS last_message_id,m.conversation_id,m.received_at,
+                      m.text_content AS original_caption,
+                      media.kind AS media_kind,media.state AS media_state,
+                      media.extracted_text AS media_text,media.language AS media_language,
+                      media.needs_clarification AS media_needs_clarification,
+                      media.last_error_code AS media_error
+               FROM supplier_message_media media
+               JOIN supplier_conversation_messages m ON m.id=media.message_id
+               JOIN supplier_conversations sc ON sc.id=m.conversation_id
+               JOIN procurement_cases c ON c.id=sc.case_id
+               WHERE sc.supplier_id=$1 AND c.owner_user_id=$2
+               ORDER BY m.received_at DESC,m.id DESC LIMIT 100""",
             supplier_id, request["owner_id"],
         )
         referrals = await connection.fetch(
@@ -1418,7 +1828,8 @@ async def supplier_detail(request: web.Request) -> web.Response:
                JOIN procurement_cases c ON c.id=sc.case_id
                WHERE sc.supplier_id=$1 AND c.owner_user_id=$2
                ORDER BY r.created_at DESC,r.id LIMIT 100""",
-            supplier_id, request["owner_id"],
+            supplier_id,
+            request["owner_id"],
         )
         enrichment = await connection.fetch(
             """SELECT e.created_at,e.data->>'outcome' AS outcome,
@@ -1434,20 +1845,60 @@ async def supplier_detail(request: web.Request) -> web.Response:
                      'supplier_contact_enrichment_result','supplier_contact_enriched'
                  )
                ORDER BY e.created_at DESC,e.id DESC LIMIT 10""",
-            str(supplier_id), request["owner_id"],
+            str(supplier_id),
+            request["owner_id"],
         )
-    return _json(request, {
-        "supplier": dict(supplier), "contacts": [dict(row) for row in contacts],
-        "locations": [dict(row) for row in locations],
-        "offers": [dict(row) for row in offers],
-        "conversations": [dict(row) for row in conversations],
-        "referrals": [dict(row) for row in referrals],
-        "contact_enrichment": [dict(row) for row in enrichment],
-    })
+    return _json(
+        request,
+        {
+            "supplier": dict(supplier),
+            "contacts": [dict(row) for row in contacts],
+            "locations": [dict(row) for row in locations],
+            "offers": [dict(row) for row in offers],
+            "conversations": [dict(row) for row in conversations],
+            "media_messages": [dict(row) for row in media_messages],
+            "referrals": [dict(row) for row in referrals],
+            "contact_enrichment": [dict(row) for row in enrichment],
+        },
+    )
 
 
 async def css(_request: web.Request) -> web.FileResponse:
     return web.FileResponse(STATIC / "app.css")
+
+
+async def supplier_message_media(request: web.Request) -> web.Response:
+    try:
+        message_id = UUID(request.match_info["message_id"])
+    except ValueError:
+        raise web.HTTPNotFound() from None
+    async with request.app["pool"].acquire() as connection:
+        row = await connection.fetchrow(
+            """SELECT media.object_key,media.kind,media.mime_type
+               FROM supplier_message_media media
+               JOIN supplier_conversation_messages m ON m.id=media.message_id
+               JOIN supplier_conversations c ON c.id=m.conversation_id
+               JOIN procurement_cases p ON p.id=c.case_id
+               WHERE m.id=$1 AND p.owner_user_id=$2 AND media.object_key IS NOT NULL""",
+            message_id, request["owner_id"],
+        )
+    if row is None:
+        raise web.HTTPNotFound()
+    try:
+        path = media_storage_path(request.app["settings"].media_root, row["object_key"])
+    except ValueError:
+        raise web.HTTPNotFound() from None
+    if not path.is_file():
+        raise web.HTTPNotFound()
+    content_type = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(
+        path.suffix, "application/octet-stream",
+    )
+    if row["kind"] == "audio" and row["mime_type"] in {
+        "audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav", "audio/flac",
+    }:
+        content_type = row["mime_type"]
+    return web.FileResponse(path, headers={"Content-Type": content_type,
+                                         "Cache-Control": "no-store"})
 
 
 async def javascript(_request: web.Request) -> web.FileResponse:
@@ -1455,8 +1906,7 @@ async def javascript(_request: web.Request) -> web.FileResponse:
 
 
 def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
-    app = web.Application(middlewares=[security_headers, authenticate],
-                          client_max_size=16 * 1024)
+    app = web.Application(middlewares=[security_headers, authenticate], client_max_size=16 * 1024)
     app["pool"] = pool
     app["settings"] = settings
     app.router.add_get("/", index)
@@ -1498,18 +1948,18 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_post("/api/cases/{case_id}/purchases", add_purchase)
     app.router.add_post("/api/cases/{case_id}/closure", change_case_status)
     app.router.add_post("/api/cases/{case_id}/items/{item_id}/research", start_item_research)
+    app.router.add_post("/api/cases/{case_id}/research-control", control_research)
     app.router.add_post("/api/cases/{case_id}/items/{item_id}/events", add_item_event)
     app.router.add_post("/api/cases/{case_id}/expenses", add_case_expense)
     app.router.add_post("/api/cases/{case_id}/deliveries", add_delivery)
     app.router.add_post(
         "/api/cases/{case_id}/deliveries/{delivery_id}/status", change_delivery_status
     )
-    app.router.add_post(
-        "/api/cases/{case_id}/deliveries/{delivery_id}/terms", add_delivery_terms
-    )
+    app.router.add_post("/api/cases/{case_id}/deliveries/{delivery_id}/terms", add_delivery_terms)
     app.router.add_post(
         "/api/cases/{case_id}/deliveries/{delivery_id}/payments", add_delivery_payment
     )
     app.router.add_get("/api/suppliers", suppliers)
     app.router.add_get("/api/suppliers/{supplier_id}", supplier_detail)
+    app.router.add_get("/api/supplier-messages/{message_id}/media", supplier_message_media)
     return app

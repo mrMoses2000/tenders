@@ -16,6 +16,7 @@ import asyncpg
 from aiogram import Bot
 
 from procurement_bot.approvals import request_approval
+from procurement_bot.auto_send_policy import authorize_and_enqueue_auto_whatsapp
 from procurement_bot.case_queries import answer_case_query, parse_case_query
 from procurement_bot.cases import (
     StaleIntakeContext,
@@ -64,6 +65,7 @@ from procurement_bot.queue import (
     ClaimedJob,
     claim_job,
     complete_job,
+    defer_job,
     enqueue_job,
     enqueue_outbox,
     fail_job,
@@ -72,13 +74,35 @@ from procurement_bot.queue import (
 )
 from procurement_bot.report_pipeline import build_case_report
 from procurement_bot.research import LocalityResolution, build_research_plan
+from procurement_bot.research_execution import ResearchExecutionRejected
 from procurement_bot.research_repository import persist_research_plan
 from procurement_bot.research_workflow import start_approved_research
+from procurement_bot.semantic_supplier_reply import (
+    SemanticReplyValidationError,
+    load_semantic_reply_snapshot,
+    propose_semantic_reply,
+)
 from procurement_bot.storage import LocalContentAddressedStorage
 from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
-from procurement_bot.supplier_dialogue import SupplierDialogueState, WhatsAppSendCommand
-from procurement_bot.supplier_outreach import prepare_supplier_outreach
-from procurement_bot.supplier_reply_processing import ReplyClassification, process_supplier_reply
+from procurement_bot.supplier_dialogue import (
+    SupplierDialogueState,
+    WhatsAppSendCommand,
+    WhatsAppSendDeferred,
+)
+from procurement_bot.supplier_media import SupplierMediaDeferred
+from procurement_bot.supplier_media_processing import process_supplier_media_payload
+from procurement_bot.supplier_outreach import (
+    prepare_supplier_outreach,
+    request_next_supplier_turn_approval,
+)
+from procurement_bot.supplier_reply_processing import (
+    ReplyClassification,
+    SupplierReplyOrderPending,
+    classify_supplier_reply,
+    enqueue_favorable_quote_notification,
+    persist_supplier_followup_turn,
+    process_supplier_reply,
+)
 from procurement_bot.transcription import Transcriber, transcript_review_reason
 from procurement_bot.whatsapp_approval_workflow import start_approved_whatsapp_send
 
@@ -108,9 +132,15 @@ class JobWorker:
         locality_browser: BrowserResearchPort | None = None,
         results_root: Path = Path("./var/results"),
         whatsapp_enabled: bool = False,
+        research_auto_prepare_outreach: bool = True,
         transcription_min_language_confidence: float = 0.55,
         waha_session: str = "default",
         waha_client: WahaClient | None = None,
+        excluded_job_kinds: tuple[str, ...] = (),
+        semantic_supplier_reply_enabled: bool = False,
+        supplier_image_reader=None,
+        supplier_kazakh_transcriber=None,
+        supplier_media_max_bytes: int = 20 * 1024 * 1024,
     ) -> None:
         self.pool = pool
         self.bot = bot
@@ -125,46 +155,102 @@ class JobWorker:
         self.locality_browser = locality_browser
         self.results_root = results_root.expanduser().resolve()
         self.whatsapp_enabled = whatsapp_enabled
+        self.research_auto_prepare_outreach = research_auto_prepare_outreach
         self.transcription_min_language_confidence = transcription_min_language_confidence
         self.waha_session = waha_session
         self.waha_client = waha_client
+        self.excluded_job_kinds = excluded_job_kinds
+        self.semantic_supplier_reply_enabled = semantic_supplier_reply_enabled
+        self.supplier_image_reader = supplier_image_reader
+        self.supplier_kazakh_transcriber = supplier_kazakh_transcriber
+        self.supplier_media_max_bytes = supplier_media_max_bytes
 
     async def run_forever(self, *, idle_seconds: float = 0.5) -> None:
+        executor = getattr(self, "research_executor", None)
+        reconcile = getattr(executor, "reconcile", None)
+        loop = asyncio.get_running_loop()
+        reconcile_interval = max(1.0, min(30.0, self.lease_seconds / 3))
+        if reconcile is not None:
+            await reconcile()
+            next_reconcile = loop.time() + reconcile_interval
+        else:
+            next_reconcile = float("inf")
         while True:
+            if reconcile is not None and loop.time() >= next_reconcile:
+                await reconcile()
+                next_reconcile = loop.time() + reconcile_interval
             worked = await self.run_once()
             if not worked:
                 await asyncio.sleep(idle_seconds)
 
     async def run_once(self) -> bool:
-        job = await claim_job(
-            self.pool,
-            worker_id=self.worker_id,
-            lease_seconds=self.lease_seconds,
-        )
+        claim_options: dict[str, Any] = {
+            "worker_id": self.worker_id,
+            "lease_seconds": self.lease_seconds,
+        }
+        if getattr(self, "excluded_job_kinds", ()):
+            claim_options["excluded_kinds"] = self.excluded_job_kinds
+        job = await claim_job(self.pool, **claim_options)
         if job is None:
             return False
         heartbeat = asyncio.create_task(self._heartbeat(job))
+        dispatch = asyncio.create_task(self._dispatch(job))
         try:
-            await self._dispatch(job)
+            done, _pending = await asyncio.wait(
+                {heartbeat, dispatch},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat in done and not dispatch.done():
+                # _heartbeat only completes by raising after ownership is lost.
+                await heartbeat
+            await dispatch
             if not await complete_job(self.pool, job.id, self.worker_id):
                 raise StaleIntakeContext("job lease expired before completion")
         except asyncio.CancelledError:
+            await self._cancel_dispatch(dispatch, job)
             raise
+        except (WhatsAppSendDeferred, SupplierMediaDeferred) as exc:
+            await defer_job(self.pool, job, available_at=exc.available_at, reason=exc.reason)
+        except SupplierReplyOrderPending:
+            await defer_job(
+                self.pool,
+                job,
+                available_at=datetime.now(UTC) + timedelta(seconds=20),
+                reason="earlier_supplier_reply_pending",
+            )
         except Exception as exc:  # the durable boundary must classify every failure
+            if not dispatch.done():
+                await self._cancel_dispatch(dispatch, job)
             retryable = self._is_retryable(exc)
             LOGGER.exception(
                 "job failed",
                 extra={"job_id": job.id, "error": type(exc).__name__},
             )
             try:
-                terminal = await fail_job(
-                    self.pool,
-                    job,
-                    type(exc).__name__,
-                    retryable=retryable,
-                )
-                if terminal:
-                    await self._record_terminal_failure(job, type(exc).__name__)
+                if job.kind == "process_supplier_media":
+                    # Keep the queue's terminal transition and media projection in
+                    # one transaction. If projection/enqueue fails, the job remains
+                    # running until its lease expires and can be reclaimed.
+                    async with self.pool.acquire() as connection, connection.transaction():
+                        terminal = await fail_job(
+                            connection,
+                            job,
+                            type(exc).__name__,
+                            retryable=retryable,
+                        )
+                        if terminal:
+                            await self._record_supplier_media_terminal_failure(
+                                connection, job, type(exc).__name__
+                            )
+                else:
+                    terminal = await fail_job(
+                        self.pool,
+                        job,
+                        type(exc).__name__,
+                        retryable=retryable,
+                    )
+                    if terminal:
+                        await self._record_terminal_failure(job, type(exc).__name__)
             except Exception:
                 LOGGER.exception(
                     "could not persist job failure",
@@ -172,12 +258,32 @@ class JobWorker:
                 )
         finally:
             heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
+            with suppress(asyncio.CancelledError, Exception):
                 await heartbeat
+            if dispatch.done():
+                _consume_task_result(dispatch)
         return True
 
+    async def _cancel_dispatch(self, dispatch: asyncio.Task[None], job: ClaimedJob) -> None:
+        if dispatch.done():
+            return
+        dispatch.cancel()
+        timeout = min(10.0, max(1.0, self.lease_seconds / 3))
+        done, _pending = await asyncio.wait({dispatch}, timeout=timeout)
+        if not done:
+            # Provider subprocess adapters own process-group termination. The
+            # generation fence still prevents a late coroutine from committing.
+            dispatch.add_done_callback(_consume_task_result)
+            LOGGER.error(
+                "dispatch did not drain after cancellation",
+                extra={"job_id": job.id, "drain_timeout_seconds": timeout},
+            )
+            return
+        with suppress(asyncio.CancelledError):
+            await dispatch
+
     async def _heartbeat(self, job: ClaimedJob) -> None:
-        interval = max(5, self.lease_seconds // 3)
+        interval = max(1, min(5, self.lease_seconds // 3))
         while True:
             await asyncio.sleep(interval)
             renewed = await renew_job_lease(
@@ -188,7 +294,38 @@ class JobWorker:
             )
             if not renewed:
                 LOGGER.error("job lease could not be renewed", extra={"job_id": job.id})
-                return
+                raise RetryableProviderError("job lease ownership was lost")
+            if job.kind == "parallel_research_task":
+                task_id = UUID(str(job.payload["task_id"]))
+                executor = getattr(self, "research_executor", None)
+                renew_task_lease = getattr(executor, "renew_task_lease", None)
+                if renew_task_lease is not None:
+                    still_owned = await renew_task_lease(task_id, job.id, self.worker_id)
+                else:
+                    still_owned = await self.pool.fetchval(
+                        """SELECT EXISTS(
+                           SELECT 1 FROM research_branch_checkpoints cp
+                           JOIN research_runs run ON run.id=cp.research_run_id
+                           JOIN research_item_groups grp ON grp.id=cp.group_id
+                           JOIN procurement_cases AS procurement_case
+                             ON procurement_case.id=run.case_id
+                           WHERE cp.id=$1 AND cp.current_job_id=$2
+                             AND (cp.status IN ('succeeded','failed','blocked','skipped')
+                                  OR (cp.status IN ('queued','researching')
+                                      AND run.status='running' AND grp.status='researching'
+                                      AND procurement_case.status IN ('researching','contacting')
+                                      AND (cp.status<>'researching' OR cp.owner_worker=$3)))
+                        )""",
+                        task_id,
+                        job.id,
+                        self.worker_id,
+                    )
+                if not still_owned:
+                    LOGGER.info(
+                        "parallel research ownership was fenced",
+                        extra={"job_id": job.id},
+                    )
+                    raise RetryableProviderError("parallel research ownership was lost")
 
     async def _dispatch(self, job: ClaimedJob) -> None:
         if job.kind == "download_attachment":
@@ -205,6 +342,49 @@ class JobWorker:
             await self._start_research(job.payload)
         elif job.kind == "execute_research":
             await self._execute_research(job.payload)
+        elif job.kind == "parallel_research_task":
+            executor = self.research_executor
+            if executor is None or not hasattr(executor, "execute_task"):
+                raise PermanentProviderError("parallel research executor is not configured")
+            try:
+                result = await executor.execute_task(
+                    job.payload,
+                    job_id=job.id,
+                    worker_id=self.worker_id,
+                )
+            except ResearchExecutionRejected:
+                abandoned = await self.pool.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM research_branch_checkpoints
+                       WHERE id=$1 AND (status='paused'
+                           OR current_job_id IS DISTINCT FROM $2))""",
+                    UUID(str(job.payload["task_id"])),
+                    job.id,
+                )
+                if abandoned:
+                    # An operator pause/new generation intentionally fenced this result.
+                    return
+                raise
+            if getattr(self, "whatsapp_enabled", False) and getattr(
+                self, "research_auto_prepare_outreach", True
+            ):
+                case_id = await self.pool.fetchval(
+                    "SELECT case_id FROM research_runs WHERE id=$1",
+                    UUID(str(job.payload["research_run_id"])),
+                )
+                if case_id is not None:
+                    async with self.pool.acquire() as connection, connection.transaction():
+                        await enqueue_job(
+                            connection,
+                            kind="prepare_supplier_outreach",
+                            payload={"case_id": str(case_id)},
+                            idempotency_key=stable_key("parallel-outreach", job.id),
+                            max_attempts=20,
+                        )
+            if result is not None:
+                await self._finish_research_result(
+                    result,
+                    UUID(str(job.payload["research_run_id"])),
+                )
         elif job.kind == "enrich_2gis_contact":
             await self._enrich_2gis_contact(job.payload)
         elif job.kind == "build_report":
@@ -215,6 +395,20 @@ class JobWorker:
             await self._prepare_supplier_outreach(job.payload)
         elif job.kind == "process_supplier_reply":
             await self._process_supplier_reply(job.payload)
+        elif job.kind == "process_supplier_media":
+            await process_supplier_media_payload(
+                job.payload,
+                pool=self.pool,
+                storage=self.storage,
+                waha=self.waha_client,
+                transcriber=self.transcriber,
+                image_reader=self.supplier_image_reader,
+                audio_probe=_probe_audio,
+                max_bytes=self.supplier_media_max_bytes,
+                max_duration=self.max_audio_duration_seconds,
+                minimum_language_confidence=self.transcription_min_language_confidence,
+                kazakh_transcriber=self.supplier_kazakh_transcriber,
+            )
         elif job.kind == "enqueue_whatsapp_send":
             await self._enqueue_whatsapp_send(job.payload)
         elif job.kind == "resolve_locality":
@@ -315,8 +509,7 @@ class JobWorker:
                     payload={
                         "chat_id": int(purchase_request["telegram_id"]),
                         "text": (
-                            "Чек сохранил. Теперь напишите количество и итоговую "
-                            "сумму покупки."
+                            "Чек сохранил. Теперь напишите количество и итоговую сумму покупки."
                         ),
                     },
                     idempotency_key=stable_key(
@@ -763,9 +956,7 @@ class JobWorker:
                 plan=plan,
                 requested_by=row["owner_user_id"],
             )
-            blocked = sum(
-                branch.blocked_reason is not None for branch in plan.source_plans
-            )
+            blocked = sum(branch.blocked_reason is not None for branch in plan.source_plans)
             approval_id: UUID | None = None
             if row["status"] == "needs_clarification" and not blocked:
                 raise PermanentProviderError("case is no longer ready for research")
@@ -780,9 +971,7 @@ class JobWorker:
                         case_id,
                     )
                     if updated != "UPDATE 1":
-                        raise PermanentProviderError(
-                            "case changed before locality clarification"
-                        )
+                        raise PermanentProviderError("case changed before locality clarification")
                 phrase = plan.locality_task.phrase if plan.locality_task else "указанную зону"
                 if getattr(self, "locality_browser", None) is not None:
                     await enqueue_job(
@@ -927,6 +1116,31 @@ class JobWorker:
         # projection needed to schedule reporting.
         if result is None:
             return
+        await self._finish_research_result(result, run_id)
+
+    async def _finish_research_result(self, result: Any, run_id: UUID) -> None:
+        """Idempotent terminal hooks shared by legacy runs and child batches."""
+        if result.status == "failed":
+            async with self.pool.acquire() as connection, connection.transaction():
+                chat_id = await connection.fetchval(
+                    """SELECT u.telegram_id FROM procurement_cases c
+                       JOIN users u ON u.id=c.owner_user_id WHERE c.id=$1 AND u.active""",
+                    result.case_id,
+                )
+                if chat_id is not None:
+                    await enqueue_outbox(
+                        connection,
+                        event_type="telegram.send_message",
+                        payload={
+                            "chat_id": int(chat_id),
+                            "text": "Поиск не завершился из-за технических ошибок источников. "
+                            "Сохранённые карточки доступны в заявке; причины по каждой "
+                            "позиции показаны в приложении. Отсутствие результата пока "
+                            "не означает, что товара нет.",
+                        },
+                        idempotency_key=stable_key("research-failed", result.case_id, run_id),
+                    )
+            return
         if result.status in {"succeeded", "partial"}:
             async with self.pool.acquire() as connection, connection.transaction():
                 if getattr(self, "locality_browser", None) is not None:
@@ -940,7 +1154,9 @@ class JobWorker:
                     },
                     idempotency_key=stable_key("build-report", result.case_id, run_id),
                 )
-                if getattr(self, "whatsapp_enabled", False):
+                if getattr(self, "whatsapp_enabled", False) and getattr(
+                    self, "research_auto_prepare_outreach", True
+                ):
                     source_kind = await connection.fetchval(
                         "SELECT source_kind FROM procurement_cases WHERE id=$1",
                         result.case_id,
@@ -951,7 +1167,9 @@ class JobWorker:
                             kind="prepare_supplier_outreach",
                             payload={"case_id": str(result.case_id)},
                             idempotency_key=stable_key(
-                                "prepare-supplier-outreach", result.case_id, run_id,
+                                "prepare-supplier-outreach",
+                                result.case_id,
+                                run_id,
                             ),
                             max_attempts=20,
                         )
@@ -969,16 +1187,26 @@ class JobWorker:
         if str(case_id) != payload["case_id"] or str(supplier_id) != payload["supplier_id"]:
             raise PermanentProviderError("enrich_2gis_contact ids are not canonical")
         found = await enrich_2gis_contact(
-            self.pool, self.locality_browser, case_id=case_id, supplier_id=supplier_id,
+            self.pool,
+            self.locality_browser,
+            case_id=case_id,
+            supplier_id=supplier_id,
         )
         async with self.pool.acquire() as connection, connection.transaction():
             await schedule_case_2gis_enrichment(
-                connection, case_id, finishing_supplier_id=supplier_id,
+                connection,
+                case_id,
+                finishing_supplier_id=supplier_id,
             )
-        if found and self.whatsapp_enabled:
+        if (
+            found
+            and self.whatsapp_enabled
+            and getattr(self, "research_auto_prepare_outreach", True)
+        ):
             async with self.pool.acquire() as connection, connection.transaction():
                 source_kind = await connection.fetchval(
-                    "SELECT source_kind FROM procurement_cases WHERE id=$1", case_id,
+                    "SELECT source_kind FROM procurement_cases WHERE id=$1",
+                    case_id,
                 )
                 if source_kind == "notion_import":
                     return
@@ -987,7 +1215,9 @@ class JobWorker:
                     kind="prepare_supplier_outreach",
                     payload={"case_id": str(case_id)},
                     idempotency_key=stable_key(
-                        "outreach-after-contact-enrichment", case_id, supplier_id,
+                        "outreach-after-contact-enrichment",
+                        case_id,
+                        supplier_id,
                     ),
                     max_attempts=20,
                 )
@@ -1006,11 +1236,15 @@ class JobWorker:
             raise PermanentProviderError("outreach case id is not canonical")
         if self.waha_client is not None:
             checked, confirmed = await verify_case_whatsapp_numbers(
-                self.pool, self.waha_client, case_id=case_id,
+                self.pool,
+                self.waha_client,
+                case_id=case_id,
             )
             LOGGER.info(
                 "outreach contact verification case=%s checked=%s confirmed=%s",
-                case_id, checked, confirmed,
+                case_id,
+                checked,
+                confirmed,
             )
         async with self.pool.acquire() as connection:
             await prepare_supplier_outreach(
@@ -1069,10 +1303,7 @@ class JobWorker:
             research_run_id = UUID(str(payload["research_run_id"]))
         except (TypeError, ValueError) as exc:
             raise PermanentProviderError("build_report identifiers are invalid") from exc
-        if (
-            str(case_id) != payload["case_id"]
-            or str(research_run_id) != payload["research_run_id"]
-        ):
+        if str(case_id) != payload["case_id"] or str(research_run_id) != payload["research_run_id"]:
             raise PermanentProviderError("build_report identifiers are not canonical")
         async with self.pool.acquire() as connection:
             await build_case_report(
@@ -1090,18 +1321,30 @@ class JobWorker:
         except (TypeError, ValueError) as exc:
             raise PermanentProviderError("refresh_report case id is invalid") from exc
         trigger_id = payload["trigger_id"]
-        if (str(case_id) != payload["case_id"] or not isinstance(trigger_id, str)
-                or not 1 <= len(trigger_id) <= 200):
+        if (
+            str(case_id) != payload["case_id"]
+            or not isinstance(trigger_id, str)
+            or not 1 <= len(trigger_id) <= 200
+        ):
             raise PermanentProviderError("refresh_report identifiers are invalid")
         async with self.pool.acquire() as connection:
             status = await connection.fetchval(
                 "SELECT status FROM procurement_cases WHERE id=$1", case_id
             )
-            if status not in {"evaluating", "contacting", "report_ready", "selected"}:
+            if status not in {
+                "researching",
+                "evaluating",
+                "contacting",
+                "report_ready",
+                "selected",
+            }:
                 return
             await build_case_report(
-                connection, results_root=self.results_root, case_id=case_id,
+                connection,
+                results_root=self.results_root,
+                case_id=case_id,
                 refresh_key=trigger_id,
+                partial_research_snapshot=status == "researching",
             )
 
     async def _enqueue_whatsapp_send(self, payload: dict[str, Any]) -> None:
@@ -1117,7 +1360,7 @@ class JobWorker:
         await start_approved_whatsapp_send(self.pool, approval_id)
 
     async def _process_supplier_reply(self, payload: dict[str, Any]) -> None:
-        """Project explicit supplier facts and notify the owner; never auto-send."""
+        """Project supplier facts and continue an explicitly authorized dialogue."""
 
         if set(payload) != {"conversation_id", "message_id"}:
             raise PermanentProviderError("process_supplier_reply payload is invalid")
@@ -1130,14 +1373,50 @@ class JobWorker:
             raise PermanentProviderError("supplier reply identifiers are invalid") from exc
         if str(conversation_id) != conversation_text or str(message_id) != message_text:
             raise PermanentProviderError("supplier reply identifiers are not canonical")
+        semantic_snapshot = None
+        semantic_proposal = None
+        semantic_proposal_error = None
+        if getattr(self, "semantic_supplier_reply_enabled", False):
+            async with self.pool.acquire() as snapshot_connection:
+                semantic_snapshot = await load_semantic_reply_snapshot(
+                    snapshot_connection,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                )
+            if (
+                classify_supplier_reply(semantic_snapshot.message_text).classification
+                == ReplyClassification.OPT_OUT
+            ):
+                semantic_snapshot = None
+            else:
+                try:
+                    if semantic_snapshot.media_needs_clarification:
+                        semantic_proposal_error = "supplier media requires text confirmation"
+                    else:
+                        semantic_proposal = await propose_semantic_reply(
+                            self.intake.extractor,
+                            semantic_snapshot,
+                        )
+                except SemanticReplyValidationError:
+                    # A malformed, stale, or unsupported model result is ambiguity,
+                    # never permission to fall through to a guessed item/price.
+                    semantic_proposal_error = (
+                        "structured supplier reply could not be validated; "
+                        "operator clarification is required"
+                    )
         async with self.pool.acquire() as connection, connection.transaction():
             result = await process_supplier_reply(
                 connection,
                 conversation_id=conversation_id,
                 message_id=message_id,
+                semantic_snapshot=semantic_snapshot,
+                semantic_proposal=semantic_proposal,
+                semantic_proposal_error=semantic_proposal_error,
             )
             if not result.newly_processed:
                 return
+            if result.offer_id is not None:
+                await enqueue_favorable_quote_notification(connection, offer_id=result.offer_id)
             owner = await connection.fetchrow(
                 """
                 SELECT owner.id AS owner_user_id,owner.telegram_id,
@@ -1153,20 +1432,24 @@ class JobWorker:
             reply_markup: dict[str, Any] | None = None
             if result.needs_human:
                 text = {
-                    ReplyClassification.NEEDS_TIME:
+                    ReplyClassification.NEEDS_TIME: (
                         "Поставщик попросил время на уточнение. Ответ сохранён; "
-                        "согласуйте срок следующего контакта.",
-                    ReplyClassification.REFERRAL:
-                        "Поставщик дал другой контакт. Номер сохранён отдельно и ждёт проверки.",
-                    ReplyClassification.SPEC_MISMATCH:
-                        "Поставщик сообщил о несоответствии характеристик. "
-                        "Проверьте возможный аналог.",
+                        "связь с позицией сохранена, поздний ответ будет обработан."
+                    ),
+                    ReplyClassification.REFERRAL: (
+                        "Поставщик дал другой контакт. Номер сохранён отдельно и ждёт проверки."
+                    ),
+                    ReplyClassification.SPEC_MISMATCH: (
+                        "Поставщик сообщил о несоответствии характеристикам. "
+                        "Проверьте возможный аналог."
+                    ),
                 }.get(
                     result.classification,
                     "Ответ поставщика требует проверки. "
                     "Посмотрите переписку и уточните следующий шаг.",
                 )
             elif result.draft_outbound_text:
+                followup_approval_id: UUID | None = None
                 if getattr(self, "whatsapp_enabled", False):
                     recipient = await connection.fetchval(
                         """
@@ -1182,8 +1465,10 @@ class JobWorker:
                           AND contact.contact_type=ANY($3::text[])
                           AND __CONTACT_SCOPE__
                         """.replace(
-                            "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
-                                contact_alias="contact", evidence_alias="contact_evidence",
+                            "__CONTACT_SCOPE__",
+                            case_owned_supplier_contact_evidence(
+                                contact_alias="contact",
+                                evidence_alias="contact_evidence",
                                 case_param="$2",
                             ),
                         ),
@@ -1210,6 +1495,14 @@ class JobWorker:
                         requested_by=owner["owner_user_id"],
                         expires_at=datetime.now(UTC) + timedelta(hours=24),
                     )
+                    followup_approval_id = approval_id
+                    auto_job = await authorize_and_enqueue_auto_whatsapp(
+                        connection,
+                        approval_id=approval_id,
+                        case_id=result.case_id,
+                        payload=command.approval_payload(),
+                        requested_by=owner["owner_user_id"],
+                    )
                     text = (
                         "Получен ответ поставщика. Проверьте следующий текст перед "
                         "отправкой в WhatsApp:\n\n"
@@ -1229,14 +1522,46 @@ class JobWorker:
                             ]
                         ]
                     }
+                    if auto_job is not None:
+                        text = (
+                            "Ответ поставщика сохранён. "
+                            "Уточняющий вопрос поставлен в очередь отправки."
+                        )
+                        reply_markup = None
                 else:
                     text = (
                         "Получен ответ поставщика. Следующий черновик не отправлен:\n\n"
                         f"{result.draft_outbound_text}\n\n"
                         "WAHA выключен, поэтому отправка недоступна."
                     )
+                if result.offer_id is not None:
+                    await persist_supplier_followup_turn(
+                        connection,
+                        conversation_id=conversation_id,
+                        offer_id=result.offer_id,
+                        message_id=message_id,
+                        draft_text=result.draft_outbound_text,
+                        approval_id=followup_approval_id,
+                    )
             else:
                 text = "Ответ поставщика получил и учёл при сравнении вариантов."
+            if (
+                getattr(self, "whatsapp_enabled", False)
+                and not result.draft_outbound_text
+                and result.classification
+                in {
+                    ReplyClassification.UNAVAILABLE,
+                    ReplyClassification.AVAILABLE,
+                    ReplyClassification.PRICE_RECEIVED,
+                    ReplyClassification.SPEC_CONFIRMED,
+                    ReplyClassification.SPEC_MISMATCH,
+                }
+            ):
+                await request_next_supplier_turn_approval(
+                    connection,
+                    conversation_id=conversation_id,
+                    requested_by=owner["owner_user_id"],
+                )
             await enqueue_outbox(
                 connection,
                 event_type="telegram.send_message",
@@ -1248,17 +1573,27 @@ class JobWorker:
                 idempotency_key=stable_key("telegram.supplier-reply", message_id),
             )
             if owner["case_status"] in {
-                "evaluating", "contacting", "report_ready", "selected"
+                "researching",
+                "evaluating",
+                "contacting",
+                "report_ready",
+                "selected",
             }:
                 await enqueue_job(
                     connection,
                     kind="refresh_report",
-                    payload={"case_id": str(result.case_id),
-                             "trigger_id": f"supplier-message:{message_id}"},
+                    payload={
+                        "case_id": str(result.case_id),
+                        "trigger_id": f"supplier-message:{message_id}",
+                    },
                     idempotency_key=stable_key("refresh-report-reply", message_id),
                 )
-            if (result.state == SupplierDialogueState.COMPLETE
-                    and owner["case_status"] in {"evaluating", "contacting", "report_ready"}):
+            if result.state == SupplierDialogueState.COMPLETE and owner["case_status"] in {
+                "researching",
+                "evaluating",
+                "contacting",
+                "report_ready",
+            }:
                 await enqueue_job(
                     connection,
                     kind="prepare_supplier_outreach",
@@ -1271,6 +1606,8 @@ class JobWorker:
         attachment_id = job.payload.get("attachment_id")
         message_id = job.payload.get("incoming_message_id") or job.payload.get("message_id")
         async with self.pool.acquire() as connection, connection.transaction():
+            if job.kind == "process_supplier_media" and message_id:
+                await self._record_supplier_media_terminal_failure(connection, job, error_code)
             if job.kind == "assess_offer_technical":
                 proposal_id = job.payload.get("proposal_id")
                 if proposal_id and all(
@@ -1310,13 +1647,46 @@ class JobWorker:
                             "Техническая ошибка при обработке сообщения. Ваш текст сохранён."
                             if job.kind == "process_intake"
                             and job.payload.get("input_kind", "text") == "text"
-                            else
-                            "Не удалось обработать материал автоматически. "
+                            else "Не удалось обработать материал автоматически. "
                             "Попробуйте другой файл или пришлите данные текстом."
                         ),
                     },
                     idempotency_key=stable_key("telegram.job-dead", job.id),
                 )
+        if job.kind == "parallel_research_task":
+            executor = getattr(self, "research_executor", None)
+            reconcile = getattr(executor, "reconcile", None)
+            if reconcile is not None:
+                await reconcile(UUID(str(job.payload["research_run_id"])))
+
+    @staticmethod
+    async def _record_supplier_media_terminal_failure(
+        connection: asyncpg.Connection,
+        job: ClaimedJob,
+        error_code: str,
+    ) -> None:
+        message_id = job.payload.get("incoming_message_id") or job.payload.get("message_id")
+        if not message_id:
+            return
+        try:
+            parsed_message_id = UUID(str(message_id))
+        except (TypeError, ValueError):
+            return
+        await connection.execute(
+            """UPDATE supplier_message_media SET state='failed',
+               needs_clarification=true,clarification_reason='media_provider_failed',
+               last_error_code=$2,updated_at=now() WHERE message_id=$1
+                 AND state NOT IN ('ready','failed')""",
+            parsed_message_id,
+            error_code[:500],
+        )
+        await enqueue_job(
+            connection,
+            kind="process_supplier_reply",
+            payload=job.payload,
+            idempotency_key=stable_key("supplier-media-reply", message_id),
+            max_attempts=20,
+        )
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
@@ -1326,6 +1696,12 @@ class JobWorker:
             exc,
             (RetryableProviderError, StaleIntakeContext, OSError, asyncio.TimeoutError),
         ) or not isinstance(exc, RuntimeError)
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Retrieve an exception from a task that exceeded the bounded drain window."""
+    with suppress(asyncio.CancelledError):
+        task.exception()
 
 
 def _location_text(raw_payload: dict[str, Any]) -> str:

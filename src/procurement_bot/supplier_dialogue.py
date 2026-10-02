@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -81,6 +81,19 @@ class SendPolicy:
 DEFAULT_SEND_POLICY = SendPolicy()
 
 
+class WhatsAppSendDeferred(ValidationBlocked):
+    """An authorized WhatsApp send must wait for a temporary policy window."""
+
+    def __init__(self, *, available_at: datetime, reason: str) -> None:
+        if available_at.tzinfo is None:
+            raise ValueError("available_at must be timezone-aware")
+        if not reason.strip():
+            raise ValueError("reason must be non-empty")
+        self.available_at = available_at.astimezone(UTC)
+        self.reason = reason
+        super().__init__(reason)
+
+
 @dataclass(frozen=True)
 class WhatsAppSendCommand:
     case_id: UUID
@@ -117,6 +130,7 @@ _OPT_OUT_PATTERNS = (
     re.compile(r"\bне\s+(?:пишите|беспокойте|звоните)\b", re.IGNORECASE),
     re.compile(r"\b(?:стоп|отпис(?:ка|аться)|удалите\s+(?:мой\s+)?номер)\b", re.IGNORECASE),
     re.compile(r"\b(?:stop|unsubscribe|do\s+not\s+(?:contact|message))\b", re.IGNORECASE),
+    re.compile(r"\b(?:жазбаңыз|мазаламаңыз|хабарласпаңыз)\b", re.IGNORECASE),
 )
 
 
@@ -345,3 +359,81 @@ async def enqueue_approved_whatsapp_send(
                 raise RuntimeError("approved WhatsApp outbox event was not created")
             return existing_after_conflict
         return event_id
+
+
+def _move_after_quiet_hours(candidate: datetime, policy: SendPolicy) -> datetime:
+    local = candidate.astimezone(ZoneInfo(policy.timezone))
+    local_time = local.timetz().replace(tzinfo=None)
+    if policy.quiet_start <= policy.quiet_end:
+        quiet = policy.quiet_start <= local_time < policy.quiet_end
+    else:
+        quiet = local_time >= policy.quiet_start or local_time < policy.quiet_end
+    if not quiet:
+        return candidate.astimezone(UTC)
+    send_day = local.date()
+    if policy.quiet_start > policy.quiet_end and local_time >= policy.quiet_start:
+        send_day += timedelta(days=1)
+    return datetime.combine(
+        send_day, policy.quiet_end, tzinfo=ZoneInfo(policy.timezone)
+    ).astimezone(UTC)
+
+
+def _deferred_available_at(
+    context: SendContext,
+    *,
+    now: datetime,
+    policy: SendPolicy,
+    reason: str,
+) -> datetime:
+    candidate = now.astimezone(UTC)
+    if context.last_sent_at is not None:
+        candidate = max(
+            candidate,
+            context.last_sent_at.astimezone(UTC) + policy.minimum_interval,
+        )
+    if reason == "daily WhatsApp limit reached":
+        local = now.astimezone(ZoneInfo(policy.timezone))
+        next_day = local.date() + timedelta(days=1)
+        reset = datetime.combine(next_day, time.min, tzinfo=ZoneInfo(policy.timezone)).astimezone(
+            UTC
+        )
+        candidate = max(candidate, reset)
+    return _move_after_quiet_hours(candidate, policy)
+
+
+def assert_send_allowed_or_defer(
+    context: SendContext,
+    *,
+    now: datetime,
+    policy: SendPolicy = DEFAULT_SEND_POLICY,
+    is_followup: bool = False,
+    autonomous_case: bool = False,
+) -> None:
+    """Defer transient limits only for a case with explicit auto-send consent."""
+
+    try:
+        assert_send_allowed(
+            context,
+            now=now,
+            policy=policy,
+            is_followup=is_followup,
+        )
+    except WhatsAppSendDeferred:
+        raise
+    except ValidationBlocked as exc:
+        reason = str(exc)
+        if not autonomous_case or reason not in {
+            "daily WhatsApp limit reached",
+            "supplier quiet hours are active",
+            "minimum WhatsApp interval has not elapsed",
+        }:
+            raise
+        raise WhatsAppSendDeferred(
+            available_at=_deferred_available_at(
+                context,
+                now=now,
+                policy=policy,
+                reason=reason,
+            ),
+            reason=reason,
+        ) from exc

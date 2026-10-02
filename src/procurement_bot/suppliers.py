@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from procurement_bot.phone import normalize_phone
+from procurement_bot.quote_snapshots import refresh_quote_snapshot
 
 STRONG_IDENTITY_TYPES = frozenset(
     {"2gis_firm_id", "domain", "bin_iin", "instagram", "source_record"}
@@ -720,6 +721,15 @@ async def upsert_offer_observation(
         observation.idempotency_key,
     )
     if row is not None:
+        # The nested transaction is a savepoint when the caller already owns
+        # one, preserving legacy installations until migration 031 is applied.
+        try:
+            async with connection.transaction():
+                await refresh_quote_snapshot(
+                    connection, observation.offer_id, row["id"], bind_observation=True
+                )
+        except asyncpg.UndefinedTableError:
+            pass
         return UpsertResult(id=row["id"], created=True)
     existing = await connection.fetchrow(
         "SELECT * FROM offer_observations WHERE idempotency_key=$1",
@@ -751,6 +761,13 @@ async def upsert_offer_observation(
         "raw_payload",
     )
     _verify_immutable(existing, dict(zip(columns, values, strict=True)), "offer observation")
+    try:
+        async with connection.transaction():
+            await refresh_quote_snapshot(
+                connection, observation.offer_id, existing["id"], bind_observation=False
+            )
+    except asyncpg.UndefinedTableError:
+        pass
     return UpsertResult(id=existing["id"], created=False)
 
 

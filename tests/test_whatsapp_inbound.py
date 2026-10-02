@@ -10,6 +10,7 @@ import pytest
 
 import procurement_bot.whatsapp_inbound as inbound_module
 from procurement_bot.conversations import LedgerWriteResult
+from procurement_bot.supplier_media import WhatsAppMediaInput
 from procurement_bot.whatsapp_inbound import (
     AuthenticatedWhatsAppInbound,
     WhatsAppInboundConflict,
@@ -42,6 +43,7 @@ class _Connection:
         self.conversations = conversations if conversations is not None else []
         self.existing_message = existing_message
         self.transaction_count = 0
+        self.conversation_query: tuple[str, tuple[object, ...]] | None = None
 
     def transaction(self) -> _Transaction:
         self.transaction_count += 1
@@ -58,6 +60,7 @@ class _Connection:
         if "FROM supplier_contacts" in sql:
             return self.contacts
         if "FROM supplier_conversations" in sql:
+            self.conversation_query = (sql, _args)
             return self.conversations
         raise AssertionError(sql)
 
@@ -150,7 +153,7 @@ async def test_known_sender_is_recorded_and_only_opaque_ids_are_enqueued(
 
 
 @pytest.mark.asyncio
-async def test_opt_out_is_applied_before_internal_job_is_enqueued(
+async def test_media_message_persists_work_and_enqueues_media_job_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     event_id = uuid4()
@@ -163,6 +166,158 @@ async def test_opt_out_is_applied_before_internal_job_is_enqueued(
                 "id": conversation_id,
                 "external_chat_id": "77001234567@c.us",
                 "state": "waiting_spec",
+                "opted_out": False,
+            }
+        ],
+    )
+    captured: dict[str, Any] = {}
+    _install_webhook_stubs(monkeypatch, event_id=event_id)
+    media = WhatsAppMediaInput(kind="image", url=None, mimetype="image/jpeg")
+    event = AuthenticatedWhatsAppInbound(
+        provider_event_id="image-event",
+        session_name="procurement",
+        sender_phone="+77001234567",
+        provider_message_id="image-message",
+        received_at=datetime(2026, 9, 22, 12, tzinfo=UTC),
+        text="",
+        media=media,
+    )
+
+    async def record(_connection: object, value: object) -> LedgerWriteResult:
+        captured["message"] = value
+        return LedgerWriteResult(id=message_id, created=True)
+
+    async def persist(_connection: object, **kwargs: object) -> bool:
+        captured["media"] = kwargs
+        return True
+
+    async def enqueue(_connection: object, **kwargs: object) -> UUID:
+        captured["job"] = kwargs
+        return uuid4()
+
+    monkeypatch.setattr(inbound_module, "record_inbound_message", record)
+    monkeypatch.setattr(inbound_module, "persist_supplier_message_media", persist)
+    monkeypatch.setattr(inbound_module, "enqueue_job", enqueue)
+
+    result = await accept_whatsapp_inbound(connection, event)  # type: ignore[arg-type]
+
+    assert result.disposition == WhatsAppInboundDisposition.PROCESSED
+    assert captured["message"].message_kind == "image"
+    assert captured["message"].text_content == "[Фотография поставщика]"
+    assert captured["message"].raw_payload["text"] == ""
+    assert captured["message"].raw_payload["media"]["url"] is None
+    assert captured["media"] == {"message_id": message_id, "media": media}
+    assert captured["job"]["kind"] == "process_supplier_media"
+    assert captured["job"]["payload"] == {
+        "conversation_id": str(conversation_id),
+        "message_id": str(message_id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_media_message_does_not_create_a_second_media_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_id = uuid4()
+    conversation_id = uuid4()
+    message_id = uuid4()
+    connection = _Connection(
+        contacts=[{"id": uuid4(), "supplier_id": uuid4()}],
+        conversations=[
+            {
+                "id": conversation_id,
+                "external_chat_id": "77001234567@c.us",
+                "state": "waiting_spec",
+                "opted_out": False,
+            }
+        ],
+    )
+    _install_webhook_stubs(monkeypatch, event_id=event_id)
+    event = AuthenticatedWhatsAppInbound(
+        provider_event_id="image-event-2",
+        session_name="procurement",
+        sender_phone="+77001234567",
+        provider_message_id="image-message-2",
+        received_at=datetime(2026, 9, 22, 12, tzinfo=UTC),
+        text="",
+        media=WhatsAppMediaInput(kind="audio", url=None),
+    )
+
+    async def record(_connection: object, _value: object) -> LedgerWriteResult:
+        return LedgerWriteResult(id=message_id, created=False)
+
+    async def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("duplicate messages must not persist media or enqueue work")
+
+    monkeypatch.setattr(inbound_module, "record_inbound_message", record)
+    monkeypatch.setattr(inbound_module, "persist_supplier_message_media", forbidden)
+    monkeypatch.setattr(inbound_module, "enqueue_job", forbidden)
+
+    result = await accept_whatsapp_inbound(connection, event)  # type: ignore[arg-type]
+
+    assert result.disposition == WhatsAppInboundDisposition.DUPLICATE
+    assert result.message_id == message_id
+    assert result.job_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_state", ["closed_no_reply", "complete"])
+async def test_terminal_target_accepts_late_webhook_for_durable_processing(
+    monkeypatch: pytest.MonkeyPatch,
+    conversation_state: str,
+) -> None:
+    event_id = uuid4()
+    conversation_id = uuid4()
+    message_id = uuid4()
+    connection = _Connection(
+        contacts=[{"id": uuid4(), "supplier_id": uuid4()}],
+        conversations=[
+            {
+                "id": conversation_id,
+                "external_chat_id": "77001234567@c.us",
+                "state": conversation_state,
+                "opted_out": False,
+            }
+        ],
+    )
+    captured = _install_webhook_stubs(monkeypatch, event_id=event_id)
+
+    async def record(_connection: object, value: object) -> LedgerWriteResult:
+        captured["message"] = value
+        return LedgerWriteResult(id=message_id, created=True)
+
+    async def enqueue(_connection: object, **kwargs: object) -> UUID:
+        captured["job"] = kwargs
+        return uuid4()
+
+    monkeypatch.setattr(inbound_module, "record_inbound_message", record)
+    monkeypatch.setattr(inbound_module, "enqueue_job", enqueue)
+
+    result = await accept_whatsapp_inbound(connection, _event())  # type: ignore[arg-type]
+
+    assert result.disposition == WhatsAppInboundDisposition.PROCESSED
+    assert result.conversation_id == conversation_id
+    assert captured["job"]["kind"] == "process_supplier_reply"
+    assert connection.conversation_query is not None
+    query, parameters = connection.conversation_query
+    assert "c.state NOT IN ('complete','closed_no_reply')" in query
+    assert parameters[2] == ["opted_out"]
+
+
+@pytest.mark.asyncio
+async def test_opt_out_is_applied_before_internal_job_is_enqueued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_id = uuid4()
+    conversation_id = uuid4()
+    message_id = uuid4()
+    connection = _Connection(
+        contacts=[{"id": uuid4(), "supplier_id": uuid4()}],
+        conversations=[
+            {
+                "id": conversation_id,
+                "external_chat_id": "77001234567@c.us",
+                "state": "closed_no_reply",
                 "opted_out": False,
             }
         ],
@@ -185,6 +340,8 @@ async def test_opt_out_is_applied_before_internal_job_is_enqueued(
     await accept_whatsapp_inbound(connection, _event("Не пишите мне"))  # type: ignore[arg-type]
 
     assert order == ["opt_out_persisted", "job_enqueued"]
+    assert connection.conversation_query is not None
+    assert connection.conversation_query[1][3] is True
 
 
 @pytest.mark.asyncio

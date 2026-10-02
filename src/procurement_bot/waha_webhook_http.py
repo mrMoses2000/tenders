@@ -14,6 +14,7 @@ import asyncpg
 from aiohttp import web
 
 from procurement_bot.phone import normalize_phone
+from procurement_bot.supplier_media import WhatsAppMediaInput
 from procurement_bot.whatsapp_inbound import (
     AuthenticatedWhatsAppInbound,
     WhatsAppInboundConflict,
@@ -183,21 +184,68 @@ def parse_waha_message_event(value: object) -> AuthenticatedWhatsAppInbound | _I
     message_type = payload.get("type")
     if message_type is not None and not isinstance(message_type, str):
         raise WahaWebhookSchemaError("payload.type must be a string")
-    if message_type not in {None, "chat", "text"}:
-        return _IgnoredEvent("non_text_message")
-
     has_media = payload.get("hasMedia")
     if has_media is not None and not isinstance(has_media, bool):
         raise WahaWebhookSchemaError("payload.hasMedia must be boolean")
-    if has_media:
-        return _IgnoredEvent("non_text_message")
-
     body = payload.get("body")
-    if body is None:
-        return _IgnoredEvent("non_text_message")
-    if not isinstance(body, str):
+    if body is not None and not isinstance(body, str):
         raise WahaWebhookSchemaError("payload.body must be a string")
-    if not body.strip():
+    if body is None:
+        body = ""
+
+    media: WhatsAppMediaInput | None = None
+    media_value = payload.get("media")
+    is_media = (
+        bool(has_media)
+        or isinstance(media_value, Mapping)
+        or message_type in {"image", "audio", "voice", "ptt"}
+    )
+    if is_media:
+        if media_value is not None and not isinstance(media_value, Mapping):
+            raise WahaWebhookSchemaError("payload.media must be an object or null")
+        media_fields = media_value if isinstance(media_value, Mapping) else {}
+        mimetype = media_fields.get("mimetype")
+        filename = media_fields.get("filename")
+        media_url = media_fields.get("url")
+        media_error = media_fields.get("error")
+        for field, field_value in (
+            ("mimetype", mimetype),
+            ("filename", filename),
+            ("url", media_url),
+            ("error", media_error),
+        ):
+            if field_value is not None and not isinstance(field_value, str):
+                raise WahaWebhookSchemaError(f"payload.media.{field} must be a string or null")
+        mime_kind = (
+            "image"
+            if isinstance(mimetype, str) and mimetype.lower().startswith("image/")
+            else "audio"
+            if isinstance(mimetype, str) and mimetype.lower().startswith("audio/")
+            else None
+        )
+        type_kind = (
+            "image"
+            if message_type == "image"
+            else "audio"
+            if message_type in {"audio", "voice", "ptt"}
+            else None
+        )
+        kind = mime_kind or type_kind
+        if kind is None:
+            return _IgnoredEvent("unsupported_media_type")
+        try:
+            media = WhatsAppMediaInput(
+                kind=kind,
+                url=media_url,
+                mimetype=mimetype,
+                filename=filename,
+                error=media_error,
+            )
+        except ValueError as exc:
+            raise WahaWebhookSchemaError("media fields violate the inbound contract") from exc
+    elif message_type not in {None, "chat", "text"}:
+        return _IgnoredEvent("non_text_message")
+    elif not body.strip():
         return _IgnoredEvent("empty_text_message")
 
     message_id = payload.get("id")
@@ -216,6 +264,7 @@ def parse_waha_message_event(value: object) -> AuthenticatedWhatsAppInbound | _I
             provider_message_id=message_id.strip(),
             received_at=received_at,
             text=body,
+            media=media,
         )
     except ValueError as exc:
         raise WahaWebhookSchemaError("message fields violate the inbound contract") from exc

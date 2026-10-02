@@ -12,18 +12,28 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import FSInputFile
 
 from procurement_bot.approvals import validate_consumed_approval
+from procurement_bot.chat_actors import (
+    ChatActorLease,
+    claim_whatsapp_outbox,
+    release_chat_actor,
+    renew_chat_actor,
+)
 from procurement_bot.errors import PermanentProviderError, ValidationBlocked
-from procurement_bot.providers.waha import WahaClient
+from procurement_bot.providers.waha import WahaClient, WahaSendResult
 from procurement_bot.queue import (
     ClaimedOutbox,
     claim_outbox,
     complete_outbox,
+    defer_outbox,
     fail_outbox,
     renew_outbox_lease,
     set_outbox_provider_request_id,
 )
 from procurement_bot.report_artifacts import resolve_report_path
-from procurement_bot.supplier_dialogue import assert_supplier_safe_text
+from procurement_bot.supplier_dialogue import (
+    WhatsAppSendDeferred,
+    assert_supplier_safe_text,
+)
 from procurement_bot.telegram_outbox_payloads import (
     TELEGRAM_ANSWER_CALLBACK_QUERY,
     TELEGRAM_SEND_DOCUMENT,
@@ -40,6 +50,10 @@ from procurement_bot.whatsapp_delivery import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class WhatsAppSendOutcomeUnknown(PermanentProviderError):
+    """A send lost its actor fence after dispatch and requires manual reconciliation."""
 
 
 class TelegramOutboxWorker:
@@ -169,15 +183,16 @@ class WhatsAppOutboxWorker:
                 await asyncio.sleep(idle_seconds)
 
     async def run_once(self) -> bool:
-        event = await claim_outbox(
+        claim = await claim_whatsapp_outbox(
             self.pool,
             worker_id=self.worker_id,
             lease_seconds=self.lease_seconds,
-            event_types=("whatsapp.send_text",),
         )
-        if event is None:
+        if claim is None:
             return False
-        heartbeat = asyncio.create_task(self._heartbeat(event))
+        event, actor = claim
+        lease_lost = asyncio.Event()
+        heartbeat = asyncio.create_task(self._heartbeat(event, actor, lease_lost))
         try:
             if event.event_type != "whatsapp.send_text":
                 raise ValueError(f"unsupported outbox event: {event.event_type}")
@@ -203,12 +218,16 @@ class WhatsAppOutboxWorker:
                 )
                 if not stored:
                     raise RuntimeError("outbox lease expired before WAHA id reservation")
-            result = await self.client.send_text(
+            result = await _send_while_actor_owned(
+                self.client,
+                lease_lost,
                 recipient=str(payload["recipient"]),
                 text=str(payload["text"]),
                 idempotency_key=event.idempotency_key,
                 provider_message_id=provider_message_id,
             )
+            if lease_lost.is_set():
+                raise RuntimeError("WhatsApp chat actor lease was lost after send")
             completed = await complete_whatsapp_delivery(
                 self.pool,
                 event,
@@ -219,6 +238,22 @@ class WhatsAppOutboxWorker:
                 raise RuntimeError("outbox lease expired after WAHA send")
         except asyncio.CancelledError:
             raise
+        except WhatsAppSendDeferred as exc:
+            LOGGER.info(
+                "WhatsApp send deferred by case policy",
+                extra={
+                    "job_id": event.id,
+                    "available_at": exc.available_at.isoformat(),
+                    "reason": exc.reason,
+                },
+            )
+            with suppress(RuntimeError):
+                await defer_outbox(
+                    self.pool,
+                    event,
+                    available_at=exc.available_at,
+                    reason=exc.reason,
+                )
         except Exception as exc:
             retryable = not isinstance(
                 exc,
@@ -239,17 +274,84 @@ class WhatsAppOutboxWorker:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
+            try:
+                if not await release_chat_actor(self.pool, actor):
+                    LOGGER.warning(
+                        "WhatsApp chat actor lease was not released by its owner",
+                        extra={"actor_id": str(actor.actor_id), "generation": actor.generation},
+                    )
+            except Exception:
+                LOGGER.exception(
+                    "WhatsApp chat actor release failed",
+                    extra={"actor_id": str(actor.actor_id), "generation": actor.generation},
+                )
         return True
 
-    async def _heartbeat(self, event: ClaimedOutbox) -> None:
+    async def _heartbeat(
+        self,
+        event: ClaimedOutbox,
+        actor: ChatActorLease,
+        lease_lost: asyncio.Event,
+    ) -> None:
         interval = max(5, self.lease_seconds // 3)
         while True:
             await asyncio.sleep(interval)
-            if not await renew_outbox_lease(
-                self.pool,
-                event.id,
-                self.worker_id,
-                lease_seconds=self.lease_seconds,
-            ):
+            try:
+                outbox_renewed = await renew_outbox_lease(
+                    self.pool,
+                    event.id,
+                    self.worker_id,
+                    lease_seconds=self.lease_seconds,
+                )
+                actor_renewed = await renew_chat_actor(
+                    self.pool,
+                    actor,
+                    lease_seconds=self.lease_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                lease_lost.set()
+                LOGGER.exception(
+                    "WhatsApp outbox or actor lease renewal raised",
+                    extra={"job_id": event.id, "actor_id": str(actor.actor_id)},
+                )
+                return
+            if not outbox_renewed or not actor_renewed:
+                lease_lost.set()
                 LOGGER.error("WhatsApp outbox lease renewal failed", extra={"job_id": event.id})
                 return
+
+
+async def _send_while_actor_owned(
+    client: WahaClient,
+    lease_lost: asyncio.Event,
+    **kwargs: str,
+) -> WahaSendResult:
+    """Cancel and reap a provider request when the durable lease is lost."""
+
+    if lease_lost.is_set():
+        raise WhatsAppSendOutcomeUnknown(
+            "WhatsApp chat actor lease was lost before send; reconcile the reserved id"
+        )
+    provider_task = asyncio.create_task(client.send_text(**kwargs))
+    lease_waiter = asyncio.create_task(lease_lost.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {provider_task, lease_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if lease_lost.is_set():
+            provider_task.cancel()
+            await asyncio.gather(provider_task, return_exceptions=True)
+            raise WhatsAppSendOutcomeUnknown(
+                "WhatsApp chat actor lease was lost during send; provider outcome is unknown"
+            )
+        return provider_task.result()
+    finally:
+        lease_waiter.cancel()
+        with suppress(asyncio.CancelledError):
+            await lease_waiter
+        if not provider_task.done():
+            provider_task.cancel()
+            await asyncio.gather(provider_task, return_exceptions=True)

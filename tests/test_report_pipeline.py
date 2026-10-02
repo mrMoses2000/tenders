@@ -149,6 +149,8 @@ class _Connection:
         self.sql.append(sql)
         if "FROM procurement_cases AS c" in sql:
             return self.case if args[0] == self.case_id else None
+        if "FROM research_scope_revisions" in sql:
+            return getattr(self, "scope_revision", None)
         if "FROM research_runs" in sql:
             if "WHERE id=$1" in sql:
                 return self.run if args[0] == self.run_id else None
@@ -238,6 +240,25 @@ async def _install_artifact_fake(
 
     monkeypatch.setattr(pipeline, "persist_report_artifact", persist)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_revised_report_labels_citywide_priority_without_changing_case_area(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection()
+    old_area = connection.case["search_area_text"]
+    connection.scope_revision = {
+        "city": "Алматы", "preferred_area_text": "Северное Кольцо",
+        "revision_sha256": "f" * 64,
+    }
+    calls = await _install_artifact_fake(monkeypatch, connection)
+    await build_case_report(
+        connection, results_root=tmp_path, case_id=connection.case_id,
+        research_run_id=connection.run_id,
+    )
+    assert "Весь город Алматы; приоритет: Северное Кольцо" in calls[0]["html"]
+    assert connection.case["search_area_text"] == old_area
 
 
 @pytest.mark.asyncio
@@ -367,3 +388,81 @@ async def test_unknown_offer_remains_unconfirmed_and_unranked(
     assert "Цена не подтверждена" in html
     assert "наличие не подтверждено" in html
     assert '<span class="rank">' not in html
+
+
+@pytest.mark.asyncio
+async def test_partial_research_report_is_explicit_and_keeps_case_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection(run_status="running")
+    connection.case["status"] = "researching"
+    connection.offers[0]["supplier_phone"] = None
+    calls = await _install_artifact_fake(monkeypatch, connection)
+    kwargs = dict(
+        results_root=tmp_path,
+        case_id=connection.case_id,
+        research_run_id=connection.run_id,
+        refresh_key="pilot-three-items-v1",
+        partial_research_snapshot=True,
+    )
+    first = await build_case_report(connection, **kwargs)  # type: ignore[arg-type]
+    retry = await build_case_report(connection, **kwargs)  # type: ignore[arg-type]
+
+    assert connection.case["status"] == "researching"
+    assert "Промежуточный срез" in calls[0]["html"]
+    assert "Сохранённые лиды заявки: по 1 из 1 позиций" in calls[0]["html"]
+    assert "телефоны указаны у лидов по 0 позициям" in calls[0]["html"]
+    assert "могут относиться к более ранним поискам" in calls[0]["html"]
+    assert "Промежуточный" in connection.outbox[0]["payload"]["caption"]
+    assert len(calls) == 1
+    assert retry.artifact_id == first.artifact_id
+    assert not retry.newly_built
+
+
+@pytest.mark.asyncio
+async def test_partial_report_with_55_items_and_no_offers_marks_each_item_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection(run_status="running")
+    connection.case["status"] = "researching"
+    first = connection.items[0]
+    connection.items = [
+        {**first, "line_number": number, "name": f"Позиция {number}",
+         "id": first["id"] if number == 1 else uuid4()}
+        for number in range(1, 56)
+    ]
+    connection.offers = []
+    calls = await _install_artifact_fake(monkeypatch, connection)
+
+    await build_case_report(
+        connection,  # type: ignore[arg-type]
+        results_root=tmp_path,
+        case_id=connection.case_id,
+        research_run_id=connection.run_id,
+        refresh_key="pilot-empty-55-v1",
+        partial_research_snapshot=True,
+    )
+
+    html = calls[0]["html"]
+    assert html.count('<section class="item-group">') == 55
+    assert html.count("Предложений пока нет.") == 55
+    assert "Позиция 55: Позиция 55" in html
+    assert "Требуется: 20 рулон" in html
+    assert "Техспек" in html
+    assert "Сохранённые лиды заявки: по 0 из 55 позиций" in html
+    assert "<article>" not in html
+
+
+@pytest.mark.asyncio
+async def test_partial_report_requires_distinct_refresh_identity(tmp_path: Path) -> None:
+    connection = _Connection(run_status="running")
+    with pytest.raises(ValueError, match="refresh key"):
+        await build_case_report(
+            connection,  # type: ignore[arg-type]
+            results_root=tmp_path,
+            case_id=connection.case_id,
+            partial_research_snapshot=True,
+        )
+    assert connection.sql == []

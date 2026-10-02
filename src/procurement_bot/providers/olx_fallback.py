@@ -43,6 +43,10 @@ class OlxFallbackProvider:
             if plan.source != ResearchSource.OLX or str(exc) != "AGY browser CLI timeout":
                 raise
             LOGGER.warning("OLX AGY browser timeout; retrying with Codex Chrome")
+        except TimeoutError:
+            if plan.source != ResearchSource.OLX:
+                raise
+            LOGGER.warning("OLX AGY browser batch timed out; retrying with Codex Chrome")
         except PermanentProviderError as exc:
             if plan.source != ResearchSource.OLX or str(exc) not in _MALFORMED_AGY_OUTPUT:
                 raise

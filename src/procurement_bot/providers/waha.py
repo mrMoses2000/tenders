@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import posixpath
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
 from procurement_bot.phone import normalize_phone
@@ -15,6 +20,9 @@ from procurement_bot.phone import normalize_phone
 
 class WahaDisabledError(PermanentProviderError):
     pass
+
+
+MAX_MEDIA_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,100 @@ class UrllibJsonTransport:
             return HttpResponse(status=exc.code, body=exc.read())
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
             raise RetryableProviderError("WAHA request failed") from exc
+
+    async def download(
+        self,
+        *,
+        url: str,
+        destination: Path,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        max_bytes: int,
+    ) -> None:
+        await asyncio.to_thread(
+            self._download,
+            url=url,
+            destination=destination,
+            headers=headers,
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+        )
+
+    @staticmethod
+    def _download(
+        *,
+        url: str,
+        destination: Path,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        max_bytes: int,
+    ) -> None:
+        if urlparse(url).scheme not in {"http", "https"}:
+            raise PermanentProviderError("WAHA media transport only permits HTTP(S)")
+
+        class _RejectRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+                return None
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirect)
+        request = urllib.request.Request(  # noqa: S310 - scheme and origin are validated above.
+            url=url, headers=dict(headers), method="GET"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: str | None = None
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            with opener.open(request, timeout=max(0.001, deadline - time.monotonic())) as response:
+                if not 200 <= response.status < 300:
+                    raise _classify_download_status(response.status)
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=destination.parent, prefix=".media-", delete=False
+                ) as target:
+                    temporary_path = target.name
+                    total = 0
+                    read_chunk = getattr(response, "read1", response.read)
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RetryableProviderError("WAHA media download deadline elapsed")
+                        _set_response_read_timeout(response, remaining)
+                        chunk = read_chunk(min(64 * 1024, max_bytes + 1 - total))
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise PermanentProviderError("WAHA media exceeds configured size limit")
+                        target.write(chunk)
+            os.replace(temporary_path, destination)
+            temporary_path = None
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise PermanentProviderError("WAHA media redirects are not allowed") from exc
+            raise _classify_download_status(exc.code) from exc
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            raise RetryableProviderError("WAHA media download failed") from exc
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+
+
+def _classify_download_status(status: int) -> Exception:
+    if status == 429 or status >= 500:
+        return RetryableProviderError(f"WAHA media temporary error ({status})")
+    return PermanentProviderError(f"WAHA media request rejected ({status})")
+
+
+def _set_response_read_timeout(response: Any, timeout_seconds: float) -> None:
+    """Apply the remaining whole-transfer budget to the underlying socket."""
+
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    settimeout = getattr(sock, "settimeout", None)
+    if callable(settimeout):
+        settimeout(timeout_seconds)
 
 
 @dataclass(frozen=True)
@@ -170,6 +272,102 @@ class WahaClient:
         if response.status == 422:
             raise RetryableProviderError("WAHA session is not ready to reserve a message id")
         return self._extract_message_id(self._decode(response))
+
+    async def fetch_chat_messages(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 20,
+        download_media: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fetch a bounded read-only chat history from WAHA."""
+
+        if not self._enabled:
+            raise WahaDisabledError("WAHA access is disabled")
+        if not self._api_key:
+            raise WahaDisabledError("WAHA API key is not configured")
+        if not chat_id.strip():
+            raise ValueError("chat_id must be non-empty")
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        query = urlencode({"limit": limit, "downloadMedia": str(download_media).lower()})
+        encoded_chat_id = quote(chat_id, safe="")
+        response = await self._transport.request(
+            method="GET",
+            url=urljoin(
+                self._base_url,
+                f"api/{quote(self._session, safe='')}/chats/{encoded_chat_id}/messages?{query}",
+            ),
+            headers={"Accept": "application/json", "X-Api-Key": self._api_key},
+            body=None,
+            timeout_seconds=self._timeout_seconds,
+        )
+        if response.status == 429 or response.status >= 500:
+            raise RetryableProviderError(f"WAHA temporary error ({response.status})")
+        try:
+            payload = json.loads(response.body or b"[]")
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise PermanentProviderError("WAHA returned invalid chat messages") from exc
+        if not 200 <= response.status < 300:
+            raise PermanentProviderError(f"WAHA rejected the request ({response.status})")
+        if isinstance(payload, dict):
+            payload = payload.get("messages", payload.get("data"))
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise PermanentProviderError("WAHA chat messages must be a list of objects")
+        return payload[:limit]
+
+    async def download_media(
+        self,
+        media_url: str,
+        destination: Path,
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Download one WAHA file after strict origin/path validation."""
+
+        if not self._enabled:
+            raise WahaDisabledError("WAHA access is disabled")
+        if not self._api_key:
+            raise WahaDisabledError("WAHA API key is not configured")
+        if not 1 <= max_bytes <= MAX_MEDIA_DOWNLOAD_BYTES:
+            raise ValueError(f"max_bytes must be between 1 and {MAX_MEDIA_DOWNLOAD_BYTES}")
+        trusted_url = self._validate_media_url(media_url)
+        download = getattr(self._transport, "download", None)
+        if download is None:
+            raise PermanentProviderError(
+                "configured WAHA transport does not support media downloads"
+            )
+        await download(
+            url=trusted_url,
+            destination=destination,
+            headers={"Accept": "*/*", "X-Api-Key": self._api_key},
+            timeout_seconds=self._timeout_seconds,
+            max_bytes=max_bytes,
+        )
+
+    def _validate_media_url(self, media_url: str) -> str:
+        if not isinstance(media_url, str) or not media_url.strip():
+            raise PermanentProviderError("WAHA media URL is missing")
+        try:
+            base = urlparse(self._base_url)
+            target = urlparse(urljoin(self._base_url, media_url))
+            base_port = base.port or (443 if base.scheme == "https" else 80)
+            target_port = target.port or (443 if target.scheme == "https" else 80)
+        except ValueError as exc:
+            raise PermanentProviderError("WAHA media URL is malformed") from exc
+        if target.scheme != base.scheme or target.username or target.password or target.fragment:
+            raise PermanentProviderError("WAHA media URL is outside the configured origin")
+        local_hosts = {"localhost", "127.0.0.1"}
+        same_host = target.hostname == base.hostname
+        if base.hostname in local_hosts and target.hostname in local_hosts:
+            same_host = True
+        if not same_host or target_port != base_port:
+            raise PermanentProviderError("WAHA media URL is outside the configured origin")
+        trusted_path = (base.path.rstrip("/") + "/api/files").rstrip("/")
+        decoded_path = posixpath.normpath(unquote(target.path))
+        if decoded_path != trusted_path and not decoded_path.startswith(trusted_path + "/"):
+            raise PermanentProviderError("WAHA media URL is not under /api/files")
+        return target.geturl()
 
     async def send_text(
         self,

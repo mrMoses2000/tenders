@@ -6,7 +6,6 @@ from pydantic import ValidationError
 
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
 from procurement_bot.providers.browser import (
-    BrowserProviderError,
     BrowserResearchPort,
     LocalityBrowserResult,
     SupplierBrowserResult,
@@ -18,46 +17,51 @@ LOGGER = logging.getLogger(__name__)
 _ACCESS_FAILURES = frozenset({
     "mcp_error", "browser_start_failed", "captcha", "access_denied", "login_wall",
 })
-_MALFORMED_AGY_OUTPUT = frozenset({
+_BROWSER_START_FAILURES = frozenset({
+    "configured AGY executable could not start",
+})
+_LOCALITY_MALFORMED_OUTPUTS = frozenset({
     "AGY browser CLI returned an invalid structured output",
     "AGY browser result_json is invalid JSON",
     "AGY browser result_json must be an object",
-})
-_MALFORMED_LOCALITY_OUTPUT = frozenset({
-    *_MALFORMED_AGY_OUTPUT,
     "AGY browser result_json must be a string",
-})
-_LOCALITY_PROVIDER_FAILURES = _MALFORMED_LOCALITY_OUTPUT | frozenset({
-    "configured AGY executable could not start",
     "AGY browser CLI output exceeded 1 MiB",
-})
-_RETRYABLE_CARD_EVIDENCE = frozenset({
-    "2GIS contact must cite its firm card and contact evidence",
 })
 
 
 class TwoGisFallbackProvider:
-    """Retry operational 2GIS browser failures through the Chrome-backed CLI."""
+    """Retry observed 2GIS/optional WEB browser failures through Chrome."""
 
-    def __init__(self, primary: BrowserResearchPort, fallback: BrowserResearchPort) -> None:
+    def __init__(
+        self,
+        primary: BrowserResearchPort,
+        fallback: BrowserResearchPort,
+        *,
+        web_fallback_enabled: bool = False,
+    ) -> None:
         self.primary = primary
         self.fallback = fallback
+        self.web_fallback_enabled = web_fallback_enabled
 
     async def resolve_locality(self, task: LocalityResearchTask) -> LocalityBrowserResult:
         try:
             result = await self.primary.resolve_locality(task)
-        except BrowserProviderError as exc:
+        except UnsafeBrowserResult as exc:
+            if exc.access_issue not in _ACCESS_FAILURES:
+                raise
             LOGGER.warning(
                 "2GIS primary locality browser failure (%s); retrying with Codex Chrome",
                 type(exc).__name__,
             )
-        except RetryableProviderError:
-            LOGGER.warning("2GIS primary locality provider failed; retrying with Codex Chrome")
+        except RetryableProviderError as exc:
+            if str(exc) not in {"AGY browser CLI timeout", "AGY browser CLI transport failed"}:
+                raise
+            LOGGER.warning("2GIS primary locality browser timed out; retrying with Codex Chrome")
         except PermanentProviderError as exc:
-            if str(exc) not in _LOCALITY_PROVIDER_FAILURES:
+            if str(exc) not in _BROWSER_START_FAILURES | _LOCALITY_MALFORMED_OUTPUTS:
                 raise
             LOGGER.warning(
-                "2GIS primary locality output/provider failed; retrying with Codex Chrome"
+                "2GIS primary locality provider failed; retrying with Codex Chrome"
             )
         except ValidationError:
             LOGGER.warning(
@@ -65,16 +69,13 @@ class TwoGisFallbackProvider:
             )
         else:
             if not isinstance(result, LocalityBrowserResult):
-                LOGGER.warning(
-                    "2GIS primary locality result had an invalid type; retrying with Codex Chrome"
-                )
-            elif result.candidates:
+                raise PermanentProviderError("2GIS locality primary returned an invalid result")
+            if result.candidates:
                 return result
-            else:
-                LOGGER.warning(
-                    "2GIS primary locality lookup returned no candidates; "
-                    "retrying with Codex Chrome"
-                )
+            LOGGER.warning(
+                "2GIS primary locality lookup returned no candidates; "
+                "retrying with Codex Chrome"
+            )
 
         fallback_result = await self.fallback.resolve_locality(task)
         if not isinstance(fallback_result, LocalityBrowserResult):
@@ -85,24 +86,37 @@ class TwoGisFallbackProvider:
         try:
             return await self.primary.search_suppliers(plan)
         except UnsafeBrowserResult as exc:
-            if (plan.source != ResearchSource.TWO_GIS
-                    or (exc.access_issue not in _ACCESS_FAILURES
-                        and str(exc) not in _RETRYABLE_CARD_EVIDENCE)):
+            source_allowed = (
+                plan.source == ResearchSource.TWO_GIS
+                or (plan.source == ResearchSource.WEB and self.web_fallback_enabled)
+            )
+            if not source_allowed or exc.access_issue not in _ACCESS_FAILURES:
                 raise
             LOGGER.warning(
-                "2GIS AGY browser/card evidence failed; retrying with Codex Chrome: %s",
-                str(exc),
+                "%s AGY browser access issue=%s; retrying with Codex Chrome",
+                plan.source.value,
+                exc.access_issue,
             )
         except RetryableProviderError as exc:
-            if plan.source != ResearchSource.TWO_GIS:
+            source_allowed = (
+                plan.source == ResearchSource.TWO_GIS
+                or (plan.source == ResearchSource.WEB and self.web_fallback_enabled)
+            )
+            if not source_allowed or str(exc) != "AGY browser CLI timeout":
                 raise
-            LOGGER.warning("2GIS AGY browser failure; retrying with Codex Chrome: %s", exc)
-        except PermanentProviderError as exc:
-            if plan.source != ResearchSource.TWO_GIS or str(exc) not in _MALFORMED_AGY_OUTPUT:
+            LOGGER.warning(
+                "%s AGY browser timed out; retrying with Codex Chrome",
+                plan.source.value,
+            )
+        except TimeoutError:
+            source_allowed = (
+                plan.source == ResearchSource.TWO_GIS
+                or (plan.source == ResearchSource.WEB and self.web_fallback_enabled)
+            )
+            if not source_allowed:
                 raise
-            LOGGER.warning("2GIS AGY output malformed; retrying with Codex Chrome")
-        except ValidationError:
-            if plan.source != ResearchSource.TWO_GIS:
-                raise
-            LOGGER.warning("2GIS AGY result failed schema validation; retrying with Codex Chrome")
+            LOGGER.warning(
+                "%s AGY browser batch timed out; retrying with Codex Chrome",
+                plan.source.value,
+            )
         return await self.fallback.search_suppliers(plan)

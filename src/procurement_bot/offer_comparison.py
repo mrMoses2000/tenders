@@ -16,7 +16,7 @@ _PACK_UNITS = {"pack", "package", "упаковка", "упаковку", "уп�
 _UNIT_ALIASES = {
     "piece": "piece", "pcs": "piece", "pc": "piece", "шт": "piece",
     "штука": "piece", "штуку": "piece", "штуки": "piece",
-    "штук": "piece", "ед": "piece",
+    "штук": "piece", "ед": "piece", "дана": "piece", "данасы": "piece",
     "kg": "kg", "кг": "kg", "килограмм": "kg", "килограмма": "kg",
     "g": "g", "г": "g", "грамм": "g",
     "m": "m", "м": "m", "метр": "m", "метра": "m", "метров": "m",

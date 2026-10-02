@@ -107,3 +107,63 @@ async def test_authentication_failure_is_permanent(tmp_path: Path) -> None:
     )
     with pytest.raises(PermanentProviderError, match="HTTP 401"):
         await transcriber.transcribe(audio)
+
+
+async def test_durable_submit_and_one_shot_poll_preserve_confidence_evidence(
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"audio")
+    calls: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/v2/upload":
+            return httpx.Response(200, json={"upload_url": "https://cdn.example/audio"})
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "durable-job_1"})
+        return httpx.Response(
+            200,
+            json={
+                "status": "completed",
+                "text": "Бағасы 1250 теңге, саны 20 дана.",
+                "language_code": "kk",
+                "language_confidence": 0.91,
+                "confidence": 0.83,
+                "words": [
+                    {"text": "1250", "confidence": 0.61},
+                    {"text": "теңге", "confidence": 0.95},
+                ],
+                "speech_model_used": "universal-2",
+            },
+        )
+
+    provider = AssemblyAITranscriber("private-test-key", transport=httpx.MockTransport(handler))
+    transcript_id = await provider.submit(audio, language="kk")
+    assert transcript_id == "durable-job_1"
+    transcript = await provider.poll(transcript_id)
+
+    assert transcript is not None
+    assert transcript.confidence == 0.91
+    assert transcript.speech_confidence == 0.83
+    assert transcript.low_confidence_words == ("1250",)
+    assert calls == [
+        ("POST", "/v2/upload"),
+        ("POST", "/v2/transcript"),
+        ("GET", "/v2/transcript/durable-job_1"),
+    ]
+
+
+@pytest.mark.parametrize("status", ["queued", "processing"])
+async def test_durable_poll_returns_none_for_pending_jobs(status: str) -> None:
+    provider = AssemblyAITranscriber(
+        "private-test-key",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"status": status})),
+    )
+    assert await provider.poll("transcript-1") is None
+
+
+async def test_durable_poll_rejects_unsafe_transcript_ids() -> None:
+    provider = AssemblyAITranscriber("private-test-key")
+    with pytest.raises(PermanentProviderError, match="invalid AssemblyAI transcript ID"):
+        await provider.poll("../other?x=1")

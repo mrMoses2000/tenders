@@ -104,9 +104,8 @@ async def test_empty_locality_result_uses_fallback_once() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "error",
+        "error",
     [
-        UnsafeBrowserResult("invalid locality evidence"),
         RetryableProviderError("AGY browser CLI timeout"),
         PermanentProviderError("AGY browser result_json is invalid JSON"),
         ValidationError.from_exception_data("LocalityBrowserResult", []),
@@ -152,17 +151,13 @@ async def test_2gis_access_and_browser_failures_use_codex_fallback(issue: str) -
 
 
 @pytest.mark.asyncio
-async def test_2gis_transient_or_malformed_agy_failures_use_fallback() -> None:
-    errors = [
-        RetryableProviderError("AGY browser CLI timeout"),
-        PermanentProviderError("AGY browser result_json is invalid JSON"),
-        ValidationError.from_exception_data("SupplierBrowserResult", []),
-    ]
-    for error in errors:
-        fallback = _Fallback()
-        provider = TwoGisFallbackProvider(_Primary(error), fallback)  # type: ignore[arg-type]
-        assert await provider.search_suppliers(_Plan(ResearchSource.TWO_GIS)) == "fallback-result"
-        assert fallback.calls == 1
+async def test_2gis_timeout_uses_fallback() -> None:
+    fallback = _Fallback()
+    provider = TwoGisFallbackProvider(
+        _Primary(RetryableProviderError("AGY browser CLI timeout")), fallback,
+    )  # type: ignore[arg-type]
+    assert await provider.search_suppliers(_Plan(ResearchSource.TWO_GIS)) == "fallback-result"
+    assert fallback.calls == 1
 
 
 @pytest.mark.asyncio
@@ -179,7 +174,7 @@ async def test_2gis_semantic_rejection_does_not_use_fallback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_2gis_missing_contact_card_evidence_rechecks_with_codex() -> None:
+async def test_2gis_missing_contact_card_evidence_does_not_trigger_transport_fallback() -> None:
     fallback = _Fallback()
     provider = TwoGisFallbackProvider(
         _Primary(UnsafeBrowserResult(
@@ -187,8 +182,25 @@ async def test_2gis_missing_contact_card_evidence_rechecks_with_codex() -> None:
         )),
         fallback,
     )  # type: ignore[arg-type]
-    assert await provider.search_suppliers(_Plan(ResearchSource.TWO_GIS)) == "fallback-result"
-    assert fallback.calls == 1
+    with pytest.raises(UnsafeBrowserResult, match="firm card and contact evidence"):
+        await provider.search_suppliers(_Plan(ResearchSource.TWO_GIS))
+    assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermanentProviderError("AGY browser result_json is invalid JSON"),
+        ValidationError.from_exception_data("SupplierBrowserResult", []),
+    ],
+)
+async def test_2gis_malformed_output_does_not_trigger_transport_fallback(error) -> None:
+    fallback = _Fallback()
+    provider = TwoGisFallbackProvider(_Primary(error), fallback)  # type: ignore[arg-type]
+    with pytest.raises(type(error)):
+        await provider.search_suppliers(_Plan(ResearchSource.TWO_GIS))
+    assert fallback.calls == 0
 
 
 @pytest.mark.asyncio
@@ -211,6 +223,19 @@ async def test_non_2gis_failures_do_not_use_fallback() -> None:
             _Primary(RetryableProviderError("timeout")), fallback,
         ).search_suppliers(_Plan(ResearchSource.WEB))
     assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_web_timeout_uses_opt_in_codex_fallback_only() -> None:
+    fallback = _Fallback()
+    provider = TwoGisFallbackProvider(
+        _Primary(RetryableProviderError("AGY browser CLI timeout")),
+        fallback,
+        web_fallback_enabled=True,
+    )  # type: ignore[arg-type]
+
+    assert await provider.search_suppliers(_Plan(ResearchSource.WEB)) == "fallback-result"
+    assert fallback.calls == 1
 
 
 @pytest.mark.asyncio

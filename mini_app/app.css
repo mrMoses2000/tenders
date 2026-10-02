@@ -266,3 +266,4 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
   .page-foot { margin: 43px 19px 0; font-size: 8px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+ .supplier-media { display: block; max-width: 100%; max-height: 480px; margin-top: 8px; }

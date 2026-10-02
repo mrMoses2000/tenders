@@ -9,6 +9,10 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from procurement_bot.auto_send_policy import (
+    assert_auto_send_authorization_active,
+    get_case_send_policy,
+)
 from procurement_bot.conversations import OutboundMessageInput, record_outbound_message
 from procurement_bot.phone import normalize_phone
 from procurement_bot.providers.waha import WahaSendResult
@@ -18,7 +22,7 @@ from procurement_bot.supplier_dialogue import (
     DEFAULT_SEND_POLICY,
     SendContext,
     SendPolicy,
-    assert_send_allowed,
+    assert_send_allowed_or_defer,
     assert_supplier_safe_text,
 )
 
@@ -91,9 +95,7 @@ def parse_whatsapp_delivery_payload(
         case_id=_canonical_uuid(value["case_id"], field="case_id"),
         recipient=recipient,
         text=text.strip(),
-        conversation_id=_canonical_uuid(
-            value["conversation_id"], field="conversation_id"
-        ),
+        conversation_id=_canonical_uuid(value["conversation_id"], field="conversation_id"),
         logical_action_id=action.strip(),
         is_followup=followup,
     )
@@ -112,10 +114,12 @@ async def assert_whatsapp_delivery_allowed(
     if current.tzinfo is None:
         raise ValueError("delivery time must be timezone-aware")
     payload = parse_whatsapp_delivery_payload(event.payload)
-    local = current.astimezone(ZoneInfo(policy.timezone))
-    local_midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_started_at = local_midnight.astimezone(UTC)
     async with pool.acquire() as connection, connection.transaction():
+        await assert_auto_send_authorization_active(connection, approval_id=event.approval_id)
+        send_policy = await get_case_send_policy(connection, payload.case_id, policy)
+        local = current.astimezone(ZoneInfo(send_policy.timezone))
+        local_midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_started_at = local_midnight.astimezone(UTC)
         row = await connection.fetchrow(
             """
             SELECT c.case_id,c.session_name,c.external_chat_id,c.state,c.opted_out,
@@ -132,8 +136,10 @@ async def assert_whatsapp_delivery_allowed(
               AND __CONTACT_SCOPE__
             FOR SHARE OF c,contact
             """.replace(
-                "__CONTACT_SCOPE__", case_owned_supplier_contact_evidence(
-                    contact_alias="contact", evidence_alias="contact_evidence",
+                "__CONTACT_SCOPE__",
+                case_owned_supplier_contact_evidence(
+                    contact_alias="contact",
+                    evidence_alias="contact_evidence",
                     case_param="$3",
                 ),
             ),
@@ -152,7 +158,10 @@ async def assert_whatsapp_delivery_allowed(
             SELECT id FROM outbox_events
             WHERE event_type='whatsapp.send_text'
               AND payload->>'conversation_id'=$1
-              AND status IN ('pending','retry','sending')
+              AND (
+                status IN ('pending','retry','sending')
+                OR (status='dead' AND provider_request_id IS NOT NULL AND external_id IS NULL)
+              )
             ORDER BY created_at,id
             LIMIT 1
             """,
@@ -168,11 +177,12 @@ async def assert_whatsapp_delivery_allowed(
             followups_sent=int(row["followup_count"]),
             last_sent_at=row["last_outbound_at"],
         )
-        assert_send_allowed(
+        assert_send_allowed_or_defer(
             context,
             now=current,
-            policy=policy,
+            policy=send_policy,
             is_followup=payload.is_followup,
+            autonomous_case=send_policy != policy,
         )
     return WhatsAppDeliveryContext(
         payload=payload,
@@ -221,6 +231,17 @@ async def complete_whatsapp_delivery(
                 text_content=context.payload.text,
                 is_followup=context.payload.is_followup,
             ),
+        )
+        await connection.execute(
+            """
+            UPDATE supplier_conversation_item_turns
+            SET status='pending_reply',updated_at=now()
+            WHERE conversation_id=$1 AND approval_id=$2
+              AND status='awaiting_approval' AND draft_text=$3
+            """,
+            context.payload.conversation_id,
+            event.approval_id,
+            context.payload.text,
         )
         if context.payload.logical_action_id.startswith("initial-availability:"):
             transitioned = await connection.execute(

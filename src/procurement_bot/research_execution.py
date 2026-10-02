@@ -23,6 +23,7 @@ from procurement_bot.providers.browser import (
     BrowserResearchPort,
     SupplierBrowserResult,
 )
+from procurement_bot.queue import stable_key
 from procurement_bot.research import (
     AvailabilityStatus,
     ContactKind,
@@ -42,8 +43,10 @@ from procurement_bot.suppliers import (
     PersistenceConflictError,
     SourceEvidenceInput,
     SupplierContactInput,
+    SupplierIdentityConflictError,
     SupplierInput,
     SupplierLocationInput,
+    normalize_contact,
     upsert_offer,
     upsert_offer_observation,
     upsert_olx_supplier_by_contact,
@@ -69,6 +72,7 @@ _SOURCE_TYPE = {
 }
 _ADVANCED_CASE_STATUSES = {
     "evaluating",
+    "contacting",
     "report_ready",
     "selected",
     "closed",
@@ -232,7 +236,7 @@ def _parse_plan(search_scope: object) -> ResearchPlan:
 
 def _request_hash(plan: SourcePlan) -> str:
     return hashlib.sha256(
-        _canonical_json(plan.model_dump(mode="json")).encode()
+        _canonical_json(plan.browser_payload()).encode()
     ).hexdigest()
 
 
@@ -275,7 +279,7 @@ def _web_plan_with_catalog_links(plan: SourcePlan, links: list[str]) -> SourcePl
     unique_links = [url for url in links if url not in plan.query_terms][:4]
     # A provider task is bounded; keep the product name and as many original clues as fit.
     terms = [*plan.query_terms[:20 - len(unique_links)], *unique_links]
-    return SourcePlan.model_validate({**plan.model_dump(), "query_terms": terms})
+    return SourcePlan.model_validate({**plan.browser_payload(), "query_terms": terms})
 
 
 def _validate_browser_result(
@@ -402,7 +406,9 @@ class ResearchRunExecutor:
         async with _connection(self.database) as connection:
             run = await connection.fetchrow(
                 """
-                SELECT id,case_id,status,search_scope,error_code
+                SELECT id,case_id,status,search_scope,error_code,
+                    EXISTS (SELECT 1 FROM research_scope_revisions revision
+                        WHERE revision.research_run_id=research_runs.id) AS has_scope_revision
                 FROM research_runs
                 WHERE id=$1
                 """,
@@ -427,6 +433,8 @@ class ResearchRunExecutor:
                 )
             if run["status"] != "running":
                 raise ResearchExecutionRejected("research run is not running")
+            if run.get("has_scope_revision"):
+                raise ResearchExecutionRejected("scope_revision_requires_parallel_execution")
 
             try:
                 snapshot = await self._load_snapshot(connection, run)
@@ -626,6 +634,15 @@ class ResearchRunExecutor:
                 ) if EvidenceClaim.CONTACT in evidence.claims),
                 primary_evidence_id,
             )
+            valid_contacts = []
+            invalid_contacts = []
+            for contact in candidate.contacts:
+                try:
+                    normalize_contact(contact.kind.value, contact.value)
+                except ValueError:
+                    invalid_contacts.append(contact)
+                else:
+                    valid_contacts.append(contact)
             existing_offer = None
             if candidate.source == ResearchSource.OLX:
                 await connection.execute(
@@ -643,6 +660,27 @@ class ResearchRunExecutor:
                     """,
                     branch.request_item_id, candidate.external_id,
                 )
+            elif candidate.source == ResearchSource.TWO_GIS:
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"2gis-offer:{branch.request_item_id}:{candidate.external_id}",
+                )
+                existing_offer = await connection.fetchrow(
+                    """
+                    SELECT o.id,o.supplier_id FROM offers o
+                    WHERE o.request_item_id=$1 AND EXISTS (
+                        SELECT 1 FROM offer_observations observation
+                        JOIN source_evidence evidence
+                          ON evidence.id=observation.source_evidence_id
+                        WHERE observation.offer_id=o.id
+                          AND evidence.external_id=$2
+                          AND evidence.source_type='2gis'
+                    )
+                    ORDER BY o.created_at,o.id LIMIT 1
+                    """,
+                    branch.request_item_id,
+                    candidate.external_id,
+                )
             if existing_offer is not None:
                 supplier_id = existing_offer["supplier_id"]
             else:
@@ -654,27 +692,93 @@ class ResearchRunExecutor:
                     source_evidence_id=primary_evidence_id,
                     confidence=_confidence(candidate, "name", "0.7"),
                 )
-                if candidate.source == ResearchSource.OLX and candidate.contacts:
+                if candidate.source == ResearchSource.OLX and valid_contacts:
                     supplier = await upsert_olx_supplier_by_contact(
                         connection,
                         supplier_input,
-                        [(contact.kind.value, contact.value)
-                         for contact in candidate.contacts],
+                        [(contact.kind.value, contact.value) for contact in valid_contacts],
                     )
                 else:
                     supplier = await upsert_supplier(connection, supplier_input)
                 supplier_id = supplier.id
-            for contact in candidate.contacts:
-                await upsert_supplier_contact(
-                    connection,
-                    supplier_id,
-                    SupplierContactInput(
-                        contact_type=contact.kind.value,
-                        display_value=contact.value,
-                        source_evidence_id=contact_evidence_id,
-                        is_whatsapp_confirmed=(contact.kind == ContactKind.WHATSAPP),
-                        confidence=Decimal(str(contact.confidence)),
+            for contact in valid_contacts:
+                try:
+                    await upsert_supplier_contact(
+                        connection,
+                        supplier_id,
+                        SupplierContactInput(
+                            contact_type=contact.kind.value,
+                            display_value=contact.value,
+                            source_evidence_id=contact_evidence_id,
+                            is_whatsapp_confirmed=(contact.kind == ContactKind.WHATSAPP),
+                            confidence=Decimal(str(contact.confidence)),
+                        ),
+                    )
+                except SupplierIdentityConflictError:
+                    normalized_contact = normalize_contact(contact.kind.value, contact.value)
+                    contact_fingerprint = _digest(
+                        {"kind": contact.kind.value, "normalized": normalized_contact}
+                    )
+                    await connection.execute(
+                        """INSERT INTO workflow_events(
+                               case_id,request_item_id,event_type,actor_type,actor_id,
+                               idempotency_key,data
+                           ) SELECT item.case_id,item.id,
+                               'supplier_contact_identity_conflict','worker',
+                               'research-persistence',$2,$3::jsonb
+                             FROM request_items item WHERE item.id=$1
+                           ON CONFLICT (idempotency_key) DO NOTHING""",
+                        branch.request_item_id,
+                        stable_key(
+                            "research-contact-identity-review",
+                            branch.id,
+                            candidate.source.value,
+                            candidate.external_id or "",
+                            supplier_id,
+                            contact_evidence_id,
+                            contact.kind.value,
+                            contact_fingerprint,
+                        ),
+                        {
+                            "outcome": "contact_needs_review",
+                            "research_query_id": str(branch.id),
+                            "supplier_id": str(supplier_id),
+                            "source_evidence_id": str(contact_evidence_id),
+                            "contact_kind": contact.kind.value,
+                            "contact_fingerprint": contact_fingerprint,
+                        },
+                    )
+            for contact in invalid_contacts:
+                contact_fingerprint = _digest(
+                    {"kind": contact.kind.value, "value": contact.value}
+                )
+                await connection.execute(
+                    """INSERT INTO workflow_events(
+                           case_id,request_item_id,event_type,actor_type,actor_id,
+                           idempotency_key,data
+                       ) SELECT item.case_id,item.id,
+                           'supplier_contact_invalid','worker','research-persistence',$2,$3::jsonb
+                         FROM request_items item WHERE item.id=$1
+                       ON CONFLICT (idempotency_key) DO NOTHING""",
+                    branch.request_item_id,
+                    stable_key(
+                        "research-contact-invalid-review",
+                        branch.id,
+                        candidate.source.value,
+                        candidate.external_id or "",
+                        supplier_id,
+                        contact_evidence_id,
+                        contact.kind.value,
+                        contact_fingerprint,
                     ),
+                    {
+                        "outcome": "contact_needs_review",
+                        "research_query_id": str(branch.id),
+                        "supplier_id": str(supplier_id),
+                        "source_evidence_id": str(contact_evidence_id),
+                        "contact_kind": contact.kind.value,
+                        "contact_fingerprint": contact_fingerprint,
+                    },
                 )
             location_id: UUID | None = None
             if (

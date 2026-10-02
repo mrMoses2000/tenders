@@ -4,18 +4,27 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel
 
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
 
 T = TypeVar("T", bound=BaseModel)
+AgyDiagnosticCode = Literal[
+    "cli_usage_limit",
+    "cli_rate_limit",
+    "cli_auth_failed",
+    "cli_context_limit",
+    "cli_timeout",
+    "cli_status_error",
+]
 
 
 class StructuredExtractor(Protocol):
@@ -64,6 +73,28 @@ class FakeExtractor:
 
 class _OutputLimitError(Exception):
     pass
+
+
+class AgyCliStatusError(RetryableProviderError):
+    """A failed AGY envelope represented by a fixed, allowlisted code."""
+
+    _ALLOWED_CODES = frozenset(
+        {
+            "cli_usage_limit",
+            "cli_rate_limit",
+            "cli_auth_failed",
+            "cli_context_limit",
+            "cli_timeout",
+            "cli_status_error",
+        }
+    )
+
+    def __init__(self, diagnostic_code: str) -> None:
+        self.diagnostic_code: AgyDiagnosticCode = cast(
+            AgyDiagnosticCode,
+            diagnostic_code if diagnostic_code in self._ALLOWED_CODES else "cli_status_error",
+        )
+        super().__init__(f"AGY CLI returned an error ({self.diagnostic_code})")
 
 
 class AgyExtractor:
@@ -320,18 +351,22 @@ class AgyExtractor:
                 except _OutputLimitError as exc:
                     await self._terminate(process)
                     raise PermanentProviderError("AGY CLI output exceeded 1 MiB") from exc
-                detail = stderr.decode(errors="replace")[-2000:]
+                except asyncio.CancelledError:
+                    # A cancelled caller may be draining a job deadline. Reap
+                    # the isolated CLI process group before propagating so it
+                    # cannot outlive the profile/temp-directory owner.
+                    await self._terminate(process)
+                    raise
                 if process.returncode != 0:
-                    raise RetryableProviderError(
-                        f"AGY CLI exited {process.returncode}: {detail}"
-                    )
+                    # stderr can contain prompts, profile paths, or account data.
+                    # Preserve the retryable boundary without exposing its text.
+                    raise RetryableProviderError("AGY CLI exited with a nonzero status")
                 try:
                     result = json.loads(stdout)
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise RetryableProviderError("AGY CLI returned an invalid envelope") from exc
                 if result.get("status") != "SUCCESS":
-                    status = str(result.get("status") or "UNKNOWN")[:80]
-                    raise RetryableProviderError(f"AGY CLI status is {status}")
+                    raise AgyCliStatusError(self._status_diagnostic_code(result))
                 structured = result.get("structured_output")
                 if not isinstance(structured, dict):
                     response = result.get("response")
@@ -363,6 +398,37 @@ class AgyExtractor:
                 if not isinstance(decoded_result, dict):
                     raise PermanentProviderError("AGY result_json is not an object")
                 return decoded_result
+
+    @staticmethod
+    def _status_diagnostic_code(envelope: Mapping[str, Any]) -> AgyDiagnosticCode:
+        """Classify only bounded literal markers from known error fields.
+
+        The envelope is already size-limited by ``_read_bounded``. Error text
+        is scanned in memory only and is never attached to the exception or a
+        receipt. Unsupported fields and unrecognized messages stay generic.
+        """
+
+        error_values: list[str] = []
+        for field in ("error_code", "error", "message", "details"):
+            value = envelope.get(field)
+            if isinstance(value, str):
+                error_values.append(value[:2048])
+            elif isinstance(value, Mapping):
+                for nested_field in ("code", "message", "details"):
+                    nested = value.get(nested_field)
+                    if isinstance(nested, str):
+                        error_values.append(nested[:2048])
+        diagnostic_text = " ".join(error_values).casefold()
+        for marker, code in (
+            (r"(?<![a-z0-9])usage_limit(?![a-z0-9])", "cli_usage_limit"),
+            (r"(?<![a-z0-9])rate_limit(?![a-z0-9])", "cli_rate_limit"),
+            (r"(?<![a-z0-9])authentication(?![a-z0-9])", "cli_auth_failed"),
+            (r"(?<![a-z0-9])context(?![a-z0-9])", "cli_context_limit"),
+            (r"(?<![a-z0-9])timeout(?![a-z0-9])", "cli_timeout"),
+        ):
+            if re.search(marker, diagnostic_text):
+                return code
+        return "cli_status_error"
 
     @staticmethod
     async def _write_prompt(stream: asyncio.StreamWriter, prompt: str) -> None:

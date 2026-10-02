@@ -1,6 +1,7 @@
 from procurement_bot.reporting import (
     ProcurementReport,
     ReportEvidence,
+    ReportItem,
     SupplierReportCard,
     render_report_html,
 )
@@ -50,3 +51,43 @@ def test_ranked_cards_render_first() -> None:
     )
     output = render_report_html(report)
     assert output.index("Лучший") < output.index("Без ранга")
+
+
+def test_full_report_shows_all_55_items_and_marks_50_without_offers() -> None:
+    report = ProcurementReport(
+        case_reference="abc123",
+        title="Заявка на 55 позиций",
+        city="Алматы",
+        search_scope="весь город",
+        items=[
+            ReportItem(
+                item_number=number,
+                item_name=f"Позиция {number}",
+                quantity=20 if number == 55 else None,
+                unit="рулон" if number == 55 else None,
+                specification_text="<script>не исполнять</script>" if number == 55 else None,
+            )
+            for number in range(1, 56)
+        ],
+        cards=[
+            SupplierReportCard(
+                item_number=number,
+                item_name=f"Позиция {number}",
+                supplier_name=f"Поставщик {number}",
+                product_name=f"Товар {number}",
+                technical_status="нужно подтвердить",
+                availability="неизвестно",
+            )
+            for number in range(1, 6)
+        ],
+    )
+
+    output = render_report_html(report)
+
+    assert output.count('<section class="item-group">') == 55
+    assert output.count("Предложений пока нет.") == 50
+    assert "Позиция 55: Позиция 55" in output
+    assert "Поставщик 5" in output
+    assert "Требуется: 20 рулон" in output
+    assert "&lt;script&gt;не исполнять&lt;/script&gt;" in output
+    assert "<script>не исполнять</script>" not in output
