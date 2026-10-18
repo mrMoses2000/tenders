@@ -165,6 +165,8 @@ class _Connection:
                 return "UPDATE 0"
             self.run["status"] = "running"
             return "UPDATE 1"
+        if "INSERT INTO case_pipeline_runtime" in sql:
+            return "INSERT 0 1"
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
     async def fetchval(self, sql: str, *args: object) -> UUID | int | None:

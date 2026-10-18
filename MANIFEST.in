@@ -1,0 +1,2 @@
+recursive-include migrations *.sql
+recursive-include mini_app *.html *.css *.js

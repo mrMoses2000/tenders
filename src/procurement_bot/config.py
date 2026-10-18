@@ -7,6 +7,7 @@ import shutil
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 
 from dotenv import dotenv_values
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -37,6 +38,20 @@ class Settings(BaseSettings):
     poll_timeout_seconds: int = Field(default=30, ge=1, le=60)
     telegram_ingress_concurrency: int = Field(default=8, ge=1, le=64)
     worker_concurrency: int = Field(default=4, ge=1, le=32)
+    parallel_research_enabled: bool = False
+    research_auto_prepare_outreach: bool = True
+    research_active_groups: int = Field(default=3, ge=1, le=3)
+    research_target_suppliers: int = Field(default=20, ge=1, le=100)
+    research_max_batches: int = Field(default=20, ge=1, le=100)
+    browser_cli_concurrency: int = Field(default=1, ge=1, le=4)
+    browser_failure_trace_enabled: bool = False
+    browser_resource_wait_seconds: int = Field(default=120, ge=1, le=1800)
+    browser_source_cooldown_seconds: int = Field(default=900, ge=60, le=3600)
+    staged_research_enabled: bool = False
+    staged_research_primary: Literal["agy", "codex"] = "agy"
+    semantic_supplier_reply_enabled: bool = False
+    browser_batch_timeout_seconds: int = Field(default=180, ge=30, le=300)
+    browser_diagnostics_root: Path = Path("./var/provider-diagnostics")
     job_lease_seconds: int = Field(default=300, ge=30, le=3600)
     max_job_attempts: int = Field(default=5, ge=1, le=20)
 
@@ -61,16 +76,31 @@ class Settings(BaseSettings):
     agy_browser_home: Path = Path("./var/agy-browser-home")
     agy_browser_mcp_server_name: str = "playwright"
     agy_browser_mcp_server_json: str = ""
+    agy_browser_model: str = ""
+    agy_browser_effort: Literal["low", "medium", "high"] = "high"
     agy_browser_timeout_seconds: int = Field(default=240, ge=30, le=1800)
     agy_browser_concurrency: int = Field(default=1, ge=1, le=4)
+    codex_2gis_fallback_enabled: bool = False
+    codex_olx_fallback_enabled: bool = False
+    codex_2gis_executable: Path = Path.home() / ".local/bin/codex"
+    codex_2gis_model: str = "gpt-6-luna"
+    codex_2gis_reasoning_effort: Literal["low", "medium", "high"] = "high"
+    codex_2gis_timeout_seconds: int = Field(default=900, ge=30, le=1800)
 
     voice_provider: str = "assemblyai"
-    assemblyai_env_file: Path = Path("/home/moses/audio_transcription/.env")
+    assemblyai_env_file: Path = Path.home() / "audio_transcription" / ".env"
     assemblyai_key_name: str = "ASSEMBLI_AI_5"
     assemblyai_timeout_seconds: int = Field(default=10_800, ge=30, le=21_600)
     transcription_min_language_confidence: float = Field(default=0.55, ge=0, le=1)
+    supplier_media_enabled: bool = False
+    supplier_media_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=20 * 1024 * 1024)
+    codex_chrome_plugin_root: Path | None = None
+    codex_chrome_node_executable: Path | None = None
+    supplier_image_timeout_seconds: int = Field(default=120, ge=30, le=300)
 
     waha_enabled: bool = False
+    # Receiving, history and media access remain available during an outbound hold.
+    waha_outbound_enabled: bool = False
     waha_base_url: str = "http://127.0.0.1:3000"
     waha_api_key: SecretStr = SecretStr("")
     waha_session: str = "default"
@@ -265,9 +295,7 @@ class Settings(BaseSettings):
         """Provision one browser-only AGY profile with an exact MCP allowlist."""
 
         server = self.require_browser_mcp_server()
-        source = self.agy_auth_token_source
-        if not source.is_file():
-            raise ValueError(f"AGY auth token was not found: {source}")
+        source = self._available_agy_auth_token()
         root = self.agy_browser_home
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
@@ -330,9 +358,7 @@ class Settings(BaseSettings):
     def prepare_isolated_agy_home(self) -> Path:
         """Create a parser-only AGY profile containing authentication, not MCP config."""
 
-        source = self.agy_auth_token_source
-        if not source.is_file():
-            raise ValueError(f"AGY auth token was not found: {source}")
+        source = self._available_agy_auth_token()
         root = self.agy_home
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
@@ -364,6 +390,21 @@ class Settings(BaseSettings):
         )
         settings_file.chmod(0o600)
         return root
+
+    def _available_agy_auth_token(self) -> Path:
+        """Reuse a private isolated copy if AGY removes its primary token file."""
+
+        name = Path(".gemini/antigravity-cli/antigravity-oauth-token")
+        for source in (
+            self.agy_auth_token_source,
+            self.agy_home / name,
+            self.agy_browser_home / name,
+        ):
+            if source.is_file() and source.stat().st_size > 0:
+                return source
+        raise ValueError(
+            f"AGY auth token was not found: {self.agy_auth_token_source}"
+        )
 
 
 @lru_cache

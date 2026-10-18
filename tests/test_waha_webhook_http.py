@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 import procurement_bot.waha_webhook_http as webhook_module
+from procurement_bot.supplier_media import WhatsAppMediaInput
 from procurement_bot.waha_webhook_http import (
     MAX_WEBHOOK_BODY_BYTES,
     WAHA_WEBHOOK_AUTH_HEADER,
@@ -39,7 +40,7 @@ class _Acquire(AbstractAsyncContextManager[object]):
 
 class _Pool:
     def __init__(self) -> None:
-        self.connection = object()
+        self.connection = _Connection()
         self.acquire_count = 0
 
     def acquire(self) -> _Acquire:
@@ -47,11 +48,36 @@ class _Pool:
         return _Acquire(self.connection)
 
 
+class _Connection:
+    def __init__(self) -> None:
+        self.audit: list[tuple[str, tuple[object, ...]]] = []
+        self.quarantine: list[tuple[str, tuple[object, ...]]] = []
+
+    def transaction(self):
+        return _Transaction()
+
+    async def fetchval(self, sql: str, *_args: object) -> object:
+        return 0 if "count(*)" in sql else False
+
+    async def execute(self, sql: str, *args: object) -> str:
+        target = self.quarantine if "whatsapp_inbound_quarantine" in sql else self.audit
+        target.append((sql, args))
+        return "INSERT 0 1"
+
+
+class _Transaction(AbstractAsyncContextManager[None]):
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
 def _document(**payload_overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": "msg-42",
         "timestamp": 1_795_008_600,
-        "from": "77001234567@c.us",
+        "from": "77000000003@c.us",
         "fromMe": False,
         "body": "Есть в наличии",
         "type": "chat",
@@ -119,25 +145,65 @@ async def test_valid_message_is_normalized_and_durably_accepted(
     assert event.provider_event_id == "msg-42"
     assert event.provider_message_id == "msg-42"
     assert event.session_name == "procurement"
-    assert event.sender_phone == "+77001234567"
+    assert event.sender_phone == "+77000000003"
     assert event.received_at == datetime.fromtimestamp(1_795_008_600, tz=UTC)
     assert captured["connection"] is pool.connection
     assert captured["worker_id"] == "http-1"
-    assert pool.acquire_count == 1
+    assert pool.acquire_count == 2
+    assert pool.connection.audit[0][1][1:4] == ("accepted", "processed", "message")
+    assert len(pool.connection.audit[0][1][5]) == 64  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("media_type", "mimetype", "expected_kind", "placeholder"),
+    [
+        ("image", "image/jpeg", "image", "[Фотография поставщика]"),
+        (None, "audio/ogg; codecs=opus", "audio", "[Голосовое сообщение поставщика]"),
+        ("ptt", None, "audio", "[Голосовое сообщение поставщика]"),
+    ],
+)
+def test_supported_media_is_accepted_with_empty_caption(
+    media_type: str | None,
+    mimetype: str | None,
+    expected_kind: str,
+    placeholder: str,
+) -> None:
+    media: dict[str, object] = {"url": None, "mimetype": mimetype, "filename": None, "error": None}
+    payload = _document(body="", hasMedia=True, media=media)
+    if media_type is not None:
+        payload["payload"]["type"] = media_type  # type: ignore[index]
+
+    event = parse_waha_message_event(payload)
+
+    assert event.media == WhatsAppMediaInput(kind=expected_kind, mimetype=mimetype)
+    assert event.text == ""
+    assert event.stored_text == placeholder
+    assert event.evidence_payload()["text"] == ""
+    assert event.evidence_payload()["original_caption"] == ""
+    assert event.evidence_payload()["media"]["url"] is None
+
+
+def test_missing_mime_and_unknown_type_media_is_acknowledged_as_unsupported() -> None:
+    event = parse_waha_message_event(_document(body="", hasMedia=True, media={"url": None}))
+
+    assert getattr(event, "reason", None) == "unsupported_media_type"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("document", "reason"),
     [
-        ({"event": "session.status", "session": "procurement", "payload": {}}, "unsupported_event"),
+        (
+            {"event": "session.status", "session": "procurement", "payload": {"status": "WORKING"}},
+            "unknown_session_status",
+        ),
         (_document(fromMe=True), "own_message"),
         (_document(**{"from": "status@broadcast"}), "status_message"),
-        (_document(type="image", hasMedia=True), "non_text_message"),
+        (_document(type="document", hasMedia=True), "unsupported_media_type"),
         (_document(**{"from": "120363@g.us"}), "group_message"),
     ],
 )
-async def test_irrelevant_provider_events_are_acknowledged_without_database_access(
+async def test_irrelevant_provider_events_are_acknowledged_and_audited(
     document: object,
     reason: str,
 ) -> None:
@@ -150,7 +216,9 @@ async def test_irrelevant_provider_events_are_acknowledged_without_database_acce
 
     assert response.status == 200
     assert response.body == {"status": "ignored", "reason": reason}
-    assert pool.acquire_count == 0
+    assert pool.acquire_count == 1
+    expected_kind = "session.status" if reason == "unknown_session_status" else "message"
+    assert pool.connection.audit[0][1][1:4] == ("ignored", reason, expected_kind)
 
 
 @pytest.mark.asyncio
@@ -189,7 +257,7 @@ async def test_request_boundary_rejects_unsafe_input_without_database_access(
 
     assert response.status == status
     assert response.body["error"] == error
-    assert pool.acquire_count == 0
+    assert pool.acquire_count == (0 if error == "method_not_allowed" else 1)
 
 
 @pytest.mark.asyncio
@@ -204,7 +272,8 @@ async def test_body_limit_is_enforced_before_authentication_or_json_parsing() ->
 
     assert response.status == 413
     assert response.body["error"] == "body_too_large"
-    assert pool.acquire_count == 0
+    assert pool.acquire_count == 1
+    assert pool.connection.audit[0][1][1:4] == ("rejected", "body_too_large", "unknown")
 
 
 @pytest.mark.asyncio
@@ -236,6 +305,139 @@ def test_timestamp_seconds_milliseconds_and_iso_are_normalized_to_utc() -> None:
     assert iso.received_at == datetime(2026, 11, 16, 5, 30, tzinfo=UTC)  # type: ignore[union-attr]
 
 
+def test_parse_outcome_exposes_only_a_bounded_fingerprint_for_unsupported_lid() -> None:
+    payload = _document(**{"from": "opaque-user@lid", "id": "provider-message-secret"})
+
+    outcome = webhook_module.parse_waha_message_outcome(payload)
+
+    assert outcome.event is None
+    assert outcome.disposition == "ignored"
+    assert outcome.reason == "unsupported_sender"
+    assert outcome.provider_id_fingerprint is not None
+    assert "provider-message-secret" not in repr(outcome)
+    assert "opaque-user" not in repr(outcome)
+
+
+def test_session_status_parser_only_returns_restriction_hints() -> None:
+    locked = {
+        "event": "session.status",
+        "session": "procurement",
+        "payload": {
+            "status": "WORKING",
+            "data": {
+                "reachoutTimelock": {
+                    "isActive": True,
+                    "timeEnforcementEnds": 1_795_008_600,
+                },
+                "messageCapping": {"cappingStatus": "FIRST_WARNING"},
+            },
+        },
+    }
+    working = {
+        "event": "session.status",
+        "session": "procurement",
+        "payload": {
+            "status": "WORKING",
+            "data": {"messageCapping": {"cappingStatus": "FIRST_WARNING"}},
+        },
+    }
+
+    lock_outcome = webhook_module.parse_waha_message_outcome(locked)
+    working_outcome = webhook_module.parse_waha_message_outcome(working)
+
+    assert lock_outcome.disposition == "accepted"
+    assert lock_outcome.restriction_state == "timelock"
+    assert lock_outcome.restriction_until == datetime.fromtimestamp(1_795_008_600, tz=UTC)
+    assert working_outcome.restriction_state is None
+
+
+@pytest.mark.asyncio
+async def test_authenticated_lid_message_is_quarantined_without_media_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    ingress = WahaWebhookHttpIngress(pool=pool, shared_secret=SHARED_AUTH_VALUE)
+    payload = _document(
+        **{
+            "from": "opaque-user@lid",
+            "type": "image",
+            "body": "Фото по вашему запросу",
+            "hasMedia": True,
+            "media": {
+                "url": "https://provider.invalid/private?token=secret",
+                "mimetype": "image/jpeg",
+            },
+        }
+    )
+
+    response = await ingress.handle(_request(payload))
+
+    assert response.status == 200
+    assert response.body == {"status": "ignored", "reason": "unsupported_sender"}
+    inserts = [call for call in pool.connection.quarantine if "INSERT INTO" in call[0]]
+    assert len(inserts) == 1
+    values = inserts[0][1]
+    assert values[2:4] == ("msg-42", "opaque-user@lid")
+    assert values[-2:] == ("image", "Фото по вашему запросу")
+    assert "provider.invalid" not in repr(values)
+    assert "secret" not in repr(values)
+
+
+@pytest.mark.asyncio
+async def test_session_status_restriction_is_only_a_hint_and_requests_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import procurement_bot.pipeline_runtime as runtime
+    import procurement_bot.whatsapp_account as account
+
+    observed: list[tuple[object, ...]] = []
+    probes: list[tuple[object, ...]] = []
+    wakes: list[tuple[object, ...]] = []
+
+    async def observe(_connection: object, session: str, **kwargs: object) -> None:
+        observed.append((session, kwargs))
+
+    async def request_probe(_connection: object, session: str, **kwargs: object) -> None:
+        probes.append((session, kwargs))
+
+    async def wake_session(_connection: object, **kwargs: object) -> int:
+        wakes.append(tuple(kwargs.items()))
+        return 1
+
+    monkeypatch.setattr(account, "observe_provider_state", observe)
+    monkeypatch.setattr(account, "request_account_probe", request_probe)
+    monkeypatch.setattr(runtime, "wake_session_pipelines", wake_session)
+    pool = _Pool()
+    ingress = WahaWebhookHttpIngress(
+        pool=pool,
+        shared_secret=SHARED_AUTH_VALUE,
+        known_sessions=("procurement",),
+    )
+    payload = {
+        "event": "session.status",
+        "session": "procurement",
+        "payload": {
+            "status": "WORKING",
+            "data": {"messageCapping": {"cappingStatus": "CAPPED"}},
+        },
+    }
+
+    response = await ingress.handle(_request(payload))
+
+    assert response.status == 200
+    assert response.body == {"status": "accepted", "disposition": "restriction_hint_recorded"}
+    assert observed[0][0] == "procurement"
+    assert observed[0][1]["state"] == "capped"
+    assert observed[0][1]["source"] == "webhook_hint"
+    assert observed[0][1]["state"] != "clear"
+    assert probes[0][0] == "procurement"
+    assert probes[0][1]["reason"] == "provider_session_status_webhook_hint"
+    assert dict(wakes[0]) == {
+        "session_name": "procurement",
+        "reason": "whatsapp_session_status_hint",
+    }
+
+
 def test_aiohttp_factory_exposes_only_configured_webhook_route() -> None:
     app = create_waha_webhook_app(  # type: ignore[arg-type]
         pool=_Pool(), shared_secret=SHARED_AUTH_VALUE
@@ -244,3 +446,31 @@ def test_aiohttp_factory_exposes_only_configured_webhook_route() -> None:
 
     assert len(resources) == 1
     assert resources[0].canonical == "/webhooks/waha"
+
+
+@pytest.mark.asyncio
+async def test_ack_uses_authenticated_receipt_path_without_supplier_inbound(monkeypatch):
+    captured = []
+
+    async def receipt(_connection, value, *, source="webhook"):
+        captured.append(value)
+        return True
+
+    async def forbidden_incoming(*_args, **_kwargs):
+        raise AssertionError("ACK must not become a supplier answer")
+
+    monkeypatch.setattr("procurement_bot.delivery_receipts.record_receipt", receipt)
+    monkeypatch.setattr(webhook_module, "accept_whatsapp_inbound", forbidden_incoming)
+    ingress = WahaWebhookHttpIngress(pool=_Pool(), shared_secret=SHARED_AUTH_VALUE)
+    ack = {
+        "event": "message.ack",
+        "session": "procurement",
+        "payload": {"id": "sent-1", "fromMe": True, "ack": 2, "ackName": "DEVICE"},
+    }
+    assert (await ingress.handle(_request(ack, secret=INVALID_AUTH_VALUE))).status == 401
+    assert captured == []
+    response = await ingress.handle(_request(ack))
+    assert response.status == 200 and response.body["matched"]
+    assert len(captured) == 1 and captured[0].ack == 2
+    ack["payload"]["ack"] = True
+    assert (await ingress.handle(_request(ack))).status == 422

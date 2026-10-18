@@ -11,15 +11,22 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from procurement_bot.approvals import payload_sha256
+from procurement_bot.auto_send_policy import (
+    assert_auto_send_authorization_active,
+    get_case_send_policy,
+)
 from procurement_bot.errors import ValidationBlocked
 from procurement_bot.phone import normalize_phone
 from procurement_bot.queue import enqueue_outbox, stable_key
+from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
 from procurement_bot.supplier_dialogue import (
     DEFAULT_SEND_POLICY,
     SendContext,
-    assert_send_allowed,
+    WhatsAppSendDeferred,
+    assert_send_allowed_or_defer,
     assert_supplier_safe_text,
 )
+from procurement_bot.supplier_outreach import initial_inquiry_text
 
 _APPROVAL_ACTION = "send_whatsapp"
 _OUTBOX_EVENT = "whatsapp.send_text"
@@ -152,9 +159,7 @@ def _parse_payload(value: object) -> _SendPayload:
         case_id=_canonical_uuid(payload["case_id"], field="case_id"),
         recipient=recipient,
         text=text,
-        conversation_id=_canonical_uuid(
-            payload["conversation_id"], field="conversation_id"
-        ),
+        conversation_id=_canonical_uuid(payload["conversation_id"], field="conversation_id"),
         logical_action_id=logical_action_id,
         is_followup=is_followup,
     )
@@ -174,6 +179,40 @@ async def _connection(
 
 def _now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+async def initial_draft_is_current(
+    connection: asyncpg.Connection,
+    *,
+    case_id: UUID,
+    conversation_id: UUID,
+    logical_action_id: str,
+    text: str,
+) -> bool:
+    """Check the exact first-contact text against the current item facts."""
+
+    if not logical_action_id.startswith("initial-availability:"):
+        return True
+    try:
+        offer_id = UUID(logical_action_id.removeprefix("initial-availability:"))
+    except ValueError:
+        return False
+    item = await connection.fetchrow(
+        """SELECT item.name,item.specification_text,item.quantity,item.unit
+           FROM supplier_conversation_targets AS target
+           JOIN request_items AS item ON item.id=target.request_item_id
+           WHERE target.conversation_id=$1 AND target.offer_id=$2
+             AND item.case_id=$3""",
+        conversation_id,
+        offer_id,
+        case_id,
+    )
+    return item is not None and text == initial_inquiry_text(
+        str(item["name"]),
+        str(item["specification_text"] or ""),
+        item["quantity"],
+        item["unit"],
+    )
 
 
 async def _existing_exact_outbox(
@@ -284,10 +323,10 @@ async def start_approved_whatsapp_send(
                 "WhatsApp logical action is already attached to an outbox event"
             )
 
-        local = now.astimezone(ZoneInfo(DEFAULT_SEND_POLICY.timezone))
-        day_started_at = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
-            UTC
-        )
+        await assert_auto_send_authorization_active(connection, approval_id=approval_id)
+        send_policy = await get_case_send_policy(connection, payload.case_id, DEFAULT_SEND_POLICY)
+        local = now.astimezone(ZoneInfo(send_policy.timezone))
+        day_started_at = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
         conversation = await connection.fetchrow(
             """
             SELECT c.case_id,c.state,c.opted_out,c.outbound_count,c.followup_count,
@@ -298,11 +337,22 @@ async def start_approved_whatsapp_send(
                       AND message.received_at >= $2) AS sent_today
             FROM supplier_conversations AS c
             JOIN supplier_contacts AS contact ON contact.id=c.supplier_contact_id
-            WHERE c.id=$1
+            JOIN source_evidence AS contact_evidence
+              ON contact_evidence.id=contact.source_evidence_id
+            WHERE c.id=$1 AND c.case_id=$3
+              AND __CONTACT_SCOPE__
             FOR UPDATE OF c,contact
-            """,
+            """.replace(
+                "__CONTACT_SCOPE__",
+                case_owned_supplier_contact_evidence(
+                    contact_alias="contact",
+                    evidence_alias="contact_evidence",
+                    case_param="$3",
+                ),
+            ),
             payload.conversation_id,
             day_started_at,
+            payload.case_id,
         )
         if conversation is None:
             raise WhatsAppSendDenied("approved WhatsApp conversation does not exist")
@@ -327,6 +377,15 @@ async def start_approved_whatsapp_send(
         if persisted_recipient != normalize_phone(payload.recipient):
             raise WhatsAppSendDenied("approved recipient does not match the conversation contact")
 
+        if not await initial_draft_is_current(
+            connection,
+            case_id=payload.case_id,
+            conversation_id=payload.conversation_id,
+            logical_action_id=payload.logical_action_id,
+            text=payload.text,
+        ):
+            raise WhatsAppSendDenied("Первый черновик устарел; обновите текст в заявке")
+
         context = SendContext(
             enabled=True,
             opted_out=False,
@@ -336,12 +395,15 @@ async def start_approved_whatsapp_send(
             last_sent_at=conversation["last_outbound_at"],
         )
         try:
-            assert_send_allowed(
+            assert_send_allowed_or_defer(
                 context,
                 now=now,
-                policy=DEFAULT_SEND_POLICY,
+                policy=send_policy,
                 is_followup=payload.is_followup,
+                autonomous_case=send_policy != DEFAULT_SEND_POLICY,
             )
+        except WhatsAppSendDeferred:
+            raise
         except (ValueError, ValidationBlocked) as exc:
             raise WhatsAppSendDenied(str(exc)) from exc
 

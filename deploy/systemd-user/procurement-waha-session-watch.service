@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover failed procurement WAHA session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tenders
+EnvironmentFile=%h/tenders/.env
+ExecStart=%h/tenders/.venv/bin/python %h/tenders/scripts/watch_waha_session.py
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/tenders/var/run

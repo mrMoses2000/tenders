@@ -1,0 +1,18 @@
+[Unit]
+Description=Back up procurement PostgreSQL schema
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tenders
+Environment=PROCUREMENT_BACKUP_MAX_SETS=14
+Environment=PROCUREMENT_BACKUP_MIN_FREE_BYTES=536870912
+ExecStart=%h/tenders/.venv/bin/python %h/tenders/scripts/backup_procurement_db.py
+TimeoutStartSec=15min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/tenders/var/backups

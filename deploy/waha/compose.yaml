@@ -2,7 +2,7 @@ name: procurement
 
 services:
   waha:
-    image: devlikeapro/waha:noweb-2026.9.1@sha256:2e4cbc92b16f82da330f8324064e0877e142b81224585938b2314c1d6c90774d
+    image: devlikeapro/waha:noweb-2026.9.1@sha256:2e4cbc92b16f82da330f8324064e0877e142b87000000001b2314c1d6c90774d
     container_name: procurement-waha
     restart: unless-stopped
     pids_limit: 512
@@ -47,4 +47,4 @@ networks:
     ipam:
       config:
         - subnet: 172.29.247.0/24
-          gateway: 172.29.247.1
+          gateway: 172.20.0.1

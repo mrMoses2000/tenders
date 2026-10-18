@@ -1,16 +1,26 @@
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError
+from procurement_bot.intake import SearchScope
+from procurement_bot.providers.agy import AgyCliStatusError
 from procurement_bot.providers.agy_browser import AgyBrowserMcpExecutor
 from procurement_bot.providers.browser import (
     PreparedBrowserCall,
     StructuredBrowserProvider,
 )
-from procurement_bot.research import LocalityResearchTask
+from procurement_bot.providers.staged_research import prepare_discovery
+from procurement_bot.research import (
+    LocalityConstraint,
+    LocalityResearchTask,
+    ResearchPurpose,
+    ResearchSource,
+    SourcePlan,
+)
 
 MCP_SERVER = {
     "command": "/usr/bin/npx",
@@ -86,6 +96,16 @@ def _executor(tmp_path: Path, executable: Path, **overrides) -> AgyBrowserMcpExe
     return AgyBrowserMcpExecutor(**options)
 
 
+def test_300_second_batch_timeout_is_supported(tmp_path):
+    executor = _executor(
+        tmp_path,
+        Path("/bin/true"),
+        batch_timeout_seconds=300,
+        timeout_seconds=360,
+    )
+    assert executor.batch_timeout_seconds == 300
+
+
 def test_constructor_requires_explicit_absolute_paths(tmp_path):
     with pytest.raises(ValueError, match="executable path must be absolute"):
         AgyBrowserMcpExecutor(
@@ -101,6 +121,169 @@ def test_constructor_requires_explicit_absolute_paths(tmp_path):
             mcp_server_name="browsermcp",
             expected_mcp_server=MCP_SERVER,
         )
+
+
+@pytest.mark.parametrize(
+    ("envelope", "diagnostic_code"),
+    [
+        (
+            {"status": "ERROR", "message": "authentication failed; private=DO_NOT_LEAK"},
+            "cli_auth_failed",
+        ),
+        ({"status": "ERROR", "error_code": "usage_limit"}, "cli_usage_limit"),
+        (
+            {"status": "ERROR", "error": "account is not eligible in this region"},
+            "cli_account_ineligible",
+        ),
+        (
+            {"status": "ERROR", "message": "private arbitrary vendor response"},
+            "cli_status_error",
+        ),
+    ],
+)
+def test_cli_error_envelopes_use_typed_allowlisted_diagnostics(
+    envelope: dict, diagnostic_code: str
+) -> None:
+    with pytest.raises(AgyCliStatusError) as caught:
+        AgyBrowserMcpExecutor._parse_stdout(json.dumps(envelope).encode())
+
+    assert caught.value.diagnostic_code == diagnostic_code
+    assert str(caught.value) == f"AGY CLI returned an error ({diagnostic_code})"
+    assert "DO_NOT_LEAK" not in str(caught.value)
+    assert "private arbitrary vendor response" not in str(caught.value)
+
+
+def test_success_response_auth_text_is_untrusted_not_an_auth_diagnostic() -> None:
+    envelope = {
+        "status": "SUCCESS",
+        "response": "authentication failed; this is untrusted model text",
+        "structured_output": {
+            "result_json": json.dumps({"observation": "authentication failed"})
+        },
+    }
+
+    result = AgyBrowserMcpExecutor._parse_stdout(json.dumps(envelope).encode())
+
+    assert result == {"observation": "authentication failed"}
+
+
+def test_bounded_search_prompt_stops_at_batch_cap(tmp_path):
+    plan = SourcePlan(
+        item_index=0,
+        source=ResearchSource.TWO_GIS,
+        purpose=ResearchPurpose.BUSINESS_DISCOVERY,
+        query_terms=["сантехника"],
+        rendered_query="сантехника Алматы",
+        locality=LocalityConstraint(city="Алматы", scope=SearchScope.CITYWIDE),
+        minimum_unique_candidates=20,
+        result_ttl_hours=24,
+        empty_page_limit=1,
+    ).model_copy(update={"batch_candidate_limit": 2})
+    call = StructuredBrowserProvider(StubExecutor()).prepare_supplier_search(plan)
+    prompt = _executor(tmp_path, Path("/bin/true"))._build_prompt(call)
+
+    assert "at most 2 distinct candidate card(s)" in prompt
+    assert "Do not browse further to reach the overall minimum_unique_candidates target" in prompt
+    assert "Do not start another batch or search here" in prompt
+    assert "return that exact HTTPS URL as next_cursor" in prompt
+    assert "stop once the requested minimum_unique_candidates are found" not in prompt
+    assert (
+        "Do not continue to another batch or search until the overall target is met"
+        not in prompt
+    )
+
+
+def test_search_cursor_prompt_continues_from_saved_page(tmp_path):
+    plan = SourcePlan(
+        item_index=0,
+        source=ResearchSource.TWO_GIS,
+        purpose=ResearchPurpose.BUSINESS_DISCOVERY,
+        query_terms=["сантехника"],
+        rendered_query="сантехника Алматы",
+        locality=LocalityConstraint(city="Алматы", scope=SearchScope.CITYWIDE),
+        minimum_unique_candidates=20,
+        result_ttl_hours=24,
+        empty_page_limit=1,
+    ).model_copy(update={
+        "batch_candidate_limit": 2,
+        "search_cursor": "https://2gis.kz/almaty/search/page/2",
+    })
+    call = StructuredBrowserProvider(StubExecutor()).prepare_supplier_search(plan)
+    prompt = _executor(tmp_path, Path("/bin/true"))._build_prompt(call)
+
+    assert "Continue this source search from the supplied search_cursor URL first" in prompt
+    assert "do not restart at the first search page" in prompt
+    assert '"search_cursor":"https://2gis.kz/almaty/search/page/2"' in prompt
+
+
+def test_discovery_prompt_overrides_legacy_page_and_contact_guidance(tmp_path):
+    plan = SourcePlan(
+        item_index=0,
+        source=ResearchSource.TWO_GIS,
+        purpose=ResearchPurpose.BUSINESS_DISCOVERY,
+        query_terms=["медицинские товары"],
+        rendered_query="медицинские товары Алматы",
+        locality=LocalityConstraint(city="Алматы", scope=SearchScope.CITYWIDE),
+        minimum_unique_candidates=20,
+        result_ttl_hours=24,
+        empty_page_limit=1,
+    ).model_copy(update={
+        "batch_candidate_limit": 2,
+        "search_cursor": "https://2gis.kz/almaty/search/page/2",
+    })
+    call = prepare_discovery(plan)
+    prompt = _executor(tmp_path, Path("/bin/true"))._build_prompt(call)
+    trusted = prompt.split("UNTRUSTED_BROWSER_REQUEST_JSON:\n", maxsplit=1)[0]
+
+    assert "inspect exactly one results page" in prompt
+    assert "up to 20 readable card descriptors" in prompt
+    assert "there is no minimum card target" in prompt
+    assert "Do not open cards" in prompt
+    assert "Do not scroll or issue coordinate gestures" in prompt
+    assert "Continue this source search from the supplied search_cursor URL first" in prompt
+    assert "return that exact HTTPS URL as next_cursor" in prompt
+    assert "inspect at most five pages" not in trusted
+    assert "minimum_unique_candidates" not in trusted
+    assert "click its public Show phone control" not in trusted
+    assert "TRUSTED_TARGET_RESULT_SCHEMA_JSON" in prompt
+    assert '"cards"' in prompt
+
+
+@pytest.mark.parametrize("stage", ["read_card", "read_contacts"])
+def test_card_stage_prompt_uses_exact_url_and_one_candidate(tmp_path, stage: str):
+    plan = SourcePlan(
+        item_index=0,
+        source=ResearchSource.TWO_GIS,
+        purpose=ResearchPurpose.BUSINESS_DISCOVERY,
+        query_terms=["медицинские товары"],
+        rendered_query="https://2gis.kz/almaty/firm/12345",
+        locality=LocalityConstraint(city="Алматы", scope=SearchScope.CITYWIDE),
+        minimum_unique_candidates=20,
+        result_ttl_hours=24,
+        empty_page_limit=1,
+    ).model_copy(update={"batch_candidate_limit": 2})
+    base = StructuredBrowserProvider(StubExecutor()).prepare_supplier_search(plan)
+    payload = json.loads(base.untrusted_request_json)
+    payload["execution_stage"] = stage
+    request = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    call = base.model_copy(update={
+        "untrusted_request_json": request,
+        "request_sha256": hashlib.sha256(request.encode()).hexdigest(),
+    })
+    prompt = _executor(tmp_path, Path("/bin/true"))._build_prompt(call)
+    trusted = prompt.split("UNTRUSTED_BROWSER_REQUEST_JSON:\n", maxsplit=1)[0]
+
+    assert f"{stage} stage: open only the exact rendered_query URL" in prompt
+    assert "return exactly one candidate for that card" in prompt
+    assert "Do not search, browse result pages, or open any other card" in prompt
+    assert "inspect at most five pages" not in trusted
+    assert "minimum_unique_candidates" not in trusted
+    if stage == "read_card":
+        assert "Do not click contact controls" in prompt
+    else:
+        assert "concatenate the digits without spaces" in prompt
+        assert "Set contact_discovery_reason precisely" in prompt
+        assert "provider_timeout" in prompt
 
 
 def test_constructor_rejects_mcp_environment_block(tmp_path):
@@ -260,6 +443,59 @@ async def test_timeout_terminates_process_group(tmp_path):
 
     with pytest.raises(RetryableProviderError, match="timeout"):
         await executor.execute(_call())
+
+
+@pytest.mark.asyncio
+async def test_attempt_receipt_is_durable_and_contains_only_safe_metadata(tmp_path, monkeypatch):
+    executable = _write_executable(tmp_path / "fake-agy", "pass\n")
+    diagnostics = tmp_path / "provider-attempts"
+    executor = _executor(tmp_path, executable, diagnostics_root=diagnostics)
+
+    async def invoke(prompt):
+        assert "UNTRUSTED_BROWSER_REQUEST_JSON" in prompt
+        return {"candidates": [], "pages_examined": 1, "access_issue": None}
+
+    monkeypatch.setattr(executor, "_invoke", invoke)
+    await executor.execute(_call())
+
+    receipts = list(diagnostics.glob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["operation"] == "resolve_locality"
+    assert receipt["source"] == "2gis"
+    assert receipt["status"] == "succeeded"
+    assert receipt["page_count"] == 1
+    assert receipt["request_sha256"]
+    assert "prompt" not in receipt and "token" not in receipts[0].read_text().lower()
+    assert receipts[0].stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_repeated_captcha_uses_cooldown_without_reporting_absence(
+    tmp_path, monkeypatch,
+):
+    executable = _write_executable(tmp_path / "fake-agy", "pass\n")
+    executor = _executor(
+        tmp_path,
+        executable,
+        captcha_cooldown_seconds=900,
+    )
+    calls = 0
+
+    async def invoke(_prompt):
+        nonlocal calls
+        calls += 1
+        return {"candidates": [], "pages_examined": 0, "access_issue": "captcha"}
+
+    monkeypatch.setattr(executor, "_invoke", invoke)
+    first = await executor.execute(_call())
+    second = await executor.execute(_call())
+    third = await executor.execute(_call())
+
+    assert executor.captcha_cooldown_seconds == 900
+    assert calls == 2
+    assert first["access_issue"] == second["access_issue"] == third["access_issue"] == "captcha"
+    assert third["pages_examined"] == 0
 
 
 @pytest.mark.asyncio

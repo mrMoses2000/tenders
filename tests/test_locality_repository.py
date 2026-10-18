@@ -74,6 +74,8 @@ class _Connection:
         self.owner_active = True
         self.resolution: dict[str, Any] | None = None
         self.insert_args: tuple[Any, ...] | None = None
+        self.clarification_registered = False
+        self.clarification_dismissed = False
 
     def transaction(self) -> _Transaction:
         return _Transaction()
@@ -105,6 +107,12 @@ class _Connection:
         return 1
 
     async def execute(self, sql: str, *args: Any) -> str:
+        if "INSERT INTO clarifications" in sql:
+            self.clarification_registered = True
+            return "INSERT 0 1"
+        if "UPDATE clarifications" in sql:
+            self.clarification_dismissed = True
+            return "UPDATE 1"
         if "INSERT INTO locality_resolutions" in sql:
             self.insert_args = args
             self.resolution = {
@@ -184,6 +192,7 @@ async def test_resolved_commit_is_atomic_storage_and_exact_prepare_payload(
     assert outcome.newly_persisted is True
     assert outcome.status == LocalityResolutionStatus.RESOLVED
     assert connection.case_status == "ready"
+    assert connection.clarification_dismissed
     assert connection.insert_args is not None
     assert connection.insert_args[9] == [_resolved().candidates[0].model_dump(mode="json")]
     assert len(connection.insert_args[10]) == 64  # candidates_sha256
@@ -250,6 +259,7 @@ async def test_ambiguous_commit_keeps_case_blocked_and_enqueues_notice(
 
     assert outcome.followup_kind == "telegram_clarification"
     assert connection.case_status == "needs_clarification"
+    assert connection.clarification_registered
     assert outbox[0]["event_type"] == "telegram.send_message"
     assert outbox[0]["payload"] == {
         "chat_id": context.telegram_chat_id,

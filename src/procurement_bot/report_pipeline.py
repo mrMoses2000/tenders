@@ -4,25 +4,21 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 
-from procurement_bot.evaluation import (
-    OfferAssessment,
-    RequirementCheck,
-    RequirementStatus,
-    TechnicalStatus,
-    evaluate_and_rank,
-)
+from procurement_bot.offer_comparison import rank_goods_offers
+from procurement_bot.offer_technical import load_case_technical_reviews, technical_states
+from procurement_bot.pipeline_metrics import load_pipeline_health, load_pipeline_metrics
 from procurement_bot.queue import enqueue_outbox, stable_key
 from procurement_bot.report_artifacts import persist_report_artifact
 from procurement_bot.reporting import (
     ProcurementReport,
     ReportEvidence,
+    ReportItem,
     SupplierReportCard,
     render_report_html,
 )
@@ -56,6 +52,8 @@ async def build_case_report(
     results_root: Path,
     case_id: UUID,
     research_run_id: UUID | None = None,
+    refresh_key: str | None = None,
+    partial_research_snapshot: bool = False,
 ) -> ReportBuildResult:
     """Build one conservative HTML report and publish its metadata atomically.
 
@@ -68,6 +66,11 @@ async def build_case_report(
         raise TypeError("case_id must be a UUID")
     if research_run_id is not None and not isinstance(research_run_id, UUID):
         raise TypeError("research_run_id must be a UUID or None")
+    if refresh_key is not None and (not refresh_key.strip() or len(refresh_key) > 200):
+        raise ValueError("refresh_key must be a short nonempty value")
+
+    if partial_research_snapshot and not refresh_key:
+        raise ValueError("partial research report requires a distinct refresh key")
 
     async with connection.transaction():
         await connection.execute(
@@ -94,9 +97,33 @@ async def build_case_report(
             connection,
             case_id=case_id,
             research_run_id=research_run_id,
+            allow_running=partial_research_snapshot,
         )
         selected_run_id = run["id"] if run is not None else None
-        event_key = stable_key("workflow.report-built", case_id, selected_run_id or "no-run")
+        scope_revision = (
+            await connection.fetchrow(
+                "SELECT city,preferred_area_text,revision_sha256 FROM research_scope_revisions "
+                "WHERE research_run_id=$1 ORDER BY revision DESC LIMIT 1",
+                selected_run_id,
+            )
+            if selected_run_id is not None
+            else None
+        )
+        if scope_revision is not None:
+            case = {
+                **dict(case),
+                "effective_search_scope_label": (
+                    f"Весь город {scope_revision['city']}; приоритет: "
+                    f"{scope_revision['preferred_area_text']}"
+                ),
+            }
+        event_key = stable_key(
+            "workflow.report-built",
+            case_id,
+            selected_run_id or "no-run",
+            *((scope_revision["revision_sha256"],) if scope_revision else ()),
+            *((refresh_key,) if refresh_key else ()),
+        )
         existing = await _load_existing_result(
             connection,
             case_id=case_id,
@@ -105,31 +132,30 @@ async def build_case_report(
         )
         if existing is not None:
             return existing
-        if case["status"] != "evaluating":
+        allowed_statuses = (
+            {"evaluating", "contacting", "report_ready", "selected"}
+            if refresh_key
+            else {"evaluating"}
+        )
+        if partial_research_snapshot:
+            allowed_statuses = {*allowed_statuses, "researching"}
+        if case["status"] not in allowed_statuses:
             raise ReportBuildRejected("procurement case is not ready for reporting")
 
         items = await connection.fetch(
             """
-            SELECT id,line_number,name,specification_text,quantity,unit,
-                analogs_allowed,status
-            FROM request_items
-            WHERE case_id=$1
-            ORDER BY line_number,id
+            SELECT i.id,i.line_number,i.name,i.specification_text,i.quantity,i.unit,
+                i.analogs_allowed,i.status,f.tender_unit_price_private,
+                COALESCE(f.currency,'KZT') AS tender_currency
+            FROM request_items i
+            LEFT JOIN request_item_financials f ON f.request_item_id=i.id
+            WHERE i.case_id=$1 ORDER BY i.line_number,i.id
             """,
             case_id,
         )
         if not items:
             raise ReportBuildRejected("procurement case has no current request items")
-        item_ids = [item["id"] for item in items]
-        requirements = await connection.fetch(
-            """
-            SELECT request_item_id,requirement_key,is_hard,source_pointer
-            FROM item_requirements
-            WHERE request_item_id=ANY($1::uuid[])
-            ORDER BY request_item_id,requirement_key,source_pointer,id
-            """,
-            item_ids,
-        )
+        requirements, technical_reviews = await load_case_technical_reviews(connection, case_id)
         offers = await connection.fetch(
             """
             SELECT
@@ -139,24 +165,188 @@ async def build_case_report(
                 ri.specification_text,ri.quantity,ri.unit,ri.analogs_allowed,
                 location.city AS location_city,location.address_text,
                 location.district,location.market_name,location.pavilion,
-                observation.price_amount,observation.currency,observation.price_unit,
-                observation.availability_status,observation.vat_status,
-                observation.delivery_status,observation.observed_at,
-                evidence.title AS evidence_title,
-                evidence.source_locator,evidence.source_url
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,price_amount,value}','')::numeric
+                     ELSE priced.price_amount END AS price_amount,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,currency,value}'
+                     ELSE priced.currency END AS currency,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,price_unit,value}'
+                     ELSE COALESCE(terms.price_unit,priced.price_unit) END AS price_unit,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,pack_qty,value}','')::numeric
+                     ELSE COALESCE(terms.pack_qty,priced.pack_qty) END AS pack_qty,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,moq,value}','')::numeric
+                     ELSE COALESCE(terms.moq,priced.moq) END AS moq,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,order_multiple,value}','')::numeric
+                     ELSE COALESCE(terms.order_multiple,priced.order_multiple)
+                END AS order_multiple,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(snapshot.snapshot #>> '{facts,available_qty,value}','')::numeric
+                     ELSE stock.available_qty END AS available_qty,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN COALESCE(
+                         snapshot.snapshot #>> '{facts,availability_status,value}','unknown'
+                     )
+                     ELSE COALESCE(stock.availability_status,'unknown') END AS availability_status,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,availability_status,source_type}'
+                     ELSE stock.source_type END AS stock_source_type,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN snapshot.snapshot #>> '{facts,price_amount,source_type}'
+                     ELSE priced.source_type END AS source_type,
+                contact.normalized_value AS supplier_phone,
+                contact.is_whatsapp_confirmed,
+                COALESCE(priced.vat_status,latest.vat_status) AS vat_status,
+                COALESCE(priced.delivery_status,latest.delivery_status) AS delivery_status,
+                CASE WHEN snapshot.id IS NOT NULL
+                     THEN NULLIF(
+                         snapshot.snapshot #>> '{facts,price_amount,observed_at}',''
+                     )::timestamptz
+                     ELSE COALESCE(priced.observed_at,latest.observed_at) END AS observed_at,
+                evidence.title AS evidence_title,evidence.source_locator,evidence.source_url
             FROM offers AS o
             JOIN request_items AS ri ON ri.id=o.request_item_id
             JOIN suppliers AS s ON s.id=o.supplier_id
             LEFT JOIN supplier_locations AS location ON location.id=o.supplier_location_id
+            LEFT JOIN quote_snapshot_current AS current_snapshot ON current_snapshot.offer_id=o.id
+            LEFT JOIN quote_snapshot_versions AS snapshot
+              ON snapshot.id=current_snapshot.snapshot_id
+             AND snapshot.offer_id=o.id
+             AND snapshot.request_item_id=ri.id
             LEFT JOIN LATERAL (
-                SELECT latest.*
-                FROM offer_observations AS latest
-                WHERE latest.offer_id=o.id
-                ORDER BY latest.observed_at DESC,latest.created_at DESC,latest.id DESC
-                LIMIT 1
-            ) AS observation ON TRUE
+                SELECT contact.normalized_value,
+                       CASE WHEN (
+                           EXISTS (
+                             SELECT 1 FROM research_queries rq
+                             JOIN research_runs rr ON rr.id=rq.research_run_id
+                             WHERE rq.id=contact_evidence.research_query_id
+                               AND rr.case_id=ri.case_id
+                           )
+                           OR EXISTS (
+                             SELECT 1 FROM offer_observations own_observation
+                             JOIN offers own_offer ON own_offer.id=own_observation.offer_id
+                             JOIN request_items own_item
+                               ON own_item.id=own_offer.request_item_id
+                             WHERE own_observation.source_evidence_id=contact_evidence.id
+                               AND own_item.case_id=ri.case_id
+                           )
+                           OR EXISTS (
+                             SELECT 1 FROM workflow_events enrichment
+                             WHERE enrichment.case_id=ri.case_id
+                               AND enrichment.event_type='supplier_contact_enrichment_result'
+                               AND enrichment.data->>'supplier_id'=contact.supplier_id::text
+                               AND (
+                                 (
+                                   enrichment.data ? 'contact_evidence_ids'
+                                   AND enrichment.data->'contact_evidence_ids'
+                                       @> jsonb_build_array(contact_evidence.id::text)
+                                 )
+                                 OR (
+                                   NOT (enrichment.data ? 'contact_evidence_ids')
+                                   AND enrichment.data->>'outcome'='contact_found'
+                                   AND enrichment.data->>'firm_id'=contact_evidence.external_id
+                                   AND contact_evidence.source_type='2gis'
+                                   AND (
+                                     contact_evidence.source_url=enrichment.data->>'card_url'
+                                     OR contact_evidence.source_url=
+                                          (enrichment.data->>'card_url') || '/'
+                                   )
+                                 )
+                               )
+                           )
+                       ) THEN contact.is_whatsapp_confirmed ELSE FALSE END
+                         AS is_whatsapp_confirmed
+                FROM supplier_contacts contact
+                JOIN source_evidence contact_evidence
+                  ON contact_evidence.id=contact.source_evidence_id
+                WHERE contact.supplier_id=o.supplier_id AND contact.active
+                  AND contact.contact_type IN ('phone','whatsapp')
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM research_queries rq
+                      JOIN research_runs rr ON rr.id=rq.research_run_id
+                      WHERE rq.id=contact_evidence.research_query_id
+                        AND rr.case_id=ri.case_id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM offer_observations own_observation
+                      JOIN offers own_offer ON own_offer.id=own_observation.offer_id
+                      JOIN request_items own_item ON own_item.id=own_offer.request_item_id
+                      WHERE own_observation.source_evidence_id=contact_evidence.id
+                        AND own_item.case_id=ri.case_id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM workflow_events enrichment
+                      WHERE enrichment.case_id=ri.case_id
+                        AND enrichment.event_type='supplier_contact_enrichment_result'
+                        AND enrichment.data->>'supplier_id'=contact.supplier_id::text
+                        AND (
+                          (
+                            enrichment.data ? 'contact_evidence_ids'
+                            AND enrichment.data->'contact_evidence_ids'
+                                @> jsonb_build_array(contact_evidence.id::text)
+                          )
+                          OR (
+                            NOT (enrichment.data ? 'contact_evidence_ids')
+                            AND enrichment.data->>'outcome'='contact_found'
+                            AND enrichment.data->>'firm_id'=contact_evidence.external_id
+                            AND contact_evidence.source_type='2gis'
+                            AND (
+                              contact_evidence.source_url=enrichment.data->>'card_url'
+                              OR contact_evidence.source_url=
+                                   (enrichment.data->>'card_url') || '/'
+                            )
+                          )
+                        )
+                    )
+                  )
+                ORDER BY contact.is_whatsapp_confirmed DESC,
+                         contact.first_seen_at DESC,contact.id DESC LIMIT 1
+            ) contact ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT ob.* FROM offer_observations ob WHERE ob.offer_id=o.id
+                ORDER BY ob.observed_at DESC,ob.created_at DESC,ob.id DESC LIMIT 1
+            ) latest ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT ob.* FROM offer_observations ob
+                WHERE ob.offer_id=o.id AND ob.price_amount IS NOT NULL
+                ORDER BY ob.observed_at DESC,ob.created_at DESC,ob.id DESC LIMIT 1
+            ) priced ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    (array_agg(ob.price_unit ORDER BY ob.observed_at DESC,
+                        ob.created_at DESC,ob.id DESC)
+                        FILTER (WHERE ob.price_unit IS NOT NULL))[1] AS price_unit,
+                    (array_agg(ob.pack_qty ORDER BY ob.observed_at DESC,
+                        ob.created_at DESC,ob.id DESC)
+                        FILTER (WHERE ob.pack_qty IS NOT NULL))[1] AS pack_qty,
+                    (array_agg(ob.moq ORDER BY ob.observed_at DESC,
+                        ob.created_at DESC,ob.id DESC)
+                        FILTER (WHERE ob.moq IS NOT NULL))[1] AS moq,
+                    (array_agg(ob.order_multiple ORDER BY ob.observed_at DESC,
+                        ob.created_at DESC,ob.id DESC)
+                        FILTER (WHERE ob.order_multiple IS NOT NULL))[1] AS order_multiple
+                FROM offer_observations ob
+                WHERE ob.offer_id=o.id AND ob.observed_at>=priced.observed_at
+                  AND ob.source_type IN ('supplier_message','manual')
+            ) terms ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT ob.available_qty,ob.availability_status,ob.source_type
+                FROM offer_observations ob
+                WHERE ob.offer_id=o.id AND
+                  (ob.availability_status<>'unknown' OR ob.available_qty IS NOT NULL)
+                ORDER BY ob.observed_at DESC,ob.created_at DESC,ob.id DESC LIMIT 1
+            ) stock ON TRUE
             LEFT JOIN source_evidence AS evidence
-                ON evidence.id=observation.source_evidence_id
+                ON evidence.id=CASE WHEN snapshot.id IS NOT NULL
+                    THEN NULLIF(
+                        snapshot.snapshot #>> '{facts,price_amount,source_evidence_id}',''
+                    )::uuid
+                    ELSE COALESCE(priced.source_evidence_id,latest.source_evidence_id) END
             WHERE ri.case_id=$1 AND o.status<>'withdrawn'
             ORDER BY ri.line_number,s.display_name,o.created_at,o.id
             """,
@@ -189,8 +379,50 @@ async def build_case_report(
                 (SELECT count(*) FROM case_suppliers AS supplier
                  WHERE NOT EXISTS (
                      SELECT 1 FROM supplier_contacts AS contact
+                     JOIN source_evidence contact_evidence
+                       ON contact_evidence.id=contact.source_evidence_id
                      WHERE contact.supplier_id=supplier.supplier_id
                        AND contact.active AND contact.contact_type='whatsapp'
+                       AND (
+                         EXISTS (
+                           SELECT 1 FROM research_queries rq
+                           JOIN research_runs rr ON rr.id=rq.research_run_id
+                           WHERE rq.id=contact_evidence.research_query_id
+                             AND rr.case_id=$1
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM offer_observations own_observation
+                           JOIN offers own_offer ON own_offer.id=own_observation.offer_id
+                           JOIN request_items own_item
+                             ON own_item.id=own_offer.request_item_id
+                           WHERE own_observation.source_evidence_id=contact_evidence.id
+                             AND own_item.case_id=$1
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM workflow_events enrichment
+                           WHERE enrichment.case_id=$1
+                             AND enrichment.event_type='supplier_contact_enrichment_result'
+                             AND enrichment.data->>'supplier_id'=contact.supplier_id::text
+                             AND (
+                               (
+                                 enrichment.data ? 'contact_evidence_ids'
+                                 AND enrichment.data->'contact_evidence_ids'
+                                     @> jsonb_build_array(contact_evidence.id::text)
+                               )
+                               OR (
+                                 NOT (enrichment.data ? 'contact_evidence_ids')
+                                 AND enrichment.data->>'outcome'='contact_found'
+                                 AND enrichment.data->>'firm_id'=contact_evidence.external_id
+                                 AND contact_evidence.source_type='2gis'
+                                 AND (
+                                   contact_evidence.source_url=enrichment.data->>'card_url'
+                                   OR contact_evidence.source_url=
+                                        (enrichment.data->>'card_url') || '/'
+                                 )
+                               )
+                             )
+                         )
+                       )
                  )) AS whatsapp_unavailable,
                 (SELECT count(*) FROM outbox_events AS event
                  WHERE event.event_type='whatsapp.send_text' AND event.status='dead'
@@ -199,16 +431,66 @@ async def build_case_report(
             case_id,
         )
 
-        generated_at = _generated_at(case, run)
+        generated_at = datetime.now(UTC) if refresh_key else _generated_at(case, run)
         report, summary = _build_report_projection(
             case=case,
             items=items,
             requirements=requirements,
+            technical_reviews=technical_reviews,
             offers=offers,
             suppliers_responded=suppliers_responded,
             contact_metrics=contact_metrics,
             generated_at=generated_at,
         )
+        report.items = [
+            ReportItem(
+                item_number=int(item["line_number"]),
+                item_name=str(item["name"]),
+                quantity=item["quantity"],
+                unit=item["unit"],
+                specification_text=item["specification_text"],
+            )
+            for item in items
+        ]
+        if partial_research_snapshot:
+            covered = len({row["request_item_id"] for row in offers})
+            contact_covered = len(
+                {row["request_item_id"] for row in offers if row["supplier_phone"]}
+            )
+            report.notice = (
+                f"Промежуточный срез. Сохранённые лиды заявки: по {covered} из {len(items)} "
+                f"позиций; телефоны указаны у лидов по {contact_covered} позициям. "
+                "Это сохранённые предложения заявки и они могут относиться к более ранним "
+                "поискам, а не к текущему запуску. "
+                "Поиск ещё не завершён. Контактный лид и публичная цена не подтверждают "
+                "наличие нужного товара, количество или соответствие техспеку."
+            )
+            summary.update(
+                partial_research_snapshot=True,
+                items_total=len(items),
+                items_with_leads=covered,
+                items_with_contacts=contact_covered,
+            )
+        report.operational_metrics = await load_pipeline_metrics(connection, case_id)
+        report.operational_metrics["comparable_quotes"] = summary["comparable_quotes"]
+        report.operational_status = await load_pipeline_health(connection, case_id)
+        account_status = report.operational_status.get("account", {})
+        ingress_status = report.operational_status.get("ingress", {})
+        report.operational_metrics.update(
+            accounts=int(account_status.get("accounts", 0)),
+            held=int(account_status.get("held", 0)),
+            circuits_open=int(account_status.get("circuits_open", 0)),
+            restricted=int(account_status.get("restricted", 0)),
+            state_unknown=int(account_status.get("state_unknown", 0)),
+            state_stale=int(account_status.get("state_stale", 0)),
+            outbound_allowed=int(account_status.get("outbound_allowed", 0)),
+            unresolved_reservations=int(account_status.get("unresolved_reservations", 0)),
+            ingress_accepted_7d=int(ingress_status.get("accepted_7d", 0)),
+            ingress_ignored_7d=int(ingress_status.get("ignored_7d", 0)),
+            ingress_rejected_7d=int(ingress_status.get("rejected_7d", 0)),
+        )
+        summary["operational_metrics"] = report.operational_metrics
+        summary["operational_status"] = report.operational_status
         html = render_report_html(report)
         artifact = await persist_report_artifact(
             connection,
@@ -221,18 +503,17 @@ async def build_case_report(
                 "report-artifact",
                 case_id,
                 selected_run_id or "no-run",
+                *((refresh_key,) if refresh_key else ()),
             ),
         )
-        transitioned = await connection.execute(
-            """
-            UPDATE procurement_cases
-            SET status='report_ready',updated_at=now()
-            WHERE id=$1 AND status='evaluating'
-            """,
-            case_id,
-        )
-        if transitioned != "UPDATE 1":
-            raise ReportBuildRejected("case changed before report publication")
+        if case["status"] == "evaluating" and not partial_research_snapshot:
+            transitioned = await connection.execute(
+                """UPDATE procurement_cases SET status='report_ready',updated_at=now()
+                   WHERE id=$1 AND status='evaluating'""",
+                case_id,
+            )
+            if transitioned != "UPDATE 1":
+                raise ReportBuildRejected("case changed before report publication")
 
         event_data = {
             "artifact_id": str(artifact.id),
@@ -265,10 +546,49 @@ async def build_case_report(
                 "chat_id": int(case["telegram_id"]),
                 "storage_path": artifact.storage_path,
                 "filename": "otchet-po-zayavke.html",
-                "caption": _telegram_announcement(summary),
+                "caption": (
+                    (
+                        "Промежуточный отчёт — поиск ещё не завершён.\n"
+                        if partial_research_snapshot
+                        else ""
+                    )
+                    + _telegram_announcement(summary)
+                ),
             },
             idempotency_key=stable_key("telegram.report-ready", artifact.id),
         )
+        for item in items:
+            ranked_cards = sorted(
+                (
+                    card
+                    for card in report.cards
+                    if card.item_number == item["line_number"] and card.rank is not None
+                ),
+                key=lambda card: card.rank or 10**9,
+            )[:5]
+            if not ranked_cards:
+                continue
+            lines = [
+                f"Позиция {item['line_number']}: {item['name']}",
+                "Лучшие проверенные цены товара (без доставки и расчёта НДС):",
+            ]
+            for card in ranked_cards:
+                difference = (
+                    f"; разница с тендером {card.tender_difference:,.2f} KZT"
+                    if card.tender_difference is not None
+                    else ""
+                )
+                lines.append(
+                    f"{card.rank}. {card.supplier_name}: {card.goods_total:,.2f} "
+                    f"{card.currency}{difference}"
+                )
+            lines.append("Карточки поставщиков и доказательства — в приложенном отчёте.")
+            await enqueue_outbox(
+                connection,
+                event_type="telegram.send_message",
+                payload={"chat_id": int(case["telegram_id"]), "text": "\n".join(lines)[:3500]},
+                idempotency_key=stable_key("telegram.report-top-five", artifact.id, item["id"]),
+            )
         return ReportBuildResult(
             case_id=case_id,
             research_run_id=selected_run_id,
@@ -289,6 +609,7 @@ async def _load_research_run(
     *,
     case_id: UUID,
     research_run_id: UUID | None,
+    allow_running: bool = False,
 ) -> Mapping[str, Any] | None:
     if research_run_id is None:
         return await connection.fetchrow(
@@ -300,7 +621,7 @@ async def _load_research_run(
             LIMIT 1
             """,
             case_id,
-            list(_TERMINAL_RESEARCH_STATUSES),
+            [*_TERMINAL_RESEARCH_STATUSES, *(["running"] if allow_running else [])],
         )
     run = await connection.fetchrow(
         """
@@ -314,7 +635,7 @@ async def _load_research_run(
         raise ReportBuildRejected("research run does not exist")
     if run["case_id"] != case_id:
         raise ReportBuildRejected("research run belongs to a different case")
-    if run["status"] not in _TERMINAL_RESEARCH_STATUSES:
+    if run["status"] not in {*_TERMINAL_RESEARCH_STATUSES, *(["running"] if allow_running else [])}:
         raise ReportBuildRejected("research run is not complete enough for reporting")
     return run
 
@@ -376,59 +697,71 @@ def _build_report_projection(
     case: Mapping[str, Any],
     items: Sequence[Mapping[str, Any]],
     requirements: Sequence[Mapping[str, Any]],
+    technical_reviews: Sequence[Mapping[str, Any]],
     offers: Sequence[Mapping[str, Any]],
     suppliers_responded: int,
     contact_metrics: Mapping[str, Any],
     generated_at: datetime,
 ) -> tuple[ProcurementReport, dict[str, Any]]:
-    requirement_names: dict[UUID, list[str]] = {}
-    for requirement in requirements:
-        requirement_names.setdefault(requirement["request_item_id"], []).append(
-            str(requirement["requirement_key"])
-        )
-
-    assessments = [
-        _assessment(row, requirement_names.get(row["request_item_id"], []))
+    technical_by_offer = technical_states(offers, requirements, technical_reviews)
+    item_by_id = {row["id"]: row for row in items}
+    comparison_rows = [
+        {
+            **dict(row),
+            "tender_unit_price_private": item_by_id[row["request_item_id"]][
+                "tender_unit_price_private"
+            ],
+            "tender_currency": item_by_id[row["request_item_id"]]["tender_currency"],
+            "technical_state": technical_by_offer[str(row["offer_id"])],
+        }
         for row in offers
     ]
-    evaluated = evaluate_and_rank(assessments)
-    evaluation_by_offer = {value.offer.offer_id: value for value in evaluated}
+    comparisons = {value.offer_id: value for value in rank_goods_offers(comparison_rows)}
     cards: list[SupplierReportCard] = []
     for row in offers:
-        value = evaluation_by_offer[str(row["offer_id"])]
+        value = comparisons[str(row["offer_id"])]
         cards.append(
             SupplierReportCard(
+                item_number=int(row["line_number"]),
+                item_name=str(row["item_name"]),
                 supplier_name=str(row["supplier_name"]),
+                supplier_phone=row["supplier_phone"],
+                whatsapp_confirmed=bool(row["is_whatsapp_confirmed"]),
                 location=_location(row),
-                product_name=(
-                    str(row["supplier_product_name"]).strip()
-                    or str(row["item_name"])
+                product_name=(str(row["supplier_product_name"]).strip() or str(row["item_name"])),
+                technical_status=_technical_label(value.technical_state),
+                availability=_availability_label(
+                    row["availability_status"], row["stock_source_type"]
                 ),
-                technical_status=_technical_label(value.technical_status),
-                availability=_availability_label(row["availability_status"]),
                 price=row["price_amount"],
                 currency=str(row["currency"] or "KZT"),
-                rank=value.rank,
+                price_unit=row["price_unit"],
+                required_quantity=row["quantity"],
+                available_quantity=row["available_qty"],
+                purchased_quantity=value.purchased_quantity,
+                goods_total=value.goods_total,
+                tender_total=value.tender_total,
+                tender_difference=value.tender_difference,
+                price_state={
+                    "supplier_confirmed": "цена из ответа поставщика",
+                    "operator_recorded": "цена внесена оператором",
+                    "published": "публичная цена",
+                }.get(value.price_state, "цена не получена"),
+                rank=value.rank if value.rank is not None and value.rank <= 5 else None,
                 evidence=_report_evidence(row),
-                questions_remaining=_questions_remaining(
-                    row,
-                    value.technical_status,
-                    requirement_names.get(row["request_item_id"], []),
-                ),
+                questions_remaining=_questions_remaining(value.blockers),
             )
         )
 
     suppliers_found = len({row["supplier_id"] for row in offers})
-    exact_matches = sum(
-        value.technical_status == TechnicalStatus.MATCH for value in evaluated
-    )
+    exact_matches = sum(state == "verified" for state in technical_by_offer.values())
     title = str(case["title"] or "").strip() or _items_title(items)
     report = ProcurementReport(
         case_reference=str(case["id"])[:8],
         title=title[:500],
         city=str(case["city"] or "").strip() or "Город не указан",
         search_scope=(
-            str(case["search_area_text"] or "").strip()
+            str(case.get("effective_search_scope_label") or case["search_area_text"] or "").strip()
             or "Область поиска не указана"
         ),
         suppliers_found=suppliers_found,
@@ -447,6 +780,10 @@ def _build_report_projection(
         "whatsapp_unavailable": int(contact_metrics["whatsapp_unavailable"] or 0),
         "whatsapp_failed": int(contact_metrics["whatsapp_failed"] or 0),
         "exact_matches": exact_matches,
+        "comparable_quotes": sum(
+            value.rank is not None and value.price_state == "supplier_confirmed"
+            for value in comparisons.values()
+        ),
         "offers_total": len(cards),
         "items_total": len(items),
         "generated_at": generated_at.isoformat(),
@@ -454,80 +791,26 @@ def _build_report_projection(
     return report, summary
 
 
-def _assessment(row: Mapping[str, Any], requirement_names: Sequence[str]) -> OfferAssessment:
-    status = str(row["offer_status"])
-    if status == "exact":
-        requirement_status = RequirementStatus.CONFIRMED_MATCH
-    elif status == "mismatch":
-        requirement_status = RequirementStatus.CONFIRMED_MISMATCH
-    else:
-        requirement_status = RequirementStatus.UNKNOWN
-    label = "Соответствие технической спецификации"
-    if requirement_names:
-        label = f"Техническая спецификация ({len(requirement_names)} требований)"
-    availability = str(row["availability_status"] or "unknown")
-    availability_confirmed = (
-        True
-        if availability in {"in_stock", "in_stock_unquantified"}
-        else False
-        if availability == "out_of_stock"
-        else None
-    )
-    evidence_level = Decimal("0")
-    if row["observed_at"] is not None:
-        evidence_level = Decimal("0.7")
-    if row["source_url"]:
-        evidence_level = Decimal("0.9")
-    return OfferAssessment(
-        offer_id=str(row["offer_id"]),
-        supplier_id=str(row["supplier_id"]),
-        supplier_name=str(row["supplier_name"]),
-        product_name=(str(row["supplier_product_name"]).strip() or str(row["item_name"])),
-        availability_confirmed=availability_confirmed,
-        # A quoted unit/package price is not a landed total. Keeping this unknown
-        # prevents a deceptively precise rank until MOQ, VAT and logistics are known.
-        total_cost=None,
-        currency=str(row["currency"]) if row["currency"] else None,
-        requirement_checks=[
-            RequirementCheck(
-                requirement=label,
-                hard=True,
-                status=requirement_status,
-                evidence=(
-                    f"Persisted offer status: {status}"
-                    if status in {"exact", "mismatch"}
-                    else None
-                ),
-            )
-        ],
-        evidence_quality=float(evidence_level),
-    )
+_BLOCKER_QUESTIONS = {
+    "technical_not_verified": "Проверить ТЗ и сохранить результат по этому товару.",
+    "price_not_confirmed": "Уточнить действующую цену у поставщика.",
+    "required_quantity_unknown": "Указать требуемое количество.",
+    "price_unknown": "Получить цену товара с валютой.",
+    "currency_not_comparable": "Уточнить цену в валюте тендера.",
+    "stock_quantity_unknown": "Подтвердить доступное количество у поставщика.",
+    "stock_not_confirmed": "Подтвердить рекламируемый остаток у поставщика.",
+    "out_of_stock": "Товара сейчас нет в наличии.",
+    "pack_quantity_unknown": "Уточнить количество единиц в упаковке.",
+    "price_unit_unknown_or_mismatch": "Уточнить единицу цены и её соответствие позиции.",
+    "order_multiple_unknown": "Уточнить кратность заказа.",
+    "insufficient_stock": "Уточнить, когда будет доступна вся нужная партия.",
+    "invalid_moq": "Исправить минимальную партию.",
+    "invalid_order_multiple": "Исправить кратность заказа.",
+}
 
 
-def _questions_remaining(
-    row: Mapping[str, Any],
-    technical_status: TechnicalStatus,
-    requirement_names: Sequence[str],
-) -> list[str]:
-    questions: list[str] = []
-    if technical_status == TechnicalStatus.NEEDS_CONFIRMATION:
-        detail = ", ".join(requirement_names[:5])
-        suffix = f" ({detail})" if detail else ""
-        questions.append(f"Подтвердить соответствие технической спецификации{suffix}.")
-    elif technical_status == TechnicalStatus.MISMATCH and row["analogs_allowed"] is not False:
-        questions.append("Уточнить, допустим ли предложенный аналог с учётом несоответствия.")
-    availability = str(row["availability_status"] or "unknown")
-    if availability not in {"in_stock", "in_stock_unquantified", "out_of_stock"}:
-        questions.append("Подтвердить фактическое наличие и срок готовности.")
-    if row["price_amount"] is None:
-        questions.append("Уточнить цену после подтверждения характеристик.")
-    elif not row["price_unit"]:
-        questions.append("Уточнить, за какую единицу указана цена.")
-    if str(row["vat_status"] or "unknown") == "unknown":
-        questions.append("Уточнить, включён ли НДС.")
-    if str(row["delivery_status"] or "unknown") == "unknown":
-        questions.append("Уточнить условия и стоимость доставки или самовывоза.")
-    return questions
+def _questions_remaining(blockers: Sequence[str]) -> list[str]:
+    return [_BLOCKER_QUESTIONS.get(code, code) for code in blockers]
 
 
 def _report_evidence(row: Mapping[str, Any]) -> list[ReportEvidence]:
@@ -557,7 +840,11 @@ def _location(row: Mapping[str, Any]) -> str | None:
     return ", ".join(parts)[:1000] or None
 
 
-def _availability_label(value: object) -> str:
+def _availability_label(value: object, source_type: object) -> str:
+    if str(value or "unknown") == "unknown":
+        return "наличие не подтверждено"
+    if source_type not in {"supplier_message", "manual"}:
+        return "наличие указано в источнике, поставщиком не подтверждено"
     return {
         "in_stock": "в наличии (количество подтверждено)",
         "in_stock_unquantified": "в наличии (количество не подтверждено)",
@@ -566,11 +853,11 @@ def _availability_label(value: object) -> str:
     }.get(str(value or "unknown"), "наличие не подтверждено")
 
 
-def _technical_label(value: TechnicalStatus) -> str:
+def _technical_label(value: str) -> str:
     return {
-        TechnicalStatus.MATCH: "соответствие подтверждено",
-        TechnicalStatus.MISMATCH: "подтверждено несоответствие",
-        TechnicalStatus.NEEDS_CONFIRMATION: "требуется подтверждение",
+        "verified": "ТЗ проверено оператором",
+        "mismatch": "несоответствие ТЗ",
+        "needs_confirmation": "ТЗ не проверено",
     }[value]
 
 

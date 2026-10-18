@@ -10,6 +10,7 @@ import pytest
 
 import procurement_bot.whatsapp_inbound as inbound_module
 from procurement_bot.conversations import LedgerWriteResult
+from procurement_bot.supplier_media import WhatsAppMediaInput
 from procurement_bot.whatsapp_inbound import (
     AuthenticatedWhatsAppInbound,
     WhatsAppInboundConflict,
@@ -42,6 +43,7 @@ class _Connection:
         self.conversations = conversations if conversations is not None else []
         self.existing_message = existing_message
         self.transaction_count = 0
+        self.conversation_query: tuple[str, tuple[object, ...]] | None = None
 
     def transaction(self) -> _Transaction:
         self.transaction_count += 1
@@ -58,6 +60,7 @@ class _Connection:
         if "FROM supplier_contacts" in sql:
             return self.contacts
         if "FROM supplier_conversations" in sql:
+            self.conversation_query = (sql, _args)
             return self.conversations
         raise AssertionError(sql)
 
@@ -66,7 +69,7 @@ def _event(text: str = "Есть в наличии") -> AuthenticatedWhatsAppInb
     return AuthenticatedWhatsAppInbound(
         provider_event_id="event-42",
         session_name="procurement",
-        sender_phone="8 (700) 123-45-67",
+        sender_phone="8 (700) 000-00-03",
         provider_message_id="message-42",
         received_at=datetime(2026, 9, 22, 12, tzinfo=UTC),
         text=text,
@@ -89,8 +92,19 @@ def _install_webhook_stubs(
         captured["claim"] = (event_id, worker_id)
         return True
 
+    async def request_probe(_connection: object, session_name: str, *, reason: str) -> None:
+        captured["account_probe"] = (session_name, reason)
+
+    async def wake_pipeline(
+        _connection: object, *, conversation_id: UUID, reason: str
+    ) -> bool:
+        captured["pipeline_wake"] = (conversation_id, reason)
+        return True
+
     monkeypatch.setattr(inbound_module, "accept_webhook_event", accept)
     monkeypatch.setattr(inbound_module, "mark_webhook_processing", claim)
+    monkeypatch.setattr(inbound_module, "request_account_probe", request_probe)
+    monkeypatch.setattr(inbound_module, "wake_conversation_pipeline", wake_pipeline)
     return captured
 
 
@@ -108,7 +122,7 @@ async def test_known_sender_is_recorded_and_only_opaque_ids_are_enqueued(
         conversations=[
             {
                 "id": conversation_id,
-                "external_chat_id": "77001234567@c.us",
+                "external_chat_id": "77000000003@c.us",
                 "state": "waiting_availability",
                 "opted_out": False,
             }
@@ -136,9 +150,9 @@ async def test_known_sender_is_recorded_and_only_opaque_ids_are_enqueued(
         message_id=message_id,
         job_id=job_id,
     )
-    assert captured["webhook"].raw_payload["sender_phone"] == "+77001234567"
+    assert captured["webhook"].raw_payload["sender_phone"] == "+77000000003"
     assert captured["message"].text_content == "Есть в наличии"
-    assert captured["message"].external_chat_id == "77001234567@c.us"
+    assert captured["message"].external_chat_id == "77000000003@c.us"
     assert captured["job"]["kind"] == "process_supplier_reply"
     assert captured["job"]["payload"] == {
         "conversation_id": str(conversation_id),
@@ -146,7 +160,161 @@ async def test_known_sender_is_recorded_and_only_opaque_ids_are_enqueued(
     }
     assert "Есть" not in repr(captured["job"])
     assert "+7700" not in repr(captured["job"])
+    assert captured["account_probe"] == ("procurement", "supplier_inbound_received")
+    assert captured["pipeline_wake"] == (conversation_id, "whatsapp_inbound_received")
     assert connection.transaction_count == 1
+
+
+@pytest.mark.asyncio
+async def test_media_message_persists_work_and_enqueues_media_job_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_id = uuid4()
+    conversation_id = uuid4()
+    message_id = uuid4()
+    connection = _Connection(
+        contacts=[{"id": uuid4(), "supplier_id": uuid4()}],
+        conversations=[
+            {
+                "id": conversation_id,
+                "external_chat_id": "77000000003@c.us",
+                "state": "waiting_spec",
+                "opted_out": False,
+            }
+        ],
+    )
+    captured: dict[str, Any] = {}
+    _install_webhook_stubs(monkeypatch, event_id=event_id)
+    media = WhatsAppMediaInput(kind="image", url=None, mimetype="image/jpeg")
+    event = AuthenticatedWhatsAppInbound(
+        provider_event_id="image-event",
+        session_name="procurement",
+        sender_phone="+77000000003",
+        provider_message_id="image-message",
+        received_at=datetime(2026, 9, 22, 12, tzinfo=UTC),
+        text="",
+        media=media,
+    )
+
+    async def record(_connection: object, value: object) -> LedgerWriteResult:
+        captured["message"] = value
+        return LedgerWriteResult(id=message_id, created=True)
+
+    async def persist(_connection: object, **kwargs: object) -> bool:
+        captured["media"] = kwargs
+        return True
+
+    async def enqueue(_connection: object, **kwargs: object) -> UUID:
+        captured["job"] = kwargs
+        return uuid4()
+
+    monkeypatch.setattr(inbound_module, "record_inbound_message", record)
+    monkeypatch.setattr(inbound_module, "persist_supplier_message_media", persist)
+    monkeypatch.setattr(inbound_module, "enqueue_job", enqueue)
+
+    result = await accept_whatsapp_inbound(connection, event)  # type: ignore[arg-type]
+
+    assert result.disposition == WhatsAppInboundDisposition.PROCESSED
+    assert captured["message"].message_kind == "image"
+    assert captured["message"].text_content == "[Фотография поставщика]"
+    assert captured["message"].raw_payload["text"] == ""
+    assert captured["message"].raw_payload["media"]["url"] is None
+    assert captured["media"] == {"message_id": message_id, "media": media}
+    assert captured["job"]["kind"] == "process_supplier_media"
+    assert captured["job"]["payload"] == {
+        "conversation_id": str(conversation_id),
+        "message_id": str(message_id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_media_message_does_not_create_a_second_media_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_id = uuid4()
+    conversation_id = uuid4()
+    message_id = uuid4()
+    connection = _Connection(
+        contacts=[{"id": uuid4(), "supplier_id": uuid4()}],
+        conversations=[
+            {
+                "id": conversation_id,
+                "external_chat_id": "77000000003@c.us",
+                "state": "waiting_spec",
+                "opted_out": False,
+            }
+        ],
+    )
+    _install_webhook_stubs(monkeypatch, event_id=event_id)
+    event = AuthenticatedWhatsAppInbound(
+        provider_event_id="image-event-2",
+        session_name="procurement",
+        sender_phone="+77000000003",
+        provider_message_id="image-message-2",
+        received_at=datetime(2026, 9, 22, 12, tzinfo=UTC),
+        text="",
+        media=WhatsAppMediaInput(kind="audio", url=None),
+    )
+
+    async def record(_connection: object, _value: object) -> LedgerWriteResult:
+        return LedgerWriteResult(id=message_id, created=False)
+
+    async def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("duplicate messages must not persist media or enqueue work")
+
+    monkeypatch.setattr(inbound_module, "record_inbound_message", record)
+    monkeypatch.setattr(inbound_module, "persist_supplier_message_media", forbidden)
+    monkeypatch.setattr(inbound_module, "enqueue_job", forbidden)
+
+    result = await accept_whatsapp_inbound(connection, event)  # type: ignore[arg-type]
+
+    assert result.disposition == WhatsAppInboundDisposition.DUPLICATE
+    assert result.message_id == message_id
+    assert result.job_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_state", ["closed_no_reply", "complete"])
+async def test_terminal_target_accepts_late_webhook_for_durable_processing(
+    monkeypatch: pytest.MonkeyPatch,
+    conversation_state: str,
+) -> None:
+    event_id = uuid4()
+    conversation_id = uuid4()
+    message_id = uuid4()
+    connection = _Connection(
+        contacts=[{"id": uuid4(), "supplier_id": uuid4()}],
+        conversations=[
+            {
+                "id": conversation_id,
+                "external_chat_id": "77000000003@c.us",
+                "state": conversation_state,
+                "opted_out": False,
+            }
+        ],
+    )
+    captured = _install_webhook_stubs(monkeypatch, event_id=event_id)
+
+    async def record(_connection: object, value: object) -> LedgerWriteResult:
+        captured["message"] = value
+        return LedgerWriteResult(id=message_id, created=True)
+
+    async def enqueue(_connection: object, **kwargs: object) -> UUID:
+        captured["job"] = kwargs
+        return uuid4()
+
+    monkeypatch.setattr(inbound_module, "record_inbound_message", record)
+    monkeypatch.setattr(inbound_module, "enqueue_job", enqueue)
+
+    result = await accept_whatsapp_inbound(connection, _event())  # type: ignore[arg-type]
+
+    assert result.disposition == WhatsAppInboundDisposition.PROCESSED
+    assert result.conversation_id == conversation_id
+    assert captured["job"]["kind"] == "process_supplier_reply"
+    assert connection.conversation_query is not None
+    query, parameters = connection.conversation_query
+    assert "c.state NOT IN ('complete','closed_no_reply')" in query
+    assert parameters[2] == ["opted_out"]
 
 
 @pytest.mark.asyncio
@@ -161,8 +329,8 @@ async def test_opt_out_is_applied_before_internal_job_is_enqueued(
         conversations=[
             {
                 "id": conversation_id,
-                "external_chat_id": "77001234567@c.us",
-                "state": "waiting_spec",
+                "external_chat_id": "77000000003@c.us",
+                "state": "closed_no_reply",
                 "opted_out": False,
             }
         ],
@@ -185,6 +353,8 @@ async def test_opt_out_is_applied_before_internal_job_is_enqueued(
     await accept_whatsapp_inbound(connection, _event("Не пишите мне"))  # type: ignore[arg-type]
 
     assert order == ["opt_out_persisted", "job_enqueued"]
+    assert connection.conversation_query is not None
+    assert connection.conversation_query[1][3] is True
 
 
 @pytest.mark.asyncio
@@ -271,7 +441,7 @@ async def test_processed_retry_returns_existing_link_without_new_job(
         webhook_status="processed",
         existing_message={"id": message_id, "conversation_id": conversation_id},
     )
-    _install_webhook_stubs(monkeypatch, event_id=event_id, created=False)
+    captured = _install_webhook_stubs(monkeypatch, event_id=event_id, created=False)
 
     async def forbidden(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("terminal retry must not claim, append, or enqueue")
@@ -279,6 +449,8 @@ async def test_processed_retry_returns_existing_link_without_new_job(
     monkeypatch.setattr(inbound_module, "mark_webhook_processing", forbidden)
     monkeypatch.setattr(inbound_module, "record_inbound_message", forbidden)
     monkeypatch.setattr(inbound_module, "enqueue_job", forbidden)
+    monkeypatch.setattr(inbound_module, "request_account_probe", forbidden)
+    monkeypatch.setattr(inbound_module, "wake_conversation_pipeline", forbidden)
 
     result = await accept_whatsapp_inbound(connection, _event())  # type: ignore[arg-type]
 
@@ -286,6 +458,8 @@ async def test_processed_retry_returns_existing_link_without_new_job(
     assert result.conversation_id == conversation_id
     assert result.message_id == message_id
     assert result.job_id is None
+    assert "account_probe" not in captured
+    assert "pipeline_wake" not in captured
 
 
 @pytest.mark.asyncio
@@ -302,7 +476,7 @@ def test_contract_rejects_bad_phone_empty_text_and_naive_timestamp() -> None:
     base: Mapping[str, Any] = {
         "provider_event_id": "event",
         "session_name": "session",
-        "sender_phone": "+77001234567",
+        "sender_phone": "+77000000003",
         "provider_message_id": "message",
         "received_at": datetime(2026, 9, 22, 12, tzinfo=UTC),
         "text": "Есть",

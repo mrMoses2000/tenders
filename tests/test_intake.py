@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from procurement_bot.dialogue import SearchScopePolicy
@@ -7,9 +9,11 @@ from procurement_bot.intake import (
     IntakeService,
     ParsedProcurementRequest,
     ProcurementItem,
+    ProcurementLocationPatch,
     ProcurementRequestPatch,
     SearchScope,
     SourceType,
+    _parse_priced_table,
     apply_intake_patch,
     canonical_json_hash,
 )
@@ -77,29 +81,86 @@ async def test_process_can_apply_only_an_explicit_scope_default():
 
 
 @pytest.mark.asyncio
-async def test_process_passes_the_one_visible_question_as_context():
-    current = ParsedProcurementRequest(items=[ProcurementItem(name="Марля")])
+@pytest.mark.parametrize("source_type", [SourceType.TEXT, SourceType.VOICE])
+@pytest.mark.parametrize("topic", ["city_missing", "locality_resolution"])
+async def test_process_passes_the_one_visible_question_as_context(source_type, topic):
+    current = ParsedProcurementRequest(items=[ProcurementItem(
+        name="Марля", quantity=100, tender_unit_price_private=Decimal("1234"),
+        source_reference="table:2:row:3",
+    )])
     clarification = IntakeClarificationContext(
-        topic="city_missing",
+        topic=topic,
         question="В каком городе искать товар?",
     )
-    proposal = ParsedProcurementRequest(city="Алматы")
+    narrow_current = current.model_copy(update={"items": []})
+    context_patch = patch_for(
+        ParsedProcurementRequest(city="Алматы"),
+        current=narrow_current,
+        source_type=source_type,
+        open_clarification=clarification,
+    )
     fake = FakeExtractor(
-        patch_for(
-            proposal,
-            current=current,
-            open_clarification=clarification,
+        ProcurementLocationPatch(
+            spec_sha256=context_patch.spec_sha256,
+            context_sha256=context_patch.context_sha256,
+            city="Алматы",
+            search_area_text="Рынки вдоль шоссе Северное Кольцо",
         )
     )
-    await IntakeService(fake).process(
+    result = await IntakeService(fake).process(
         "Алматы",
         current=current,
+        source_type=source_type,
         open_clarification=clarification,
     )
     assert fake.calls[0]["context"]["open_clarification"] == {
-        "topic": "city_missing",
+        "topic": topic,
         "question": "В каком городе искать товар?",
     }
+    assert fake.calls[0]["context"]["current_request"]["items"] == []
+    assert result.request.items == current.items
+    assert result.request.city == "Алматы"
+    assert result.request.search_area_text == "Рынки вдоль шоссе Северное Кольцо"
+
+
+PRICED_TABLE = (
+    "[table:1:row:1]\n"
+    "Наименование | Значение\n\n"
+    "[table:1:row:2]\n"
+    " | Республика Казахстан, п. Таукент\n\n"
+    "[table:2:row:1]\n"
+    "№ п/п | Наименование | Ед. изм. | Кол-во | Цена | Стоимость | Краткая характеристика\n\n"
+    "[table:2:row:2]\n"
+    "1 | Силикагель | кг | 5,50 | 3 000 | 16500 | Индикаторный\nСиний\n\n"
+    "[table:2:row:3]\n"
+    "2 | Светильник | шт | 10 | 1000 | 10000 | 60 Вт"
+)
+
+
+@pytest.mark.asyncio
+async def test_explicit_document_table_preserves_rows_prices_specs_and_asks_city():
+    extractor = FakeExtractor({})
+    result = await IntakeService(extractor).process(PRICED_TABLE, source_type="document")
+    assert extractor.calls == []
+    assert result.parser_name == "priced-table-intake"
+    assert len(result.request.items) == 2
+    item = result.request.items[0]
+    assert item.quantity == Decimal("5.50")
+    assert item.tender_unit_price_private == Decimal("3000")
+    assert item.requirements[0].expected_value == "Индикаторный\nСиний"
+    assert item.source_reference == "table:2:row:2"
+    assert result.request.delivery_address == "Республика Казахстан, п. Таукент"
+    assert result.request.city is None
+    assert result.clarifications == ["В каком городе искать товар?"]
+
+
+@pytest.mark.parametrize("bad", [
+    PRICED_TABLE.replace("5,50", "не указано"),
+    PRICED_TABLE.replace("2 | Светильник", "3 | Светильник"),
+    PRICED_TABLE.replace("3 000", "договорная"),
+])
+def test_unreliable_table_falls_back_without_partial_rows(bad):
+    assert _parse_priced_table(bad) is None
 
 
 def test_stale_patch_is_rejected():

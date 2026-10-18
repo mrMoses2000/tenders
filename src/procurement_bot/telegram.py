@@ -117,9 +117,7 @@ class TelegramIngress:
     async def _accept_message(self, update: Update, message: Message) -> bool:
         raw_payload = _model_dump(update)
         async with self.pool.acquire() as connection, connection.transaction():
-            if not await accept_update(
-                connection, update.update_id, raw_payload=raw_payload
-            ):
+            if not await accept_update(connection, update.update_id, raw_payload=raw_payload):
                 return False
 
             sender = message.from_user
@@ -176,6 +174,56 @@ class TelegramIngress:
             )
             command_parts = (message.text or "").strip().split(maxsplit=1)
             command = command_parts[0].casefold().split("@", 1)[0] if command_parts else ""
+            wake_text = (message.text or "").strip().casefold()
+            if command in {"/continue", "/resume"} or wake_text in {
+                "продолжить",
+                "продолжить поиск",
+                "продолжай",
+                "возобновить",
+                "продолжить пайплайн",
+            }:
+                from procurement_bot.pipeline_runtime import wake_pipeline
+
+                cases = await connection.fetch(
+                    """SELECT p.case_id,c.owner_user_id FROM case_pipeline_runtime p
+                    JOIN procurement_cases c ON c.id=p.case_id
+                    JOIN users u ON u.id=c.owner_user_id
+                    WHERE u.telegram_id=$1 AND u.active AND p.enabled
+                      AND c.status NOT IN ('closed','cancelled','selected')
+                    ORDER BY c.created_at DESC""",
+                    sender.id,
+                )
+                requested = (
+                    command_parts[1].strip()
+                    if len(command_parts) == 2 and command.startswith("/")
+                    else None
+                )
+                if requested:
+                    cases = [row for row in cases if str(row["case_id"]) == requested]
+                if len(cases) == 1:
+                    await wake_pipeline(
+                        connection,
+                        case_id=cases[0]["case_id"],
+                        owner_id=cases[0]["owner_user_id"],
+                        reason=f"telegram:{update.update_id}",
+                    )
+                    reply_text = ("Продолжение запрошено. Проверю доступность источников "
+                                  "и свободные группы переговоров.")
+                elif cases:
+                    reply_text = "Укажите заявку: /continue UUID заявки."
+                else:
+                    reply_text = (
+                        "Нет вашей активной заявки с включённым автоматическим продолжением."
+                    )
+                await self._reply(
+                    connection,
+                    update_id=update.update_id,
+                    chat_id=message.chat.id,
+                    text=reply_text,
+                    purpose="pipeline-wake",
+                )
+                await self._complete_update(connection, update.update_id)
+                return True
             if command in {"/start", "/help"}:
                 await self._reply(
                     connection,
@@ -242,9 +290,7 @@ class TelegramIngress:
         sender = message.from_user
         if sender is not None:
             display_name = " ".join(
-                value
-                for value in (sender.first_name, sender.last_name)
-                if value
+                value for value in (sender.first_name, sender.last_name) if value
             ).strip()
             user_id = await connection.fetchval(
                 """

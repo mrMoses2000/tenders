@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/moses/tenders
-EnvironmentFile=/home/moses/tenders/.env
-ExecStart=/home/moses/tenders/.venv/bin/procurement-bot miniapp
+WorkingDirectory=%h/tenders
+EnvironmentFile=%h/tenders/.env
+ExecStart=%h/tenders/.venv/bin/procurement-bot miniapp
 Restart=on-failure
 RestartSec=5
 UMask=0077

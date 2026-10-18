@@ -224,10 +224,10 @@ async def finish_dialogue_turn(
     changed = await connection.execute(
         """
         UPDATE dialogue_turns
-        SET case_id=COALESCE(case_id,$2),status=$3,response_kind=$4,processed_at=now()
+        SET case_id=COALESCE(case_id,$2::uuid),status=$3,response_kind=$4,processed_at=now()
         WHERE message_id=$1
           AND (status='planned' OR (status=$3 AND response_kind=$4))
-          AND (case_id IS NULL OR $2 IS NULL OR case_id=$2)
+          AND (case_id IS NULL OR $2::uuid IS NULL OR case_id=$2::uuid)
         """,
         message_id,
         case_id,

@@ -105,7 +105,7 @@ def configure_local_runtime(
         {
             "AGY_BROWSER_MCP_SERVER_JSON": json.dumps(
                 {
-                    "command": "/home/moses/.local/bin/npx",
+                    "command": str(Path.home() / ".local/bin/npx"),
                     "args": [
                         "-y",
                         "@playwright/mcp@0.0.82",
@@ -131,7 +131,7 @@ def configure_local_runtime(
             "AGY_BROWSER_MCP_SERVER_NAME": "playwright",
             "BROWSER_RESEARCH_ENABLED": "true",
             "VOICE_PROVIDER": "assemblyai",
-            "ASSEMBLYAI_ENV_FILE": "/home/moses/audio_transcription/.env",
+            "ASSEMBLYAI_ENV_FILE": str(Path.home() / "audio_transcription" / ".env"),
             "ASSEMBLYAI_KEY_NAME": "ASSEMBLI_AI_5",
             "ASSEMBLYAI_TIMEOUT_SECONDS": "10800",
             "POSTGRES_DSN": DEFAULT_POSTGRES_DSN,
@@ -143,7 +143,7 @@ def configure_local_runtime(
             "WAHA_WEBHOOK_ENABLED": "true",
             "WAHA_WEBHOOK_SECRET": webhook_secret,
             # Dedicated Compose bridge gateway; not reachable from the LAN.
-            "WAHA_WEBHOOK_BIND_HOST": "172.29.247.1",
+            "WAHA_WEBHOOK_BIND_HOST": "172.20.0.1",
             "WAHA_WEBHOOK_ALLOW_PRIVATE_BIND": "true",
             "WAHA_WEBHOOK_PORT": "18081",
         }
@@ -164,7 +164,7 @@ def configure_local_runtime(
             "NODE_OPTIONS": "--max-old-space-size=2048",
             "WHATSAPP_DEFAULT_ENGINE": "NOWEB",
             "WHATSAPP_HOOK_URL": (
-                "http://172.29.247.1:18081/webhooks/waha"
+                "http://172.20.0.1:18081/webhooks/waha"
             ),
             "WHATSAPP_HOOK_EVENTS": "message",
             "WHATSAPP_HOOK_CUSTOM_HEADERS": (
@@ -280,7 +280,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("configure", "qr"))
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--telegram-username", default="JustMoses0002")
+    parser.add_argument("--telegram-username", default="procurement_test_user")
     arguments = parser.parse_args()
     root = arguments.root.resolve()
     if arguments.command == "configure":

@@ -34,6 +34,7 @@ class _Connection:
         self.case_id = uuid4()
         self.run_id = uuid4()
         self.item_id = uuid4()
+        self.requirement_id = uuid4()
         self.offer_id = uuid4()
         self.supplier_id = uuid4()
         self.now = datetime(2026, 9, 23, 4, 0, tzinfo=UTC)
@@ -65,15 +66,25 @@ class _Connection:
                 "unit": "рулон",
                 "analogs_allowed": False,
                 "status": "offers_found",
+                "tender_unit_price_private": Decimal("1500"),
+                "tender_currency": "KZT",
             }
         ]
         self.requirements = [
             {
+                "id": self.requirement_id,
                 "request_item_id": self.item_id,
                 "requirement_key": "ГОСТ",
                 "is_hard": True,
                 "source_pointer": "p1",
             }
+        ]
+        self.technical_reviews = [
+            {"id": uuid4(), "offer_id": self.offer_id, "requirement_id": None,
+             "verdict": "match", "created_at": self.now},
+            {"id": uuid4(), "offer_id": self.offer_id,
+             "requirement_id": self.requirement_id,
+             "verdict": "match", "created_at": self.now},
         ]
         self.offers = [
             {
@@ -98,6 +109,14 @@ class _Connection:
                 "price_amount": Decimal("1250"),
                 "currency": "KZT",
                 "price_unit": None,
+                "pack_qty": None,
+                "moq": None,
+                "order_multiple": None,
+                "available_qty": None,
+                "stock_source_type": None,
+                "source_type": "supplier_message",
+                "supplier_phone": "+77000000009",
+                "is_whatsapp_confirmed": True,
                 "availability_status": "in_stock_unquantified",
                 "vat_status": "unknown",
                 "delivery_status": "unknown",
@@ -130,25 +149,32 @@ class _Connection:
         self.sql.append(sql)
         if "FROM procurement_cases AS c" in sql:
             return self.case if args[0] == self.case_id else None
+        if "FROM research_scope_revisions" in sql:
+            return getattr(self, "scope_revision", None)
         if "FROM research_runs" in sql:
             if "WHERE id=$1" in sql:
                 return self.run if args[0] == self.run_id else None
             return self.run if args[0] == self.case_id else None
+        if "AS public_prices" in sql:
+            return {"leads": 1, "public_prices": 1, "accepted": 0, "delivery_unknown": 0}
+        if "WITH case_suppliers AS" in sql:
+            return {"contacted": 0, "whatsapp_unavailable": 1, "whatsapp_failed": 0}
         if "FROM workflow_events" in sql:
             return self.events.get(str(args[0]))
         if "FROM report_artifacts" in sql:
             return self.reports.get(args[0])  # type: ignore[arg-type]
-        if "WITH case_suppliers AS" in sql:
-            return {"contacted": 0, "whatsapp_unavailable": 1, "whatsapp_failed": 0}
         raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
     async def fetch(self, sql: str, *args: object) -> list[dict[str, Any]]:
         self.sql.append(sql)
         if "FROM request_items" in sql:
             return self.items
-        if "FROM item_requirements" in sql:
-            assert args[0] == [self.item_id]
+        if "FROM item_requirements r" in sql:
+            assert args[0] == self.case_id
             return self.requirements
+        if "FROM offer_technical_reviews review" in sql:
+            assert args[0] == self.case_id
+            return self.technical_reviews
         if "FROM offers AS o" in sql:
             assert args[0] == self.case_id
             return self.offers
@@ -187,6 +213,21 @@ async def _install_artifact_fake(
 ) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
+    async def pipeline_health(_connection: object, _case_id: UUID) -> dict[str, Any]:
+        return {
+            "account": {},
+            "ingress": {"accepted_7d": 0, "ignored_7d": 0, "rejected_7d": 0},
+            "research": {
+                "run_status": "running",
+                "last_real_progress_at": "2026-09-23T03:00:00+00:00",
+                "wait_reason": "queue_job_active_or_scheduled",
+                "next_wake_at": None,
+                "queued_without_runnable_job": 0,
+                "queued_with_terminal_job": 0,
+                "stalled": False,
+            },
+        }
+
     async def persist(
         _connection: object,
         **kwargs: Any,
@@ -215,7 +256,27 @@ async def _install_artifact_fake(
         return artifact
 
     monkeypatch.setattr(pipeline, "persist_report_artifact", persist)
+    monkeypatch.setattr(pipeline, "load_pipeline_health", pipeline_health)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_revised_report_labels_citywide_priority_without_changing_case_area(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection()
+    old_area = connection.case["search_area_text"]
+    connection.scope_revision = {
+        "city": "Алматы", "preferred_area_text": "Северное Кольцо",
+        "revision_sha256": "f" * 64,
+    }
+    calls = await _install_artifact_fake(monkeypatch, connection)
+    await build_case_report(
+        connection, results_root=tmp_path, case_id=connection.case_id,
+        research_run_id=connection.run_id,
+    )
+    assert "Весь город Алматы; приоритет: Северное Кольцо" in calls[0]["html"]
+    assert connection.case["search_area_text"] == old_area
 
 
 @pytest.mark.asyncio
@@ -239,11 +300,22 @@ async def test_builds_private_report_without_inventing_total_cost_rank(
     assert len(calls) == 1
     html = calls[0]["html"]
     assert "1 250.00 KZT" in html
-    assert "соответствие подтверждено" in html
+    assert "Состояние автоматизации" in html
+    assert "Последний сохранённый прогресс поиска" in html
+    assert "queue_job_active_or_scheduled" in html
+    assert "ТЗ проверено оператором" in html
     assert '<span class="rank">' not in html
-    assert "Уточнить, за какую единицу указана цена" in html
-    assert "Уточнить, включён ли НДС" in html
-    assert "latest.observed_at DESC" in "\n".join(connection.sql)
+    assert "Уточнить единицу цены" in html
+    assert "Уточнить НДС" not in html
+    assert "ob.observed_at DESC" in "\n".join(connection.sql)
+    offers_sql = next(sql for sql in connection.sql if "FROM offers AS o" in sql)
+    assert "contact_evidence" in offers_sql
+    assert "rr.case_id=ri.case_id" in offers_sql
+    assert "offer_observations own_observation" in offers_sql
+    assert "contact_evidence_ids" in offers_sql
+    contact_metrics_sql = next(sql for sql in connection.sql if "WITH case_suppliers AS" in sql)
+    assert "contact_evidence" in contact_metrics_sql
+    assert "rr.case_id=$1" in contact_metrics_sql
     assert connection.outbox[0]["event_type"] == "telegram.send_document"
     assert connection.outbox[0]["payload"]["storage_path"] == "reports/aa/report.html"
     assert connection.outbox[0]["payload"]["filename"] == "otchet-po-zayavke.html"
@@ -322,6 +394,7 @@ async def test_unknown_offer_remains_unconfirmed_and_unranked(
         evidence_title=None,
         source_locator=None,
     )
+    connection.technical_reviews = []
     calls = await _install_artifact_fake(monkeypatch, connection)
 
     result = await build_case_report(
@@ -332,7 +405,85 @@ async def test_unknown_offer_remains_unconfirmed_and_unranked(
 
     html = calls[0]["html"]
     assert result.exact_matches == 0
-    assert "требуется подтверждение" in html
+    assert "ТЗ не проверено" in html
     assert "Цена не подтверждена" in html
     assert "наличие не подтверждено" in html
     assert '<span class="rank">' not in html
+
+
+@pytest.mark.asyncio
+async def test_partial_research_report_is_explicit_and_keeps_case_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection(run_status="running")
+    connection.case["status"] = "researching"
+    connection.offers[0]["supplier_phone"] = None
+    calls = await _install_artifact_fake(monkeypatch, connection)
+    kwargs = dict(
+        results_root=tmp_path,
+        case_id=connection.case_id,
+        research_run_id=connection.run_id,
+        refresh_key="pilot-three-items-v1",
+        partial_research_snapshot=True,
+    )
+    first = await build_case_report(connection, **kwargs)  # type: ignore[arg-type]
+    retry = await build_case_report(connection, **kwargs)  # type: ignore[arg-type]
+
+    assert connection.case["status"] == "researching"
+    assert "Промежуточный срез" in calls[0]["html"]
+    assert "Сохранённые лиды заявки: по 1 из 1 позиций" in calls[0]["html"]
+    assert "телефоны указаны у лидов по 0 позициям" in calls[0]["html"]
+    assert "могут относиться к более ранним поискам" in calls[0]["html"]
+    assert "Промежуточный" in connection.outbox[0]["payload"]["caption"]
+    assert len(calls) == 1
+    assert retry.artifact_id == first.artifact_id
+    assert not retry.newly_built
+
+
+@pytest.mark.asyncio
+async def test_partial_report_with_55_items_and_no_offers_marks_each_item_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection(run_status="running")
+    connection.case["status"] = "researching"
+    first = connection.items[0]
+    connection.items = [
+        {**first, "line_number": number, "name": f"Позиция {number}",
+         "id": first["id"] if number == 1 else uuid4()}
+        for number in range(1, 56)
+    ]
+    connection.offers = []
+    calls = await _install_artifact_fake(monkeypatch, connection)
+
+    await build_case_report(
+        connection,  # type: ignore[arg-type]
+        results_root=tmp_path,
+        case_id=connection.case_id,
+        research_run_id=connection.run_id,
+        refresh_key="pilot-empty-55-v1",
+        partial_research_snapshot=True,
+    )
+
+    html = calls[0]["html"]
+    assert html.count('<section class="item-group">') == 55
+    assert html.count("Предложений пока нет.") == 55
+    assert "Позиция 55: Позиция 55" in html
+    assert "Требуется: 20 рулон" in html
+    assert "Техспек" in html
+    assert "Сохранённые лиды заявки: по 0 из 55 позиций" in html
+    assert "<article>" not in html
+
+
+@pytest.mark.asyncio
+async def test_partial_report_requires_distinct_refresh_identity(tmp_path: Path) -> None:
+    connection = _Connection(run_status="running")
+    with pytest.raises(ValueError, match="refresh key"):
+        await build_case_report(
+            connection,  # type: ignore[arg-type]
+            results_root=tmp_path,
+            case_id=connection.case_id,
+            partial_research_snapshot=True,
+        )
+    assert connection.sql == []

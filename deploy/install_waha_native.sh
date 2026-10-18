@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${1:-/home/moses/tenders}"
+ROOT="${1:-${HOME:?HOME is required}/tenders}"
 IMAGE_REPOSITORY="devlikeapro/waha"
 IMAGE_DIGEST="sha256:4a43878961f6940176039e33fd08c1af52e27f79bcd73a09d5a357096a09b098"
 LAYERS_DIR="$ROOT/var/runtime/waha-layers"

@@ -1,0 +1,21 @@
+[Unit]
+Description=Procurement Jobs and Outbox Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tenders
+EnvironmentFile=%h/tenders/.env
+ExecStart=%h/tenders/.venv/bin/procurement-bot worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+# Chrome's sandbox fails under this host's PrivateTmp mount namespace.
+# Keep its own AGY HOME and per-call browser profile isolated instead.
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target

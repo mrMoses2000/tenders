@@ -147,6 +147,7 @@ async def start_approved_research(
     database: asyncpg.Pool | asyncpg.Connection,
     *,
     approval_id: UUID,
+    allow_followup: bool = False,
 ) -> ResearchStartResult:
     """Consume one exact approval and enqueue an internal research job.
 
@@ -221,7 +222,9 @@ async def start_approved_research(
             )
         if approval["status"] != "approved" or not approval["is_live"]:
             raise ResearchStartDenied("approval is not approved and unexpired")
-        if case["status"] != _STARTABLE_CASE_STATUS:
+        if case["status"] != _STARTABLE_CASE_STATUS and not (
+            allow_followup and case["status"] in {"evaluating", "report_ready"}
+        ):
             raise ResearchStartDenied("procurement case is not ready for research")
         if run["status"] != _STARTABLE_RUN_STATUS:
             raise ResearchStartDenied("research run is not in planned state")
@@ -241,9 +244,10 @@ async def start_approved_research(
             """
             UPDATE procurement_cases
             SET status='researching',updated_at=now()
-            WHERE id=$1 AND status='ready'
+            WHERE id=$1 AND (status='ready' OR ($2 AND status IN ('evaluating','report_ready')))
             """,
             payload.case_id,
+            allow_followup,
         )
         if case_updated != "UPDATE 1":
             raise ResearchStartDenied("procurement case changed before research start")
@@ -258,6 +262,13 @@ async def start_approved_research(
         if run_updated != "UPDATE 1":
             raise ResearchStartDenied("research run changed before research start")
 
+        await connection.execute(
+            """INSERT INTO case_pipeline_runtime(case_id,research_run_id,enabled)
+            VALUES($1,$2,true) ON CONFLICT(case_id) DO UPDATE
+            SET research_run_id=EXCLUDED.research_run_id,enabled=true,paused=false,
+                next_tick_at=now(),wake_reason='approved_research',updated_at=now()""",
+            payload.case_id, payload.research_run_id,
+        )
         event_data = {
             "approval_id": str(approval_id),
             "research_run_id": str(payload.research_run_id),

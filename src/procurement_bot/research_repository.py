@@ -19,6 +19,7 @@ _SOURCE_PROVIDERS = {
     ResearchSource.OWN_DATABASE: "own_database",
     # The current browser boundary models the public 2GIS web surface, not its API.
     ResearchSource.TWO_GIS: "2gis_web",
+    ResearchSource.OLX: "marketplace",
     ResearchSource.WEB: "web",
 }
 

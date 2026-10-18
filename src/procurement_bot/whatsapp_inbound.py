@@ -18,8 +18,14 @@ from procurement_bot.conversations import (
     record_inbound_message,
 )
 from procurement_bot.phone import normalize_phone
+from procurement_bot.pipeline_runtime import wake_conversation_pipeline
 from procurement_bot.queue import enqueue_job, stable_key
 from procurement_bot.supplier_dialogue import is_opt_out
+from procurement_bot.supplier_media import (
+    WhatsAppMediaInput,
+    persist_supplier_message_media,
+)
+from procurement_bot.whatsapp_account import request_account_probe
 
 
 class WhatsAppInboundConflict(RuntimeError):
@@ -37,15 +43,11 @@ class WhatsAppInboundDisposition(StrEnum):
 
 _QUARANTINE_REASON_TO_DISPOSITION = {
     "unknown_sender": WhatsAppInboundDisposition.QUARANTINED_UNKNOWN_SENDER,
-    "no_active_conversation": (
-        WhatsAppInboundDisposition.QUARANTINED_NO_ACTIVE_CONVERSATION
-    ),
+    "no_active_conversation": (WhatsAppInboundDisposition.QUARANTINED_NO_ACTIVE_CONVERSATION),
     "ambiguous_sender": WhatsAppInboundDisposition.QUARANTINED_AMBIGUOUS_SENDER,
-    "ambiguous_conversation": (
-        WhatsAppInboundDisposition.QUARANTINED_AMBIGUOUS_CONVERSATION
-    ),
+    "ambiguous_conversation": (WhatsAppInboundDisposition.QUARANTINED_AMBIGUOUS_CONVERSATION),
 }
-_TERMINAL_CONVERSATION_STATES = ("complete", "closed_no_reply", "opted_out")
+_TERMINAL_CONVERSATION_STATES = ("opted_out",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +60,16 @@ class AuthenticatedWhatsAppInbound:
     provider_message_id: str
     received_at: datetime
     text: str
+    media: WhatsAppMediaInput | None = None
 
     def __post_init__(self) -> None:
         _require_text("provider_event_id", self.provider_event_id, max_length=500)
         _require_text("session_name", self.session_name, max_length=200)
         _require_text("provider_message_id", self.provider_message_id, max_length=500)
-        _require_text("text", self.text, max_length=100_000)
+        if self.media is None:
+            _require_text("text", self.text, max_length=100_000)
+        elif not isinstance(self.text, str) or len(self.text) > 100_000:
+            raise ValueError("text is invalid or too long")
         normalize_phone(self.sender_phone)
         if self.received_at.tzinfo is None or self.received_at.utcoffset() is None:
             raise ValueError("received_at must be timezone-aware")
@@ -72,10 +78,10 @@ class AuthenticatedWhatsAppInbound:
     def normalized_sender_phone(self) -> str:
         return normalize_phone(self.sender_phone)
 
-    def evidence_payload(self) -> dict[str, str]:
+    def evidence_payload(self) -> dict[str, Any]:
         """Return the minimal authenticated transport fact stored in the inbox."""
 
-        return {
+        evidence: dict[str, Any] = {
             "provider_event_id": self.provider_event_id,
             "session_name": self.session_name,
             "sender_phone": self.normalized_sender_phone,
@@ -83,6 +89,22 @@ class AuthenticatedWhatsAppInbound:
             "received_at": self.received_at.isoformat(),
             "text": self.text,
         }
+        if self.media is not None:
+            evidence["original_caption"] = self.text
+            evidence["media"] = self.media.as_evidence()
+        return evidence
+
+    @property
+    def stored_text(self) -> str:
+        """Return the immutable ledger caption or a neutral media placeholder."""
+
+        if self.text.strip():
+            return self.text
+        if self.media is None:
+            return self.text
+        if self.media.kind == "image":
+            return "[Фотография поставщика]"
+        return "[Голосовое сообщение поставщика]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,9 +131,7 @@ async def accept_whatsapp_inbound(
 
     _require_text("worker_id", worker_id, max_length=200)
     raw_payload = event.evidence_payload()
-    webhook_key = stable_key(
-        "whatsapp-webhook", event.session_name, event.provider_event_id
-    )
+    webhook_key = stable_key("whatsapp-webhook", event.session_name, event.provider_event_id)
 
     async with connection.transaction():
         accepted = await accept_webhook_event(
@@ -140,9 +160,7 @@ async def accept_whatsapp_inbound(
                 return terminal
 
         if webhook["status"] not in {"accepted", "failed"}:
-            raise WhatsAppInboundConflict(
-                f"webhook event is not claimable: {webhook['status']}"
-            )
+            raise WhatsAppInboundConflict(f"webhook event is not claimable: {webhook['status']}")
         claimed = await mark_webhook_processing(
             connection,
             event_id=accepted.id,
@@ -167,32 +185,50 @@ async def accept_whatsapp_inbound(
         if len(contacts) != 1:
             return await _quarantine(connection, accepted.id, "ambiguous_sender")
 
+        opt_out = is_opt_out(event.text)
         conversations = await connection.fetch(
             """
-            SELECT id,external_chat_id,state,opted_out
-            FROM supplier_conversations
-            WHERE supplier_contact_id=$1 AND session_name=$2 AND channel='whatsapp'
-              AND NOT opted_out
-              AND state <> ALL($3::text[])
-            ORDER BY updated_at DESC,id
+            SELECT c.id,c.external_chat_id,c.state,c.opted_out
+            FROM supplier_conversations AS c
+            JOIN procurement_cases AS procurement_case ON procurement_case.id=c.case_id
+            WHERE c.supplier_contact_id=$1 AND c.session_name=$2 AND c.channel='whatsapp'
+              AND NOT c.opted_out
+              AND c.state <> ALL($3::text[])
+              AND (
+                  procurement_case.status NOT IN ('closed','cancelled')
+                  OR $4::boolean
+              )
+              AND (
+                  $4::boolean
+                  OR c.state NOT IN ('complete','closed_no_reply')
+                  OR EXISTS (
+                      SELECT 1
+                      FROM supplier_conversation_targets AS target
+                      JOIN offers AS offer
+                        ON offer.id=target.offer_id
+                       AND offer.request_item_id=target.request_item_id
+                       AND offer.supplier_id=target.supplier_id
+                      WHERE target.conversation_id=c.id
+                        AND target.case_id=c.case_id
+                        AND target.supplier_id=c.supplier_id
+                        AND offer.status IN ('lead','confirm','exact','mismatch')
+                  )
+              )
+            ORDER BY c.updated_at DESC,c.id
             LIMIT 2
-            FOR UPDATE
+            FOR UPDATE OF c
             """,
             contacts[0]["id"],
             event.session_name,
             list(_TERMINAL_CONVERSATION_STATES),
+            opt_out,
         )
         if not conversations:
-            return await _quarantine(
-                connection, accepted.id, "no_active_conversation"
-            )
+            return await _quarantine(connection, accepted.id, "no_active_conversation")
         if len(conversations) != 1:
-            return await _quarantine(
-                connection, accepted.id, "ambiguous_conversation"
-            )
+            return await _quarantine(connection, accepted.id, "ambiguous_conversation")
 
         conversation = conversations[0]
-        opt_out = is_opt_out(event.text)
         message = await record_inbound_message(
             connection,
             InboundMessageInput(
@@ -203,18 +239,45 @@ async def accept_whatsapp_inbound(
                 external_message_id=event.provider_message_id,
                 received_at=event.received_at,
                 raw_payload=raw_payload,
-                text_content=event.text,
+                message_kind=event.media.kind if event.media is not None else "text",
+                text_content=event.stored_text,
                 is_opt_out=opt_out,
             ),
         )
+        if not message.created:
+            return WhatsAppInboundResult(
+                webhook_event_id=accepted.id,
+                disposition=WhatsAppInboundDisposition.DUPLICATE,
+                conversation_id=conversation["id"],
+                message_id=message.id,
+            )
+        if event.media is not None:
+            await persist_supplier_message_media(
+                connection,
+                message_id=message.id,
+                media=event.media,
+            )
         job_id = await enqueue_job(
             connection,
-            kind="process_supplier_reply",
+            kind="process_supplier_media" if event.media is not None else "process_supplier_reply",
             payload={
                 "conversation_id": str(conversation["id"]),
                 "message_id": str(message.id),
             },
-            idempotency_key=stable_key("process-supplier-reply", message.id),
+            idempotency_key=stable_key(
+                "process-supplier-media" if event.media is not None else "process-supplier-reply",
+                message.id,
+            ),
+        )
+        await request_account_probe(
+            connection,
+            event.session_name,
+            reason="supplier_inbound_received",
+        )
+        await wake_conversation_pipeline(
+            connection,
+            conversation_id=conversation["id"],
+            reason="whatsapp_inbound_received",
         )
         return WhatsAppInboundResult(
             webhook_event_id=accepted.id,
@@ -249,9 +312,7 @@ async def _terminal_retry_result(
         webhook_event_id,
     )
     if message is None:
-        raise WhatsAppInboundConflict(
-            "processed webhook has no linked inbound message"
-        )
+        raise WhatsAppInboundConflict("processed webhook has no linked inbound message")
     return WhatsAppInboundResult(
         webhook_event_id=webhook_event_id,
         disposition=WhatsAppInboundDisposition.DUPLICATE,

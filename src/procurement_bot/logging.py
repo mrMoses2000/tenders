@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 
 
@@ -17,6 +18,9 @@ class JsonFormatter(logging.Formatter):
             value = getattr(record, name, None)
             if value is not None:
                 payload[name] = str(value)
+        reason = getattr(record, "reason", None)
+        if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", reason):
+            payload["reason"] = reason
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)[-4000:]
         return json.dumps(payload, ensure_ascii=False)

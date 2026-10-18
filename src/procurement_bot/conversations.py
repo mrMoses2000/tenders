@@ -219,6 +219,7 @@ async def create_conversation(
             WHERE idempotency_key=$1 OR (
                 case_id=$2 AND supplier_id=$3 AND supplier_contact_id=$4
                 AND session_name=$5 AND external_chat_id=$6
+                AND state NOT IN ('complete','closed_no_reply','opted_out')
             )
             """,
             value.idempotency_key,

@@ -22,20 +22,20 @@ def test_configure_preserves_token_and_generates_matching_waha_secrets(
     result = configure_local_runtime(
         app_env=app,
         waha_env=waha,
-        telegram_username="@JustMoses0002",
+        telegram_username="@procurement_test_user",
     )
 
     app_values = _values(app)
     waha_values = _values(waha)
     assert app_values["TELEGRAM_TOKEN"] == "kept-secret"  # noqa: S105
-    assert app_values["TELEGRAM_BOOTSTRAP_USERNAMES"] == "justmoses0002"
+    assert app_values["TELEGRAM_BOOTSTRAP_USERNAMES"] == "procurement_test_user"
     assert app_values["WAHA_ENABLED"] == "true"
     assert app_values["WAHA_WEBHOOK_ENABLED"] == "true"
-    assert app_values["WAHA_WEBHOOK_BIND_HOST"] == "172.29.247.1"
+    assert app_values["WAHA_WEBHOOK_BIND_HOST"] == "172.20.0.1"
     assert app_values["WAHA_WEBHOOK_ALLOW_PRIVATE_BIND"] == "true"
     assert app_values["BROWSER_RESEARCH_ENABLED"] == "true"
     assert app_values["VOICE_PROVIDER"] == "assemblyai"
-    assert app_values["ASSEMBLYAI_ENV_FILE"] == "/home/moses/audio_transcription/.env"
+    assert app_values["ASSEMBLYAI_ENV_FILE"] == str(Path.home() / "audio_transcription" / ".env")
     assert app_values["ASSEMBLYAI_KEY_NAME"] == "ASSEMBLI_AI_5"
     assert "@playwright/mcp@0.0.82" in app_values[
         "AGY_BROWSER_MCP_SERVER_JSON"
@@ -48,7 +48,7 @@ def test_configure_preserves_token_and_generates_matching_waha_secrets(
     assert waha_values["WHATSAPP_API_PORT"] == "3000"
     assert (
         waha_values["WHATSAPP_HOOK_URL"]
-        == "http://172.29.247.1:18081/webhooks/waha"
+        == "http://172.20.0.1:18081/webhooks/waha"
     )
     assert result.generated_secrets == 3
     assert app.stat().st_mode & 0o777 == 0o600
@@ -62,7 +62,7 @@ def test_configure_is_idempotent_and_does_not_rotate_secrets(tmp_path: Path) -> 
     configure_local_runtime(
         app_env=app,
         waha_env=waha,
-        telegram_username="JustMoses0002",
+        telegram_username="procurement_test_user",
     )
     before_app = _values(app)
     before_waha = _values(waha)
@@ -70,7 +70,7 @@ def test_configure_is_idempotent_and_does_not_rotate_secrets(tmp_path: Path) -> 
     result = configure_local_runtime(
         app_env=app,
         waha_env=waha,
-        telegram_username="JustMoses0002",
+        telegram_username="procurement_test_user",
     )
 
     assert result.generated_secrets == 0

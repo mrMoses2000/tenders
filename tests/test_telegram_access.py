@@ -38,7 +38,7 @@ class FakeConnection:
 
 
 def test_username_normalization_is_strict() -> None:
-    assert normalize_telegram_username(" @JustMoses0002 ") == "justmoses0002"
+    assert normalize_telegram_username(" @procurement_test_user ") == "procurement_test_user"
     assert normalize_telegram_username("bad-name") is None
     assert normalize_telegram_username("x") is None
 
@@ -48,14 +48,14 @@ async def test_configured_username_is_bound_once() -> None:
     connection = FakeConnection()
     policy = TelegramAccessPolicy(
         allowed_user_ids=set(),
-        bootstrap_usernames={"@JustMoses0002"},
+        bootstrap_usernames={"@procurement_test_user"},
     )
 
     assert await policy.authorize(
-        connection, telegram_id=7001, username="JustMoses0002"
+        connection, telegram_id=7001, username="procurement_test_user"
     )
     insert = next(call for call in connection.calls if "INSERT INTO" in call[0])
-    assert insert[1] == ("justmoses0002", 7001)
+    assert insert[1] == ("procurement_test_user", 7001)
 
 
 @pytest.mark.asyncio
@@ -63,11 +63,11 @@ async def test_bound_username_cannot_be_claimed_by_another_id() -> None:
     connection = FakeConnection(bound_id=7001)
     policy = TelegramAccessPolicy(
         allowed_user_ids=set(),
-        bootstrap_usernames={"JustMoses0002"},
+        bootstrap_usernames={"procurement_test_user"},
     )
 
     assert not await policy.authorize(
-        connection, telegram_id=7002, username="JustMoses0002"
+        connection, telegram_id=7002, username="procurement_test_user"
     )
     assert not any("INSERT INTO" in sql for sql, _ in connection.calls)
 
@@ -76,7 +76,7 @@ async def test_bound_username_cannot_be_claimed_by_another_id() -> None:
 async def test_previously_bound_id_does_not_depend_on_current_username() -> None:
     policy = TelegramAccessPolicy(
         allowed_user_ids=set(),
-        bootstrap_usernames={"JustMoses0002"},
+        bootstrap_usernames={"procurement_test_user"},
     )
     assert await policy.authorize(
         FakeConnection(already_authorized=True),
@@ -89,7 +89,7 @@ async def test_previously_bound_id_does_not_depend_on_current_username() -> None
 async def test_unconfigured_or_wrong_username_fails_closed() -> None:
     policy = TelegramAccessPolicy(
         allowed_user_ids=set(),
-        bootstrap_usernames={"JustMoses0002"},
+        bootstrap_usernames={"procurement_test_user"},
     )
     assert not await policy.authorize(
         FakeConnection(), telegram_id=7001, username="someone_else"
@@ -101,12 +101,12 @@ async def test_username_is_never_bootstrapped_from_a_group_message() -> None:
     connection = FakeConnection()
     policy = TelegramAccessPolicy(
         allowed_user_ids=set(),
-        bootstrap_usernames={"JustMoses0002"},
+        bootstrap_usernames={"procurement_test_user"},
     )
     assert not await policy.authorize(
         connection,
         telegram_id=7001,
-        username="JustMoses0002",
+        username="procurement_test_user",
         permit_bootstrap=False,
     )
     assert not any("INSERT INTO" in sql for sql, _ in connection.calls)

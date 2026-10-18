@@ -13,6 +13,10 @@ class Transcript:
     language: str
     confidence: float | None
     provider: str
+    # ``confidence`` is the detected language confidence, retained for existing
+    # review gates. Providers may separately report speech and token confidence.
+    speech_confidence: float | None = None
+    low_confidence_words: tuple[str, ...] = ()
 
 
 SUPPORTED_PROCUREMENT_LANGUAGES = frozenset({"ru", "kk"})

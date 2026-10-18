@@ -34,12 +34,20 @@ class LocalContentAddressedStorage:
         sha256 = digest.hexdigest()
         safe_suffix = suffix if suffix.startswith(".") and len(suffix) <= 20 else ""
         relative = Path(namespace) / sha256[:2] / f"{sha256}{safe_suffix}"
-        destination = (self.root / relative).resolve()
-        if not destination.is_relative_to(self.root):
+        destination = self.root / relative
+        resolved_destination = destination.resolve(strict=False)
+        if not resolved_destination.is_relative_to(self.root):
             raise ValueError("object path escaped storage root")
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if destination.is_symlink():
+            raise ValueError("content-addressed object path is a symlink")
         if not destination.exists():
             self._atomic_copy(source.open("rb"), destination)
+        else:
+            existing_sha256, existing_size = self._digest_and_size(destination)
+            source_size = source.stat().st_size
+            if existing_sha256 != sha256 or existing_size != source_size:
+                self._atomic_copy(source.open("rb"), destination)
         destination.chmod(0o600)
         return StoredObject(str(relative), destination, sha256, destination.stat().st_size)
 
@@ -48,6 +56,16 @@ class LocalContentAddressedStorage:
         if not path.is_relative_to(self.root):
             raise ValueError("object key escaped storage root")
         return path
+
+    @staticmethod
+    def _digest_and_size(path: Path) -> tuple[str, int]:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+        return digest.hexdigest(), size
 
     @staticmethod
     def _atomic_copy(source: BinaryIO, destination: Path) -> None:

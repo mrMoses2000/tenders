@@ -1,10 +1,16 @@
+import asyncio
+import json
 import re
+import signal
+import stat
 
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from procurement_bot.errors import PermanentProviderError
-from procurement_bot.providers.agy import AgyExtractor, FakeExtractor
+from procurement_bot.errors import PermanentProviderError, RetryableProviderError
+from procurement_bot.providers import agy as agy_module
+from procurement_bot.providers.agy import AgyCliStatusError, AgyExtractor, FakeExtractor
+from procurement_bot.providers.provider_diagnostics import safe_error_code
 
 
 class Nested(BaseModel):
@@ -16,6 +22,31 @@ class Output(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = None
     nested: Nested = Nested()
+
+
+def _fake_agy(
+    tmp_path,
+    envelope: object,
+    *,
+    exit_code: int = 0,
+    raw_stdout: str | None = None,
+) -> tuple[AgyExtractor, str]:
+    home = tmp_path / "profile"
+    profile = home / ".gemini" / "antigravity-cli"
+    profile.mkdir(parents=True)
+    (profile / "antigravity-oauth-token").write_text("test-token", encoding="utf-8")
+    (profile / "settings.json").write_text("{}", encoding="utf-8")
+    executable = tmp_path / "fake-agy"
+    stdout_payload = raw_stdout if raw_stdout is not None else json.dumps(envelope)
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.stdout.write({json.dumps(stdout_payload)})\n"
+        f"sys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    executable.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    return AgyExtractor(executable=str(executable), home_dir=home), str(executable)
 
 
 @pytest.mark.asyncio
@@ -49,7 +80,7 @@ def test_prompt_keeps_user_text_in_untrusted_json_envelope():
 
 
 def test_extractor_environment_replaces_user_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", "/home/real-user")
+    monkeypatch.setenv("HOME", "/tmp/agent-home")
     extractor = AgyExtractor(home_dir=tmp_path)
     assert extractor._environment()["HOME"] == str(tmp_path.resolve())
 
@@ -90,6 +121,63 @@ async def test_extractor_rejects_context_hash_mismatch_before_subprocess():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_extraction_terminates_cli_and_propagates_cancellation(
+    tmp_path, monkeypatch, caplog
+):
+    extractor, _ = _fake_agy(tmp_path, {"status": "SUCCESS"})
+    started = asyncio.Event()
+    terminated = asyncio.Event()
+    signals: list[int] = []
+
+    class FakeProcess:
+        pid = 12345
+        stdin = object()
+        stdout = object()
+        stderr = object()
+        returncode: int | None = None
+
+        async def wait(self):
+            await terminated.wait()
+            self.returncode = 0
+            return 0
+
+    process = FakeProcess()
+
+    async def create_subprocess_exec(*args, **kwargs):
+        return process
+
+    async def write_prompt(stream, prompt):
+        return None
+
+    async def read_forever(stream):
+        started.set()
+        await asyncio.Event().wait()
+
+    def killpg(pid: int, sent_signal: int) -> None:
+        signals.append(sent_signal)
+        if sent_signal == signal.SIGTERM:
+            terminated.set()
+
+    monkeypatch.setattr(agy_module.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(AgyExtractor, "_write_prompt", staticmethod(write_prompt))
+    monkeypatch.setattr(AgyExtractor, "_read_bounded", staticmethod(read_forever))
+    monkeypatch.setattr(agy_module.os, "killpg", killpg)
+
+    task = asyncio.create_task(extractor.extract("safe request", Output))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert process.returncode == 0
+    assert signals == [signal.SIGTERM]
+    assert str(raised.value) == ""
+    assert "test-token" not in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_repair_keeps_same_policy_and_hashes():
     class Repairing(AgyExtractor):
         def __init__(self):
@@ -114,3 +202,104 @@ async def test_repair_keeps_same_policy_and_hashes():
     first_hash = re.search(r"CONTEXT_SHA256: ([0-9a-f]{64})", extractor.prompts[0]).group(1)
     assert f"CONTEXT_SHA256: {first_hash}" in extractor.prompts[1]
     assert "Your only permitted outcome" in extractor.prompts[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_fields", "expected_code"),
+    [
+        ({"error_code": "usage_limit"}, "cli_usage_limit"),
+        ({"error": {"code": "rate_limit"}}, "cli_rate_limit"),
+        ({"message": "authentication failed; token=PRIVATE"}, "cli_auth_failed"),
+        ({"details": {"message": "context limit exceeded"}}, "cli_context_limit"),
+        ({"message": "request timeout"}, "cli_timeout"),
+        ({"message": "PRIVATE supplier text and auth-like token xyz"}, "cli_status_error"),
+        ({"response": "usage_limit authentication context timeout"}, "cli_status_error"),
+    ],
+)
+async def test_error_envelope_maps_only_safe_diagnostic_code(
+    tmp_path,
+    error_fields: dict[str, object],
+    expected_code: str,
+) -> None:
+    envelope = {"status": "ERROR", **error_fields}
+    extractor, _ = _fake_agy(tmp_path, envelope)
+
+    with pytest.raises(RetryableProviderError) as raised:
+        await extractor.extract("safe request", Output)
+
+    assert isinstance(raised.value, AgyCliStatusError)
+    assert raised.value.diagnostic_code == expected_code
+    assert safe_error_code(raised.value) == expected_code
+    assert "PRIVATE" not in str(raised.value)
+    assert "token=PRIVATE" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_fields", "expected_code"),
+    [
+        (
+            {"error": "account is not eligible in your location; private=SECRET"},
+            "cli_account_ineligible",
+        ),
+        ({"message": "Service not currently available for this location"},
+         "cli_status_error"),
+        ({"error_code": "usage_limit"}, "cli_usage_limit"),
+        ({"error": {"code": "rate_limit"}}, "cli_rate_limit"),
+    ],
+)
+async def test_nonzero_error_envelope_maps_allowlisted_diagnostics_without_leaking_text(
+    tmp_path,
+    error_fields: dict[str, object],
+    expected_code: str,
+) -> None:
+    extractor, _ = _fake_agy(
+        tmp_path,
+        {"status": "ERROR", **error_fields},
+        exit_code=1,
+    )
+
+    with pytest.raises(RetryableProviderError) as raised:
+        await extractor.extract("safe request", Output)
+
+    assert isinstance(raised.value, AgyCliStatusError)
+    assert raised.value.diagnostic_code == expected_code
+    assert safe_error_code(raised.value) == expected_code
+    assert "SECRET" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("envelope", "raw_stdout"),
+    [
+        ({}, "not-json"),
+        (["status", "ERROR"], None),
+        ({"error": "account is not eligible"}, None),
+        ({"status": "SUCCESS", "structured_output": {"result_json": '{"name":"x"}'}}, None),
+    ],
+)
+async def test_nonzero_invalid_or_success_envelope_stays_generic_and_unaccepted(
+    tmp_path,
+    envelope: object,
+    raw_stdout: str | None,
+) -> None:
+    extractor, _ = _fake_agy(
+        tmp_path,
+        envelope,
+        exit_code=1,
+        raw_stdout=raw_stdout,
+    )
+
+    with pytest.raises(RetryableProviderError, match="nonzero status") as raised:
+        await extractor.extract("safe request", Output)
+
+    assert not isinstance(raised.value, AgyCliStatusError)
+    assert safe_error_code(raised.value) == "RetryableProviderError"
+
+
+def test_safe_provider_diagnostic_allowlist_includes_parser_error_codes() -> None:
+    class DiagnosedError(RetryableProviderError):
+        diagnostic_code = "cli_context_limit"
+
+    assert safe_error_code(DiagnosedError("private provider response")) == "cli_context_limit"

@@ -190,13 +190,20 @@ async def test_approve_verifies_owner_and_enqueues_opaque_job(queue_spy) -> None
 async def test_whatsapp_approval_enqueues_only_opaque_send_control_job(queue_spy) -> None:
     approval_id = uuid4()
     actor_id = uuid4()
+    case_id = uuid4()
     connection = FakeConnection(
         approval_row={
             "id": approval_id,
-            "case_id": uuid4(),
+            "case_id": case_id,
             "status": "requested",
             "unexpired": True,
             "actor_user_id": actor_id,
+            "payload": {
+                "case_id": str(case_id), "channel": "whatsapp",
+                "recipient": "+77000000003", "text": "Здравствуйте! Есть ли товар?",
+                "conversation_id": str(uuid4()), "logical_action_id": "availability-v1",
+                "is_followup": False,
+            },
         }
     )
     ingress = ResearchApprovalCallbackIngress(
@@ -221,6 +228,37 @@ async def test_whatsapp_approval_enqueues_only_opaque_send_control_job(queue_spy
         }
     ]
     assert queue_spy["outbox"][0]["payload"]["show_alert"] is False  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_callback_blocks_stale_initial_draft(queue_spy, monkeypatch) -> None:
+    approval_id = uuid4()
+    case_id = uuid4()
+    connection = FakeConnection(approval_row={
+        "id": approval_id, "case_id": case_id, "status": "requested",
+        "unexpired": True, "actor_user_id": uuid4(),
+        "payload": {
+            "case_id": str(case_id), "channel": "whatsapp",
+            "recipient": "+77000000003", "text": "Старый общий текст",
+            "conversation_id": str(uuid4()),
+            "logical_action_id": f"initial-availability:{uuid4()}",
+            "is_followup": False,
+        },
+    })
+
+    async def stale(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(callback_module, "initial_draft_is_current", stale)
+    ingress = ResearchApprovalCallbackIngress(
+        pool=FakePool(connection), allowed_user_ids={9},  # type: ignore[arg-type]
+    )
+    await ingress.accept(
+        make_update(update_id=108, data=f"wa:a:{approval_id}")  # type: ignore[arg-type]
+    )
+    assert queue_spy["jobs"] == []
+    assert queue_spy["approvals"] == []
+    assert queue_spy["outbox"][0]["payload"]["show_alert"] is True  # type: ignore[index]
 
 
 @pytest.mark.asyncio

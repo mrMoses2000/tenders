@@ -18,6 +18,11 @@ from aiogram.types import Update
 from procurement_bot.approvals import approve_request
 from procurement_bot.queue import accept_update, enqueue_job, enqueue_outbox, stable_key
 from procurement_bot.telegram_access import TelegramAccessPolicy
+from procurement_bot.whatsapp_approval_workflow import (
+    WhatsAppSendDenied,
+    _parse_payload,
+    initial_draft_is_current,
+)
 
 CallbackDecision = Literal["approve", "reject"]
 CallbackNamespace = Literal["research", "whatsapp"]
@@ -220,7 +225,7 @@ class ApprovalCallbackIngress:
         else:
             row = await connection.fetchrow(
                 """
-                SELECT approval.id,approval.case_id,approval.status,
+                SELECT approval.id,approval.case_id,approval.status,approval.payload,
                        (approval.expires_at IS NULL OR approval.expires_at>now()) AS unexpired,
                        owner.id AS actor_user_id
                 FROM action_approvals AS approval
@@ -252,6 +257,25 @@ class ApprovalCallbackIngress:
         actor_user_id: UUID = row["actor_user_id"]
         case_id: UUID = row["case_id"]
         if parsed.decision == "approve":
+            if parsed.namespace == "whatsapp":
+                try:
+                    send_payload = _parse_payload(row["payload"])
+                    current_text = await initial_draft_is_current(
+                        connection, case_id=case_id,
+                        conversation_id=send_payload.conversation_id,
+                        logical_action_id=send_payload.logical_action_id,
+                        text=send_payload.text,
+                    )
+                    current_text = current_text and send_payload.case_id == case_id
+                except WhatsAppSendDenied:
+                    current_text = False
+                if not current_text:
+                    await ApprovalCallbackIngress._answer(
+                        connection, update_id=update_id, callback_id=callback_id,
+                        text="Черновик устарел. Обновите текст в заявке.",
+                        show_alert=True,
+                    )
+                    return
             changed = await approve_request(
                 connection,
                 approval_id=parsed.approval_id,

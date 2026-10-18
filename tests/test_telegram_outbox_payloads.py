@@ -17,7 +17,7 @@ from procurement_bot.telegram_outbox_payloads import (
     to_aiogram_kwargs,
 )
 
-APPROVAL_ID = UUID("126d47dd-daa0-43dc-bbed-f33d6cc4c434")
+APPROVAL_ID = UUID("00000000-0000-4a00-8000-000000000004")
 
 
 def test_send_message_payload_converts_keyboard_to_aiogram_types() -> None:

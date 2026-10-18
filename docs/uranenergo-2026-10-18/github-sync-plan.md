@@ -5,7 +5,7 @@
 - Repository: [`mrMoses2000/tenders`](https://github.com/mrMoses2000/tenders), confirmed **public** on GitHub. Treat every pushed file as public.
 - Origin: `git@github.com:mrMoses2000/tenders.git` for fetch and push.
 - A read-only SSH check authenticated as the repository owner. `gh auth status` reports no GitHub CLI session; native SSH Git works.
-- Local source checkout: `/Users/mosesvasilenko/tenders`, branch `codex/pipeline-v3-event-core` at `b4acafe`, tracking its same-named remote branch.
+- Local source checkout: the existing dirty local checkout, branch `codex/pipeline-v3-event-core` at `b4acafe`, tracking its same-named remote branch.
 - That checkout contains a large dirty worktree (94 tracked modified files, numerous untracked code, migrations, tests, build output, screenshots and operational artifacts at the time of inspection). It must not be staged wholesale or used as the base of a push.
 - Stable base selected for this recovery: `origin/main` at `7ea41c0` (`Refresh Mini App design and audit production readiness`). The main history also contains `3e1fb13` (`Record project handoff and remaining work`).
 

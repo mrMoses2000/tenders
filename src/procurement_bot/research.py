@@ -6,14 +6,16 @@ import re
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Literal
+from urllib.parse import unquote, urlparse
+from uuid import UUID
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from procurement_bot.intake import (
     CleanText,
     ParsedProcurementRequest,
+    ProcurementItem,
     SearchScope,
     StrictModel,
 )
@@ -22,6 +24,7 @@ from procurement_bot.intake import (
 class ResearchSource(StrEnum):
     OWN_DATABASE = "own_database"
     TWO_GIS = "2gis"
+    OLX = "olx"
     WEB = "web"
 
 
@@ -39,6 +42,7 @@ class LocalityResolutionStatus(StrEnum):
 
 class EvidenceType(StrEnum):
     BUSINESS_LISTING = "business_listing"
+    SELLER_PROFILE = "seller_profile"
     PRODUCT_PAGE = "product_page"
     SUPPLIER_STATEMENT = "supplier_statement"
 
@@ -120,6 +124,96 @@ def _validate_source_url(value: str) -> str:
     if parsed.username or parsed.password:
         raise ValueError("source URL must not contain credentials")
     return value
+
+
+_OLX_LISTING_URL_ID = re.compile(r"(?:^|-)ID([A-Za-z0-9_-]+)\.html/?$", re.IGNORECASE)
+_OLX_PROFILE_MARKERS = frozenset({
+    "profile", "user", "seller", "uzytkownik", "uzytkownicy", "sprzedawca",
+})
+
+
+def _olx_url_parts(value: str):
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.casefold() != "https"
+        or host not in {"olx.kz", "www.olx.kz"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or re.search(r"%(?:2f|5c)", parsed.path, re.IGNORECASE)
+    ):
+        return None
+    try:
+        path = unquote(parsed.path, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if "\\" in path or "\x00" in path:
+        return None
+    return parsed, host, path
+
+
+def olx_listing_id_from_url(value: str) -> str | None:
+    """Return an OLX listing ID only from its canonical public listing URL."""
+    parts = _olx_url_parts(value)
+    if parts is None:
+        return None
+    _parsed, _host, path = parts
+    if not path.casefold().startswith("/d/obyavlenie/"):
+        return None
+    match = _OLX_LISTING_URL_ID.search(path)
+    return match.group(1) if match else None
+
+
+def olx_listing_id_matches_url(external_id: str, value: str) -> bool:
+    """Bind current and legacy-prefixed external IDs to the OLX card URL."""
+    url_id = olx_listing_id_from_url(value)
+    return url_id is not None and (
+        external_id == url_id
+        or (external_id[:2].casefold() == "id" and external_id[2:] == url_id)
+    )
+
+
+def canonical_olx_listing_id(external_id: str, value: str) -> str | None:
+    """Return the URL's stable suffix when an ID is bound to that listing URL."""
+    url_id = olx_listing_id_from_url(value)
+    return url_id if url_id is not None and olx_listing_id_matches_url(external_id, value) else None
+
+
+def olx_profile_urls_match(left: str, right: str) -> bool:
+    """Compare evidence URLs after safe OLX host/path normalization."""
+    left_parts = _olx_url_parts(left)
+    right_parts = _olx_url_parts(right)
+    if left_parts is None or right_parts is None:
+        return False
+    def normalized_path(path: str) -> tuple[str, ...]:
+        segments = tuple(segment for segment in path.split("/") if segment)
+        if not segments:
+            return ()
+        return tuple(segment.casefold() for segment in segments[:-1]) + (segments[-1],)
+
+    return normalized_path(left_parts[2]) == normalized_path(right_parts[2])
+
+
+def olx_seller_profile_id_from_url(value: str) -> str | None:
+    """Extract a conservative profile ID from an explicit OLX profile URL.
+
+    Profile routes vary by locale. Accept only recognized profile route markers
+    and a stable alphanumeric final path segment; otherwise keep listing identity.
+    """
+    parts = _olx_url_parts(value)
+    if parts is None:
+        return None
+    _parsed, _host, path = parts
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) < 2 or segments[0].casefold() not in _OLX_PROFILE_MARKERS:
+        return None
+    profile_id = segments[-1]
+    return profile_id if re.fullmatch(r"[A-Za-z0-9]{1,30}", profile_id) else None
 
 
 class GeoPoint(StrictModel):
@@ -258,6 +352,33 @@ class SourcePlan(StrictModel):
     result_ttl_hours: int = Field(ge=1, le=24 * 90)
     empty_page_limit: int = Field(ge=1, le=20)
     blocked_reason: CleanText | None = Field(default=None, max_length=500)
+    execution_query_id: UUID | None = Field(default=None, exclude=True)
+    execution_generation: int | None = Field(default=None, ge=0, exclude=True)
+    execution_intent_ordinal: int | None = Field(default=None, ge=0, exclude=True)
+    # Execution cursors are never part of the immutable, approved plan hash.
+    batch_candidate_limit: int | None = Field(default=None, ge=1, le=2, exclude=True)
+    execution_scope_revision_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", exclude=True,
+    )
+    preferred_area_text: CleanText | None = Field(default=None, max_length=500, exclude=True)
+    search_cursor: str | None = Field(default=None, max_length=2_000, exclude=True)
+    excluded_external_ids: list[CleanText] = Field(
+        default_factory=list, max_length=200, exclude=True,
+    )
+
+    def browser_payload(self) -> dict[str, Any]:
+        payload = self.model_dump(mode="json")
+        if self.batch_candidate_limit is not None:
+            payload["batch_candidate_limit"] = self.batch_candidate_limit
+        if self.search_cursor is not None:
+            payload["search_cursor"] = self.search_cursor
+        if self.excluded_external_ids:
+            payload["excluded_external_ids"] = list(self.excluded_external_ids)
+        if self.execution_scope_revision_sha256 is not None:
+            payload["execution_scope_revision_sha256"] = self.execution_scope_revision_sha256
+        if self.preferred_area_text is not None:
+            payload["preferred_area_text"] = self.preferred_area_text
+        return payload
 
     @model_validator(mode="after")
     def supplier_safe(self) -> SourcePlan:
@@ -283,7 +404,8 @@ class LocalityResearchTask(StrictModel):
     @field_validator("sources")
     @classmethod
     def supported_sources(cls, value: list[ResearchSource]) -> list[ResearchSource]:
-        if ResearchSource.OWN_DATABASE in value:
+        if any(source not in {ResearchSource.TWO_GIS, ResearchSource.WEB}
+               for source in value):
             raise ValueError("locality browser lookup supports only 2GIS and web")
         return list(dict.fromkeys(value))
 
@@ -293,7 +415,7 @@ class ResearchPlan(StrictModel):
     scope: SearchScope
     locality_resolution: LocalityResolution | None = None
     locality_task: LocalityResearchTask | None = None
-    source_plans: list[SourcePlan] = Field(min_length=1, max_length=600)
+    source_plans: list[SourcePlan] = Field(min_length=1, max_length=800)
     plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -308,6 +430,25 @@ def _deduplicate_terms(values: list[str]) -> list[str]:
             seen.add(key)
             result.append(stripped)
     return result
+
+
+def _category_clues(item: ProcurementItem, search_terms: list[str]) -> list[str]:
+    """Give category inference product facts without lengthening the site query."""
+
+    clues = list(search_terms)
+    for requirement in item.requirements:
+        fact = " ".join(part for part in (
+            requirement.name, requirement.expected_value, requirement.unit
+        ) if part)
+        if not fact or len(clues) >= 20:
+            continue
+        try:
+            assert_no_private_price(fact, path="category_clue")
+        except PrivatePriceLeakError:
+            continue
+        if fact.casefold() not in {value.casefold() for value in clues}:
+            clues.append(fact[:500])
+    return clues
 
 
 def _locality_constraint(
@@ -362,6 +503,7 @@ def build_research_plan(
     synonyms_by_item: dict[int, list[str]] | None = None,
     locality_resolution: LocalityResolution | None = None,
     minimum_unique_candidates: int = 10,
+    include_olx: bool = False,
 ) -> ResearchPlan:
     """Build reproducible source branches from the approved intake projection.
 
@@ -384,7 +526,7 @@ def build_research_plan(
         request, locality_resolution
     )
     branches: list[SourcePlan] = []
-    source_settings = (
+    source_settings = [
         (
             ResearchSource.OWN_DATABASE,
             ResearchPurpose.KNOWN_SUPPLIER_LOOKUP,
@@ -393,8 +535,13 @@ def build_research_plan(
         ),
         (ResearchSource.TWO_GIS, ResearchPurpose.BUSINESS_DISCOVERY, 24, 2),
         (ResearchSource.WEB, ResearchPurpose.PRODUCT_EVIDENCE, 24, 3),
+    ]
+    if include_olx:
+        source_settings.insert(2, (ResearchSource.OLX, ResearchPurpose.PRODUCT_EVIDENCE,
+                                   12, 3))
+    per_branch_minimum = max(
+        1, (minimum_unique_candidates + len(source_settings) - 1) // len(source_settings)
     )
-    per_branch_minimum = max(1, (minimum_unique_candidates + 2) // 3)
     for index, item in enumerate(request.items):
         if item.name is None:
             raise ValueError(f"item {index} has no product name")
@@ -405,12 +552,17 @@ def build_research_plan(
                 query_parts.append(locality.canonical_place_name)
             elif request.search_scope == SearchScope.ONLINE_WITH_DELIVERY:
                 query_parts.append("доставка")
+            if source == ResearchSource.OLX:
+                query_parts.insert(0, "site:olx.kz")
             branches.append(
                 SourcePlan(
                     item_index=index,
                     source=source,
                     purpose=purpose,
-                    query_terms=terms,
+                    query_terms=(
+                        _category_clues(item, terms)
+                        if source == ResearchSource.TWO_GIS else terms
+                    ),
                     rendered_query=" ".join(query_parts),
                     locality=locality,
                     minimum_unique_candidates=per_branch_minimum,
@@ -456,6 +608,11 @@ class SupplierEvidence(StrictModel):
     availability: AvailabilityStatus = AvailabilityStatus.UNKNOWN
     price_amount: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
     currency: CleanText | None = Field(default=None, max_length=3)
+    price_unit: CleanText | None = Field(default=None, max_length=50)
+    pack_qty: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+    moq: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+    order_multiple: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+    available_qty: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=6)
 
     _source_url = field_validator("source_url")(_validate_source_url)
 
@@ -468,7 +625,10 @@ class SupplierEvidence(StrictModel):
     def evidence_semantics(self) -> SupplierEvidence:
         if (self.price_amount is None) != (self.currency is None):
             raise ValueError("price amount and currency must be supplied together")
-        if self.evidence_type == EvidenceType.BUSINESS_LISTING:
+        if self.evidence_type in {
+            EvidenceType.BUSINESS_LISTING,
+            EvidenceType.SELLER_PROFILE,
+        }:
             product_claims = {
                 EvidenceClaim.PRODUCT_MATCH,
                 EvidenceClaim.ADVERTISED_PRICE,
@@ -508,6 +668,11 @@ class SupplierCandidate(StrictModel):
     source: ResearchSource
     external_id: CleanText | None = Field(default=None, max_length=300)
     name: CleanText = Field(max_length=500)
+    seller_profile_id: CleanText | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9]{1,30}$"
+    )
+    seller_profile_url: str | None = Field(default=None, max_length=2_000)
+    product_name: CleanText | None = Field(default=None, max_length=500)
     categories: list[CleanText] = Field(default_factory=list, max_length=50)
     address: CleanText | None = Field(default=None, max_length=500)
     point: GeoPoint | None = None
@@ -515,6 +680,17 @@ class SupplierCandidate(StrictModel):
     evidence: list[SupplierEvidence] = Field(min_length=1, max_length=100)
     product_availability: AvailabilityStatus = AvailabilityStatus.UNKNOWN
     field_confidence: dict[str, float] = Field(default_factory=dict, max_length=50)
+    contact_discovery_reason: Literal[
+        "phone_found", "not_attempted", "button_not_found", "click_failed",
+        "login_required", "captcha", "revealed_empty", "format_invalid",
+        "provider_timeout", "mcp_disconnected", "permission_denied",
+        "contact_not_published", "phone_not_visible", "access_blocked", "attempt_failed",
+    ] | None = None
+
+    @field_validator("field_confidence", mode="before")
+    @classmethod
+    def empty_confidences(cls, value: object) -> object:
+        return {} if value is None else value
 
     @field_validator("field_confidence")
     @classmethod
@@ -534,6 +710,31 @@ class SupplierCandidate(StrictModel):
         ]
         if self.product_availability != AvailabilityStatus.UNKNOWN and not supporting:
             raise ValueError("candidate availability must be supported by evidence")
+        if self.source != ResearchSource.OLX:
+            if self.seller_profile_id is not None or self.seller_profile_url is not None:
+                raise ValueError("seller profile identity is only valid for OLX")
+            return self
+
+        if self.seller_profile_url is None:
+            # Pre-contract outputs carried an unbound generic ID. Keep the old
+            # payload readable, but never let that claim drive global identity.
+            self.seller_profile_id = None
+            return self
+
+        derived_id = olx_seller_profile_id_from_url(self.seller_profile_url)
+        if derived_id is None:
+            raise ValueError("seller profile URL is not a recognized OLX profile URL")
+        if self.seller_profile_id is not None and self.seller_profile_id != derived_id:
+            raise ValueError("seller profile ID differs from its source URL")
+        profile_evidence = any(
+            olx_profile_urls_match(evidence.source_url, self.seller_profile_url)
+            and evidence.evidence_type == EvidenceType.SELLER_PROFILE
+            and EvidenceClaim.BUSINESS_IDENTITY in evidence.claims
+            for evidence in self.evidence
+        )
+        if not profile_evidence:
+            raise ValueError("seller profile URL must be cited by business identity evidence")
+        self.seller_profile_id = derived_id
         return self
 
 

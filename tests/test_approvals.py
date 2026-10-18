@@ -21,12 +21,12 @@ from procurement_bot.supplier_dialogue import (
 
 
 def test_canonical_payload_hash_is_order_independent_and_rejects_lossy_json() -> None:
-    left = {"recipient": "+77001234567", "nested": {"b": 2, "a": 1}}
-    right = {"nested": {"a": 1, "b": 2}, "recipient": "+77001234567"}
+    left = {"recipient": "+77000000003", "nested": {"b": 2, "a": 1}}
+    right = {"nested": {"a": 1, "b": 2}, "recipient": "+77000000003"}
 
     assert canonical_payload_json(left) == canonical_payload_json(right)
     assert payload_sha256(left) == payload_sha256(right)
-    assert "+77001234567" not in payload_sha256(left)
+    assert "+77000000003" not in payload_sha256(left)
 
     with pytest.raises(TypeError, match="keys must be strings"):
         canonical_payload_json({1: "not allowed"})  # type: ignore[dict-item]
@@ -67,7 +67,7 @@ class ApprovalConnection:
 @pytest.mark.asyncio
 async def test_exact_approval_is_single_use_and_does_not_authorize_mutated_payload() -> None:
     case_id = uuid4()
-    exact = {"recipient": "77001234567@c.us", "text": "Есть в наличии?"}
+    exact = {"recipient": "77000000003@c.us", "text": "Есть в наличии?"}
     connection = ApprovalConnection(
         case_id=case_id,
         action_type="send_whatsapp",
@@ -169,7 +169,7 @@ class EnqueuePool:
 async def test_whatsapp_enqueue_retry_returns_existing_event_without_second_approval() -> None:
     command = WhatsAppSendCommand(
         case_id=uuid4(),
-        recipient="+7 700 123-45-67",
+        recipient="+7 700 000-00-03",
         text="Здравствуйте! Есть ли товар в наличии?",
         conversation_id=uuid4(),
         logical_action_id="availability-v1",

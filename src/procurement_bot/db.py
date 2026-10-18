@@ -46,6 +46,8 @@ async def transaction(pool: asyncpg.Pool) -> AsyncIterator[asyncpg.Connection]:
 async def run_migrations(pool: asyncpg.Pool, migrations_dir: Path) -> list[str]:
     """Apply immutable numbered migrations under a process-safe advisory lock."""
     files = sorted(migrations_dir.glob("[0-9][0-9][0-9]_*.sql"))
+    if not files:
+        raise RuntimeError(f"No numbered migrations found in {migrations_dir}")
     applied: list[str] = []
     async with pool.acquire() as connection:
         await connection.execute(

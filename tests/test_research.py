@@ -18,6 +18,7 @@ from procurement_bot.research import (
     SupplierEvidence,
     build_research_plan,
     decide_locality_resolution,
+    olx_listing_id_matches_url,
 )
 
 
@@ -107,6 +108,134 @@ def test_private_tender_price_marker_is_rejected_from_query_terms():
         build_research_plan(
             _request(),
             synonyms_by_item={0: ["марля, тендерная цена 500 тенге"]},
+        )
+
+
+def test_olx_listing_identity_normalizes_host_case_escaped_path_and_trailing_slash():
+    assert olx_listing_id_matches_url(
+        "qZ9sJ",
+        "HTTPS://WWW.OLX.KZ/d/obyavlenie/tool-IDqZ9%73J.html/?utm_source=test",
+    )
+    assert olx_listing_id_matches_url(
+        "IDqZ9sJ",
+        "https://olx.kz/d/obyavlenie/tool-IDqZ9sJ.html",
+    )
+    assert not olx_listing_id_matches_url(
+        "qZ9sJ", "https://olx.kz.evil.example/d/obyavlenie/tool-IDqZ9sJ.html"
+    )
+
+
+def test_legacy_unbound_olx_seller_id_is_accepted_but_not_used_as_identity():
+    legacy = SupplierCandidate.model_validate({
+        "source": "olx",
+        "external_id": "qZ9sJ",
+        "name": "Seller",
+        # Matches the old saved result shape: a generic token plus listing evidence only.
+        "seller_profile_id": "1lYldf",
+        "evidence": [{
+            "evidence_type": "product_page",
+            "source": "olx",
+            "source_url": "https://www.olx.kz/d/obyavlenie/tool-IDqZ9sJ.html",
+            "observed_at": datetime.now(UTC).isoformat(),
+            "raw_snapshot_sha256": "a" * 64,
+            "claims": ["product_match"],
+        }],
+    })
+
+    assert legacy.external_id == "qZ9sJ"
+    assert legacy.seller_profile_id is None
+    assert legacy.seller_profile_url is None
+
+
+def test_olx_profile_id_must_be_derived_from_cited_business_profile_url():
+    listing_url = "https://olx.kz/d/obyavlenie/tool-IDqZ9sJ.html"
+    profile_url = "HTTPS://WWW.OLX.KZ/Profile/User/%31lYldf/"
+    candidate = SupplierCandidate(
+        source=ResearchSource.OLX,
+        external_id="qZ9sJ",
+        name="Seller",
+        seller_profile_id="1lYldf",
+        seller_profile_url=profile_url,
+        evidence=[
+            SupplierEvidence(
+                evidence_type=EvidenceType.PRODUCT_PAGE,
+                source=ResearchSource.OLX,
+                source_url=listing_url,
+                observed_at=datetime.now(UTC),
+                raw_snapshot_sha256="b" * 64,
+                claims=[EvidenceClaim.PRODUCT_MATCH],
+            ),
+            SupplierEvidence(
+                evidence_type=EvidenceType.SELLER_PROFILE,
+                source=ResearchSource.OLX,
+                source_url="https://olx.kz/profile/user/1lYldf?from=listing",
+                observed_at=datetime.now(UTC),
+                raw_snapshot_sha256="c" * 64,
+                claims=[EvidenceClaim.BUSINESS_IDENTITY],
+            ),
+        ],
+    )
+
+    assert candidate.seller_profile_id == "1lYldf"
+
+    with pytest.raises(ValidationError, match="cited by business identity evidence"):
+        SupplierCandidate(
+            source=ResearchSource.OLX,
+            external_id="qZ9sJ",
+            name="Seller",
+            seller_profile_id="1lYldf",
+            seller_profile_url=profile_url,
+            evidence=[SupplierEvidence(
+                evidence_type=EvidenceType.PRODUCT_PAGE,
+                source=ResearchSource.OLX,
+                source_url=listing_url,
+                observed_at=datetime.now(UTC),
+                raw_snapshot_sha256="d" * 64,
+                claims=[EvidenceClaim.PRODUCT_MATCH],
+            )],
+        )
+
+    with pytest.raises(ValidationError, match="differs from its source URL"):
+        SupplierCandidate(
+            source=ResearchSource.OLX,
+            external_id="qZ9sJ",
+            name="Seller",
+            seller_profile_id="different1",
+            seller_profile_url=profile_url,
+            evidence=[
+                SupplierEvidence(
+                    evidence_type=EvidenceType.PRODUCT_PAGE,
+                    source=ResearchSource.OLX,
+                    source_url=listing_url,
+                    observed_at=datetime.now(UTC),
+                    raw_snapshot_sha256="d" * 64,
+                    claims=[EvidenceClaim.PRODUCT_MATCH],
+                ),
+                SupplierEvidence(
+                    evidence_type=EvidenceType.SELLER_PROFILE,
+                    source=ResearchSource.OLX,
+                    source_url=profile_url,
+                    observed_at=datetime.now(UTC),
+                    raw_snapshot_sha256="e" * 64,
+                    claims=[EvidenceClaim.BUSINESS_IDENTITY],
+                ),
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="recognized OLX profile URL"):
+        SupplierCandidate(
+            source=ResearchSource.OLX,
+            external_id="qZ9sJ",
+            name="Seller",
+            seller_profile_url="https://example.org/profile/user/1lYldf",
+            evidence=[SupplierEvidence(
+                evidence_type=EvidenceType.SELLER_PROFILE,
+                source=ResearchSource.OLX,
+                source_url="https://example.org/profile/user/1lYldf",
+                observed_at=datetime.now(UTC),
+                raw_snapshot_sha256="e" * 64,
+                claims=[EvidenceClaim.BUSINESS_IDENTITY],
+            )],
         )
 
 

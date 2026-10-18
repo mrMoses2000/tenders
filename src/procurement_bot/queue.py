@@ -172,6 +172,7 @@ async def claim_outbox(
     worker_id: str,
     lease_seconds: int = 60,
     event_types: tuple[str, ...] | None = None,
+    event_id: UUID | None = None,
 ) -> ClaimedOutbox | None:
     if not worker_id:
         raise ValueError("worker_id must be non-empty")
@@ -203,6 +204,7 @@ async def claim_outbox(
                 FROM outbox_events
                 WHERE attempts < max_attempts
                   AND ($3::text[] IS NULL OR event_type=ANY($3::text[]))
+                  AND ($4::uuid IS NULL OR id=$4)
                   AND (
                     (status IN ('pending','retry') AND available_at <= now())
                     OR (status='sending' AND lease_expires_at <= now())
@@ -222,6 +224,7 @@ async def claim_outbox(
             worker_id,
             lease_seconds,
             selected_types,
+            event_id,
         )
     if row is None:
         return None
@@ -335,11 +338,42 @@ async def fail_outbox(
     return terminal
 
 
+async def defer_outbox(
+    pool: asyncpg.Pool,
+    event: ClaimedOutbox,
+    *,
+    available_at: datetime,
+    reason: str,
+) -> bool:
+    """Release a live outbox lease for later without consuming a send attempt."""
+
+    if available_at.tzinfo is None:
+        raise ValueError("available_at must be timezone-aware")
+    if not reason.strip():
+        raise ValueError("reason must be non-empty")
+    result = await pool.execute(
+        """
+        UPDATE outbox_events
+        SET status='retry',available_at=$3,attempts=GREATEST(attempts-1,0),
+            locked_at=NULL,locked_by=NULL,lease_expires_at=NULL,last_error_code=$4
+        WHERE id=$1 AND status='sending' AND locked_by=$2 AND lease_expires_at>now()
+        """,
+        event.id,
+        event.locked_by,
+        available_at,
+        reason[:500],
+    )
+    if result != "UPDATE 1":
+        raise RuntimeError("outbox lease was lost before deferral could be recorded")
+    return True
+
+
 async def claim_job(
     pool: asyncpg.Pool,
     *,
     worker_id: str,
     lease_seconds: int = 300,
+    excluded_kinds: tuple[str, ...] = (),
 ) -> ClaimedJob | None:
     if not worker_id:
         raise ValueError("worker_id must be non-empty")
@@ -363,11 +397,16 @@ async def claim_job(
                 SELECT id
                 FROM jobs
                 WHERE attempts < max_attempts
+                  AND NOT (kind=ANY($3::text[]))
                   AND (
                     (status IN ('pending','retry') AND available_at <= now())
                     OR (status='running' AND lease_expires_at <= now())
                   )
-                ORDER BY available_at, created_at
+                ORDER BY CASE
+                    WHEN kind IN ('process_supplier_reply','process_supplier_media') THEN 0
+                    WHEN kind='pipeline_tick' THEN 1
+                    WHEN kind='prepare_supplier_outreach' THEN 3
+                    ELSE 2 END, available_at, created_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
@@ -384,6 +423,7 @@ async def claim_job(
             """,
             worker_id,
             lease_seconds,
+            list(excluded_kinds),
         )
     if row is None:
         return None
@@ -452,13 +492,15 @@ async def fail_job(
     result = await pool.execute(
         """
         UPDATE jobs
-        SET status=$3,available_at=$4,locked_at=NULL,locked_by=NULL,
-            lease_expires_at=NULL,last_error_code=$5,updated_at=now(),
-            completed_at=CASE WHEN $3='dead' THEN now() ELSE NULL END
+        SET status=$4,available_at=$5,locked_at=NULL,locked_by=NULL,
+            lease_expires_at=NULL,last_error_code=$6,updated_at=now(),
+            completed_at=CASE WHEN $4='dead' THEN now() ELSE NULL END
         WHERE id=$1 AND status='running' AND locked_by=$2
+          AND lease_expires_at>now() AND attempts=$3
         """,
         job.id,
         job.locked_by,
+        job.attempts,
         "dead" if terminal else "retry",
         available_at,
         error_code[:500],
@@ -466,6 +508,37 @@ async def fail_job(
     if result != "UPDATE 1":
         raise RuntimeError("job lease was lost before failure could be recorded")
     return terminal
+
+
+async def defer_job(
+    pool: asyncpg.Pool,
+    job: ClaimedJob,
+    *,
+    available_at: datetime,
+    reason: str,
+) -> bool:
+    """Release a live job lease for later without consuming a retry attempt."""
+
+    if available_at.tzinfo is None:
+        raise ValueError("available_at must be timezone-aware")
+    if not reason.strip():
+        raise ValueError("reason must be non-empty")
+    result = await pool.execute(
+        """
+        UPDATE jobs
+        SET status='pending',available_at=$3,attempts=GREATEST(attempts-1,0),
+            locked_at=NULL,locked_by=NULL,lease_expires_at=NULL,last_error_code=$4,
+            updated_at=now(),completed_at=NULL
+        WHERE id=$1 AND status='running' AND locked_by=$2 AND lease_expires_at>now()
+        """,
+        job.id,
+        job.locked_by,
+        available_at,
+        reason[:500],
+    )
+    if result != "UPDATE 1":
+        raise RuntimeError("job lease was lost before deferral could be recorded")
+    return True
 
 
 async def persist_telegram_message(

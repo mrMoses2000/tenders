@@ -34,6 +34,54 @@ def test_telegram_allowlist_is_deny_by_default():
         settings.require_telegram_allowed_user_ids()
 
 
+def test_codex_browser_timeout_covers_eight_listing_fallback() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.codex_2gis_timeout_seconds == 900
+
+
+def test_codex_chrome_node_executable_is_optional_path_configuration(tmp_path: Path):
+    assert Settings(_env_file=None).codex_chrome_node_executable is None
+    node = tmp_path / "node"
+
+    settings = Settings(_env_file=None, CODEX_CHROME_NODE_EXECUTABLE=node)
+
+    assert settings.codex_chrome_node_executable == node
+
+
+def test_browser_batch_timeout_can_be_raised_to_300_without_changing_default():
+    assert Settings(_env_file=None).browser_batch_timeout_seconds == 180
+    settings = Settings(_env_file=None, BROWSER_BATCH_TIMEOUT_SECONDS=300)
+    assert settings.browser_batch_timeout_seconds == 300
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, BROWSER_BATCH_TIMEOUT_SECONDS=301)
+
+
+def test_browser_source_cooldown_has_bounded_default_and_configuration():
+    assert Settings(_env_file=None).browser_source_cooldown_seconds == 900
+    assert (
+        Settings(_env_file=None, BROWSER_SOURCE_COOLDOWN_SECONDS=1200)
+        .browser_source_cooldown_seconds
+        == 1200
+    )
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, BROWSER_SOURCE_COOLDOWN_SECONDS=59)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, BROWSER_SOURCE_COOLDOWN_SECONDS=3601)
+
+
+def test_staged_research_primary_defaults_to_agy_and_accepts_codex():
+    assert Settings(_env_file=None).staged_research_primary == "agy"
+    assert (
+        Settings(_env_file=None, STAGED_RESEARCH_PRIMARY="codex")
+        .staged_research_primary
+        == "codex"
+    )
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, STAGED_RESEARCH_PRIMARY="web")
+
+
 def test_telegram_allowlist_parses_comma_separated_ids():
     settings = Settings(_env_file=None, TELEGRAM_ALLOWED_USER_IDS="123, 456,123")
     assert settings.require_telegram_allowed_user_ids() == {123, 456}
@@ -43,9 +91,9 @@ def test_telegram_access_can_bootstrap_a_known_username():
     settings = Settings(
         _env_file=None,
         TELEGRAM_ALLOWED_USER_IDS="",
-        TELEGRAM_BOOTSTRAP_USERNAMES="@JustMoses0002",
+        TELEGRAM_BOOTSTRAP_USERNAMES="@procurement_test_user",
     )
-    assert settings.telegram_access_config() == (set(), frozenset({"justmoses0002"}))
+    assert settings.telegram_access_config() == (set(), frozenset({"procurement_test_user"}))
 
 
 def test_telegram_access_is_deny_by_default_without_id_or_username():
@@ -106,14 +154,14 @@ def test_waha_webhook_requires_a_distinct_long_secret() -> None:
         Settings(_env_file=None, WAHA_WEBHOOK_BIND_HOST="0.0.0.0")  # noqa: S104
 
     with pytest.raises(ValueError, match="explicit opt-in"):
-        Settings(_env_file=None, WAHA_WEBHOOK_BIND_HOST="172.29.247.1")
+        Settings(_env_file=None, WAHA_WEBHOOK_BIND_HOST="172.20.0.1")
 
     private = Settings(
         _env_file=None,
-        WAHA_WEBHOOK_BIND_HOST="172.29.247.1",
+        WAHA_WEBHOOK_BIND_HOST="172.20.0.1",
         WAHA_WEBHOOK_ALLOW_PRIVATE_BIND=True,
     )
-    assert private.waha_webhook_bind_host == "172.29.247.1"
+    assert private.waha_webhook_bind_host == "172.20.0.1"
 
 
 def test_isolated_agy_home_copies_only_auth_token(tmp_path: Path):
@@ -134,6 +182,25 @@ def test_isolated_agy_home_copies_only_auth_token(tmp_path: Path):
     assert not (root / ".gemini" / "antigravity" / "mcp_config.json").exists()
     settings_file = root / ".gemini" / "antigravity-cli" / "settings.json"
     assert json.loads(settings_file.read_text())["permissions"]["allow"] == []
+
+
+def test_isolated_agy_home_survives_primary_token_file_disappearing(tmp_path: Path):
+    source = tmp_path / "source-token"
+    source.write_text("isolated-auth", encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        AGY_HOME=tmp_path / "agy-home",
+        AGY_BROWSER_HOME=tmp_path / "browser-home",
+        AGY_AUTH_TOKEN_SOURCE=source,
+    )
+    settings.prepare_isolated_agy_home()
+    source.unlink()
+
+    root = settings.prepare_isolated_agy_home()
+
+    assert (root / ".gemini/antigravity-cli/antigravity-oauth-token").read_text() == (
+        "isolated-auth"
+    )
 
 
 def test_browser_mcp_config_is_explicit_and_secret_free() -> None:

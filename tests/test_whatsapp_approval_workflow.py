@@ -7,8 +7,13 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import procurement_bot.whatsapp_approval_workflow as workflow
 from procurement_bot.approvals import payload_sha256
 from procurement_bot.queue import stable_key
+from procurement_bot.supplier_dialogue import (
+    DEFAULT_SEND_POLICY,
+    WhatsAppSendDeferred,
+)
 from procurement_bot.whatsapp_approval_workflow import (
     WhatsAppSendDenied,
     WhatsAppSendStateConflict,
@@ -25,7 +30,7 @@ class FakeConnection:
         self.payload: dict[str, Any] = {
             "case_id": str(self.case_id),
             "channel": "whatsapp",
-            "recipient": "+7 700 123-45-67",
+            "recipient": "+7 700 000-00-03",
             "text": "Здравствуйте! Есть ли товар в наличии?",
             "conversation_id": str(self.conversation_id),
             "logical_action_id": "availability-v1",
@@ -52,7 +57,7 @@ class FakeConnection:
             "followup_count": 0,
             "last_outbound_at": None,
             "contact_type": "whatsapp",
-            "normalized_value": "+77001234567",
+            "normalized_value": "+77000000003",
             "active": True,
             "sent_today": 0,
         }
@@ -81,10 +86,7 @@ class FakeConnection:
         if "WHERE approval_id=$1 OR idempotency_key=$2" in query:
             if self.outbox is None:
                 return None
-            if (
-                self.outbox["approval_id"] == args[0]
-                or self.outbox["idempotency_key"] == args[1]
-            ):
+            if self.outbox["approval_id"] == args[0] or self.outbox["idempotency_key"] == args[1]:
                 return self.outbox
             return None
         raise AssertionError(f"unexpected fetchrow: {query}")
@@ -110,7 +112,12 @@ class FakeConnection:
             return "UPDATE 1"
         raise AssertionError(f"unexpected execute: {query}")
 
-    async def fetchval(self, query: str, *args: object) -> UUID | None:
+    async def fetchval(self, query: str, *args: object) -> UUID | bool | None:
+        if "SELECT CASE" in query and "auto_send_approval_authorizations" in query:
+            # This fixture models a legacy/manual approval with no auto-policy audit.
+            return True
+        if "SELECT EXISTS" in query and "case_auto_send_policies" in query:
+            return False
         assert "INSERT INTO outbox_events" in query
         event_id, event_type, payload, key, max_attempts, approval_id = args
         assert event_type == "whatsapp.send_text"
@@ -162,6 +169,30 @@ async def test_approved_send_is_consumed_and_enqueued_atomically() -> None:
 
 
 @pytest.mark.asyncio
+async def test_old_initial_text_cannot_reach_whatsapp_outbox() -> None:
+    class InitialConnection(FakeConnection):
+        async def fetchrow(self, query: str, *args: object):
+            if "FROM supplier_conversation_targets" in query:
+                return {
+                    "name": "Плитка",
+                    "specification_text": "Потолочная плитка Армстронг",
+                    "quantity": 40,
+                    "unit": "Штука",
+                }
+            return await super().fetchrow(query, *args)
+
+    connection = InitialConnection()
+    connection.payload["logical_action_id"] = f"initial-availability:{uuid4()}"
+    connection.payload["text"] = "Плитка, количество 40. Есть ли?"
+    connection.approval["payload_sha256"] = payload_sha256(connection.payload)
+
+    with pytest.raises(WhatsAppSendDenied, match="черновик устарел"):
+        await start_approved_whatsapp_send(connection, connection.approval_id)
+    assert connection.outbox is None
+    assert connection.approval_updates == 0
+
+
+@pytest.mark.asyncio
 async def test_consumed_retry_through_pool_returns_only_exact_existing_outbox() -> None:
     connection = FakeConnection()
     pool = FakePool(connection)
@@ -209,16 +240,14 @@ async def test_invalid_or_mutated_approval_fails_closed(mutate: Any, message: st
         (lambda db: db.conversation.update(state="complete"), "not in a sendable state"),
         (lambda db: db.conversation.update(opted_out=True), "opted out"),
         (
-            lambda db: db.conversation.update(normalized_value="+77009999999"),
+            lambda db: db.conversation.update(normalized_value="+77000000010"),
             "does not match",
         ),
         (lambda db: db.conversation.update(active=False), "not active"),
         (lambda db: db.conversation.update(outbound_count=4), "message limit"),
     ],
 )
-async def test_live_conversation_and_contact_state_are_enforced(
-    mutate: Any, message: str
-) -> None:
+async def test_live_conversation_and_contact_state_are_enforced(mutate: Any, message: str) -> None:
     connection = FakeConnection()
     assert connection.conversation is not None
     mutate(connection)
@@ -252,3 +281,40 @@ async def test_consumed_approval_without_outbox_fails_closed() -> None:
 
     with pytest.raises(WhatsAppSendStateConflict, match="no matching outbox"):
         await start_approved_whatsapp_send(connection, connection.approval_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_auto_case_daily_quota_defers_before_consuming_or_enqueuing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from zoneinfo import ZoneInfo
+
+    connection = FakeConnection()
+    assert connection.conversation is not None
+    connection.conversation["sent_today"] = 30
+    autonomous_policy = replace(
+        DEFAULT_SEND_POLICY,
+        daily_limit=30,
+        conversation_limit=60,
+    )
+
+    async def active_policy(_connection: object, _case_id: UUID, _default: object):
+        return autonomous_policy
+
+    async def auto_authorized(_connection: object, *, approval_id: UUID) -> None:
+        assert approval_id == connection.approval_id
+
+    monkeypatch.setattr(workflow, "get_case_send_policy", active_policy)
+    monkeypatch.setattr(workflow, "assert_auto_send_authorization_active", auto_authorized)
+
+    with pytest.raises(WhatsAppSendDeferred) as deferred:
+        await start_approved_whatsapp_send(connection, connection.approval_id)  # type: ignore[arg-type]
+
+    assert deferred.value.reason == "daily WhatsApp limit reached"
+    assert deferred.value.available_at == datetime(
+        2026, 9, 24, 9, tzinfo=ZoneInfo("Asia/Almaty")
+    ).astimezone(UTC)
+    assert connection.approval["status"] == "approved"
+    assert connection.approval_updates == 0
+    assert connection.outbox is None
