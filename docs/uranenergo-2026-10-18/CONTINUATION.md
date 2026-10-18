@@ -20,7 +20,7 @@ Do not continue if the branch or commit differs from the handoff or the expected
 
 Recover the existing UranEnergo case through the already deployed pipeline and Mini App, preserving the live case, 55 original request items, supplier history, canonical tables and existing service boundaries. Validate Telegram PDF/DOCX intake; allow the current pipeline to process for the user-authorized four-hour unattended window; reconcile extracted facts to the existing case; continue supplier discovery and dialogue in Taraz → Shymkent → Almaty order where current provider gates allow; and produce a useful, evidence-backed shortlist in the existing Mini App/report.
 
-The code review identified the repository's existing entities and interfaces, but did not query production. The server runtime agent must establish current status and case IDs itself with read-only commands and secret-safe output.
+The docs branch is based on public `origin/main@7ea41c0` and is **not a runnable copy of the dirty pipeline checkout**. It lacks newer local modules, tests and migrations present in `codex/pipeline-v3-event-core@b4acafe`; see the [verification baseline](verification-baseline.md). The live server may run a third source state. Do not deploy or cherry-pick from this docs branch as if it contains the latest pipeline. The code review identified entities and interfaces but did not query production. The server runtime agent must establish the actual deployed state itself with read-only commands and secret-safe output.
 
 ## Server work sequence
 
@@ -58,5 +58,6 @@ For the requested four-hour work window, record start/end UTC and Almaty times, 
 - [this integration scout](integration-scout.md)
 - [this GitHub sync plan](github-sync-plan.md)
 - [this case reconciliation plan](case-reconciliation-plan.md)
+- [local verification baseline and source gap](verification-baseline.md)
 
 This is a server continuation plan, not a statement that the four-hour run or any live reconciliation has happened.
