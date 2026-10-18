@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -84,17 +85,32 @@ async def pg_intake_database():
         await admin.close()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_unknown_tender_price_persists_searchable_items_without_financial_rows(
+@pytest.mark.parametrize(
+    "header,expected_price",
+    [
+        ("Цена", None),
+        ("Цена, USD", None),
+        ("Цена, KZT/USD", None),
+        ("Цена, KZT/JPY", None),
+        ("Цена, KZT/KGS", None),
+        ("Цена, тенге/рублях", None),
+        ("Цена, KZT", Decimal("3000")),
+    ],
+)
+async def test_native_price_currency_preserves_searchable_items(
     pg_intake_database,
+    header,
+    expected_price,
 ):
     pool = pg_intake_database
     parsed = await IntakeService(FakeExtractor({})).process(
-        PRICED_TABLE,
+        PRICED_TABLE.replace("Цена | Стоимость", f"{header} | Стоимость"),
         source_type=SourceType.DOCUMENT,
     )
-    assert parsed.request.items[0].tender_unit_price_private is None
-    assert parsed.request.warnings
+    assert parsed.request.items[0].tender_unit_price_private == expected_price
+    assert bool(parsed.request.warnings) is (expected_price is None)
 
     # The owner has separately supplied sourcing geography; the table's product
     # facts and warning remain those produced by the native deterministic parser.
@@ -173,5 +189,12 @@ async def test_unknown_tender_price_persists_searchable_items_without_financial_
     assert items[0]["quantity"] == 5.5 and items[0]["unit"] == "кг"
     assert items[0]["specification_text"] == "Техническая характеристика Индикаторный"
     assert items[0]["status"] == "ready"
-    assert financial_count == 0
+    assert financial_count == int(expected_price is not None)
+    if expected_price is not None:
+        async with pool.acquire() as connection:
+            financial = await connection.fetchrow(
+                "SELECT tender_unit_price_private,currency FROM request_item_financials"
+            )
+        assert financial["tender_unit_price_private"] == expected_price
+        assert financial["currency"] == "KZT"
     assert prepare_job_count == 1
