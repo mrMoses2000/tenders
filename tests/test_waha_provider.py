@@ -185,6 +185,41 @@ async def test_waha_session_422_is_retryable_before_send() -> None:
 
 
 @pytest.mark.asyncio
+async def test_waha_reads_authenticated_self_jid_without_enabling_outbound() -> None:
+    transport = RecordingTransport(HttpResponse(200, b'{"id":"77000000003@c.us"}'))
+    client = WahaClient(
+        base_url="http://localhost:3000",
+        api_key="secret",
+        session="procurement",
+        enabled=True,
+        outbound_enabled=False,
+        transport=transport,
+    )
+
+    identity = await client.get_account_identity()
+
+    assert identity.account_jid == "77000000003@c.us"
+    assert identity.observed_at.tzinfo is not None
+    assert transport.requests[0]["method"] == "GET"
+    assert transport.requests[0]["url"].endswith("api/sessions/procurement/me")
+    assert transport.requests[0]["body"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"null", b"{}", b'{"id":"not-a-jid"}'])
+async def test_waha_self_jid_read_fails_closed_when_identity_is_unavailable(body: bytes) -> None:
+    client = WahaClient(
+        base_url="http://localhost:3000",
+        api_key="secret",
+        enabled=True,
+        transport=RecordingTransport(HttpResponse(200, body)),
+    )
+
+    with pytest.raises((PermanentProviderError, RetryableProviderError)):
+        await client.get_account_identity()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [429, 500, 503])
 async def test_waha_classifies_temporary_http_statuses_as_retryable(status: int) -> None:
     transport = RecordingTransport(HttpResponse(status, b"upstream unavailable"))

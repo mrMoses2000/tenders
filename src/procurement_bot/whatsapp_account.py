@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from procurement_bot.providers.waha import WahaAccountIdentity, WahaClient, normalize_account_jid
 from procurement_bot.supplier_dialogue import WhatsAppSendDeferred
 
 ACCOUNT_TIMEZONE = "Asia/Almaty"
@@ -19,10 +20,9 @@ DEFAULT_DAILY_NEW_CONTACT_LIMIT = 0
 DEFAULT_MINIMUM_INTERVAL_SECONDS = 120
 DEFAULT_MAX_CONCURRENT_POSTS = 1
 PROVIDER_CLEAR_MAX_AGE = timedelta(minutes=30)
+ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE = timedelta(seconds=30)
 
-ProviderState = Literal[
-    "unknown", "clear", "restricted", "timelock", "capped", "unavailable"
-]
+ProviderState = Literal["unknown", "clear", "restricted", "timelock", "capped", "unavailable"]
 SendOutcome = Literal["accepted", "unknown", "rejected"]
 
 
@@ -38,6 +38,14 @@ class WhatsAppAccountReservation:
     is_new_contact: bool
     generation: int
     lease_expires_at: datetime
+    pinned_account_jid: str | None = None
+    account_pin_version: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WhatsAppAccountIdentityPin:
+    account_jid: str
+    version: int
 
 
 def _now(value: datetime | None) -> datetime:
@@ -68,9 +76,7 @@ def _provider_clear_is_fresh(state: dict[str, Any], now: datetime) -> bool:
     return timedelta(0) <= age <= PROVIDER_CLEAR_MAX_AGE
 
 
-async def ensure_account(
-    connection: asyncpg.Connection, session_name: str
-) -> asyncpg.Record:
+async def ensure_account(connection: asyncpg.Connection, session_name: str) -> asyncpg.Record:
     """Create an unseen session in held/unknown state and record its origin."""
 
     if not isinstance(session_name, str) or not session_name.strip():
@@ -102,9 +108,7 @@ async def ensure_account(
     return existing
 
 
-async def get_account_state(
-    connection: asyncpg.Connection, session_name: str
-) -> dict[str, Any]:
+async def get_account_state(connection: asyncpg.Connection, session_name: str) -> dict[str, Any]:
     """Return account gates and budgets; an absent row is represented as held."""
 
     if not isinstance(session_name, str) or not session_name.strip():
@@ -126,6 +130,8 @@ async def get_account_state(
             "daily_new_contact_limit": DEFAULT_DAILY_NEW_CONTACT_LIMIT,
             "minimum_interval_seconds": DEFAULT_MINIMUM_INTERVAL_SECONDS,
             "max_concurrent_posts": DEFAULT_MAX_CONCURRENT_POSTS,
+            "account_identity_pinned": False,
+            "account_pin_version": 0,
             "outbound_allowed": False,
             "unresolved_reservations": 0,
         }
@@ -138,11 +144,16 @@ async def get_account_state(
         or 0
     )
     result = dict(row)
+    result["account_identity_pinned"] = bool(result.get("pinned_account_jid"))
+    result["account_pin_version"] = int(result.get("pin_version") or 0)
+    for private_field in ("pinned_account_jid", "pinned_by", "pinned_at", "pin_observed_at"):
+        result.pop(private_field, None)
     result["unresolved_reservations"] = unresolved
     result["provider_clear_fresh"] = _provider_clear_is_fresh(result, datetime.now(UTC))
     result["outbound_allowed"] = (
         not result["operator_held"]
         and not result["circuit_open"]
+        and result["account_identity_pinned"]
         and result["provider_clear_fresh"]
         and unresolved == 0
     )
@@ -165,6 +176,8 @@ async def assert_account_send_allowed(
         raise _blocked("whatsapp_provider_restriction_state_not_fresh_clear", now=current)
     if state["circuit_open"]:
         raise _blocked("whatsapp_account_circuit_open", now=current)
+    if not state["pinned_account_jid"] or int(state["pin_version"]) < 1:
+        raise _blocked("whatsapp_account_identity_not_pinned", now=current)
     if await connection.fetchval(
         """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
            WHERE session_name=$1 AND state='unknown')""",
@@ -215,9 +228,142 @@ async def authorize_session_owner(
 ) -> None:
     """Verify that an active actor owns one or every active case using a session."""
 
-    await _authorize_session_owner(
-        connection, session_name, actor_user_id, require_all=require_all
+    await _authorize_session_owner(connection, session_name, actor_user_id, require_all=require_all)
+
+
+async def load_account_identity_pin(
+    pool: asyncpg.Pool,
+    session_name: str,
+) -> WhatsAppAccountIdentityPin:
+    """Read the current pin; reserve_outbound rechecks this snapshot atomically."""
+
+    async with pool.acquire() as connection:
+        row = await connection.fetchrow(
+            "SELECT pinned_account_jid,pin_version FROM whatsapp_account_controls "
+            "WHERE session_name=$1",
+            session_name,
+        )
+    if row is None or not row["pinned_account_jid"] or int(row["pin_version"] or 0) < 1:
+        raise WhatsAppSendDeferred(
+            available_at=datetime.now(UTC) + timedelta(minutes=5),
+            reason="whatsapp_account_identity_not_pinned",
+        )
+    return WhatsAppAccountIdentityPin(
+        account_jid=normalize_account_jid(row["pinned_account_jid"]),
+        version=int(row["pin_version"]),
     )
+
+
+async def record_account_identity_preflight_event(
+    pool: asyncpg.Pool,
+    *,
+    session_name: str,
+    outbox_event_id: UUID,
+    event_type: Literal["account_identity_mismatch", "account_identity_check_failed"],
+    reason: str,
+    pin: WhatsAppAccountIdentityPin,
+    observed_identity: WahaAccountIdentity | None = None,
+) -> None:
+    """Audit a preflight denial before any provider request ID or send reservation exists."""
+
+    reason = _reason(reason)
+    details: dict[str, Any] = {
+        "pinned_account_jid": pin.account_jid,
+        "pin_version": pin.version,
+        "observation_available": observed_identity is not None,
+    }
+    if observed_identity is not None:
+        details["observed_account_jid"] = normalize_account_jid(observed_identity.account_jid)
+        details["observed_at"] = _now(observed_identity.observed_at).isoformat()
+    async with pool.acquire() as connection, connection.transaction():
+        await connection.execute(
+            """INSERT INTO whatsapp_account_control_events(
+                   session_name,event_type,reason,outbox_event_id,details
+               ) VALUES($1,$2,$3,$4,$5::jsonb)""",
+            session_name,
+            event_type,
+            reason,
+            outbox_event_id,
+            details,
+        )
+
+
+async def pin_whatsapp_account_identity(
+    pool: asyncpg.Pool,
+    client: WahaClient,
+    *,
+    actor_user_id: UUID,
+    expected_account_jid: str,
+    reason: str,
+    now: datetime | None = None,
+) -> int:
+    """Pin an owner-confirmed live self JID without changing send gates."""
+
+    expected_jid = normalize_account_jid(expected_account_jid)
+    reason = _reason(reason)
+    async with pool.acquire() as connection:
+        await authorize_session_owner(
+            connection, client.session_name, actor_user_id, require_all=True
+        )
+    identity: WahaAccountIdentity = await client.get_account_identity()
+    if identity.account_jid != expected_jid:
+        raise PermissionError("live WAHA identity differs from the owner-confirmed identity")
+    session_name = client.session_name
+    async with pool.acquire() as connection:
+        await authorize_session_owner(connection, session_name, actor_user_id, require_all=True)
+        async with connection.transaction():
+            await ensure_account(connection, session_name)
+            account = await connection.fetchrow(
+                "SELECT * FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+                session_name,
+            )
+            if account is None:
+                raise RuntimeError("WhatsApp account control row disappeared")
+            current = _now(now)
+            observed_at = _now(identity.observed_at)
+            if not timedelta(0) <= current - observed_at <= ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE:
+                raise PermissionError("live WAHA identity observation is stale or future-dated")
+            active_post = await connection.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
+                   WHERE session_name=$1 AND state='reserved')""",
+                session_name,
+            )
+            if active_post:
+                raise PermissionError(
+                    "cannot change account pin while a send reservation is active"
+                )
+            version = int(account["pin_version"]) + 1
+            event_type = (
+                "account_identity_pinned"
+                if account["pinned_account_jid"] is None
+                else "account_identity_changed"
+            )
+            await connection.execute(
+                """UPDATE whatsapp_account_controls SET pinned_account_jid=$2,
+                       pinned_by=$3,pinned_at=$4,pin_observed_at=$5,pin_version=$6,
+                       updated_at=$4 WHERE session_name=$1""",
+                session_name,
+                identity.account_jid,
+                actor_user_id,
+                current,
+                identity.observed_at,
+                version,
+            )
+            await connection.execute(
+                """INSERT INTO whatsapp_account_control_events(
+                       session_name,event_type,reason,actor_user_id,details
+                   ) VALUES($1,$2,$3,$4,$5::jsonb)""",
+                session_name,
+                event_type,
+                reason,
+                actor_user_id,
+                {
+                    "account_jid": identity.account_jid,
+                    "pin_version": version,
+                    "observed_at": identity.observed_at.isoformat(),
+                },
+            )
+    return version
 
 
 async def set_account_hold(
@@ -318,9 +464,7 @@ async def configure_account_budget(
         raise ValueError("max_concurrent_posts must be between 1 and 4")
     reason = _reason(reason)
     current = _now(now)
-    await _authorize_session_owner(
-        connection, session_name, actor_user_id, require_all=True
-    )
+    await _authorize_session_owner(connection, session_name, actor_user_id, require_all=True)
     await ensure_account(connection, session_name)
     async with connection.transaction():
         await connection.fetchrow(
@@ -429,9 +573,7 @@ async def request_account_probe(
     reason = _reason(reason)
     current = _now(now)
     if actor_user_id is not None:
-        await _authorize_session_owner(
-            connection, session_name, actor_user_id, require_all=False
-        )
+        await _authorize_session_owner(connection, session_name, actor_user_id, require_all=False)
     await ensure_account(connection, session_name)
     async with connection.transaction():
         await connection.execute(
@@ -463,6 +605,10 @@ async def reserve_outbound(
     *,
     provider_request_id: str,
     worker_id: str,
+    identity_observation: WahaAccountIdentity | None = None,
+    expected_account_jid: str | None = None,
+    expected_pin_version: int | None = None,
+    expected_session_name: str | None = None,
     lease_seconds: int = 60,
     now: datetime | None = None,
 ) -> WhatsAppAccountReservation | None:
@@ -483,8 +629,6 @@ async def reserve_outbound(
     from procurement_bot.phone import normalize_phone
 
     recipient = normalize_phone(recipient)
-    local = current.astimezone(ZoneInfo(ACCOUNT_TIMEZONE))
-    day_started_at = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
     async with pool.acquire() as connection, connection.transaction():
         from procurement_bot.whatsapp_delivery import (
             assert_whatsapp_delivery_allowed_on_connection,
@@ -514,6 +658,8 @@ async def reserve_outbound(
         ):
             raise ValueError("WhatsApp reservation recipient differs from active contact")
         session_name = identity["session_name"]
+        if expected_session_name is not None and session_name != expected_session_name:
+            raise _blocked("waha_session_mismatch", now=_now(now))
         account = await ensure_account(connection, session_name)
         account = await connection.fetchrow(
             "SELECT * FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
@@ -521,6 +667,35 @@ async def reserve_outbound(
         )
         if account is None:
             raise RuntimeError("WhatsApp account control row disappeared")
+        current = _now(now)  # Account-lock waits must count toward observation age.
+        local = current.astimezone(ZoneInfo(ACCOUNT_TIMEZONE))
+        day_started_at = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+        if not account["pinned_account_jid"] or int(account["pin_version"]) < 1:
+            raise _blocked("whatsapp_account_identity_not_pinned", now=current)
+        if (
+            identity_observation is None
+            or expected_account_jid is None
+            or expected_pin_version is None
+        ):
+            raise _blocked("whatsapp_account_identity_observation_required", now=current)
+        expected_jid = normalize_account_jid(expected_account_jid)
+        observed_jid = normalize_account_jid(identity_observation.account_jid)
+        observed_at = _now(identity_observation.observed_at)
+        age = current - observed_at
+        if age < timedelta(0) or age > ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE:
+            raise WhatsAppSendDeferred(
+                available_at=current + timedelta(minutes=1),
+                reason="whatsapp_account_identity_observation_stale",
+            )
+        if (
+            account["pinned_account_jid"] != expected_jid
+            or int(account["pin_version"]) != expected_pin_version
+            or observed_jid != expected_jid
+        ):
+            raise WhatsAppSendDeferred(
+                available_at=current + timedelta(minutes=30),
+                reason="whatsapp_account_identity_changed",
+            )
         expired = await connection.fetch(
             """SELECT outbox_event_id FROM whatsapp_account_send_reservations
                WHERE session_name=$1 AND state='reserved'
@@ -533,7 +708,7 @@ async def reserve_outbound(
             expired_ids = [row["outbox_event_id"] for row in expired]
             await connection.execute(
                 """UPDATE whatsapp_account_send_reservations SET state='unknown',
-                       post_worker=NULL,post_lease_expires_at=NULL,updated_at=$2
+                       post_worker=NULL,post_generation=NULL,post_lease_expires_at=NULL,updated_at=$2
                    WHERE outbox_event_id=ANY($1::uuid[])""",
                 expired_ids,
                 current,
@@ -641,8 +816,9 @@ async def reserve_outbound(
             """INSERT INTO whatsapp_account_send_reservations(
                    outbox_event_id,session_name,conversation_id,supplier_contact_id,
                    state,is_new_contact,reserved_at,post_worker,post_generation,
-                   post_lease_expires_at
-               ) VALUES($1,$2,$3,$4,'reserved',$5,$6,$7,$8,$9)
+                   post_lease_expires_at,pinned_account_jid,account_pin_version,
+                   observed_account_jid,account_identity_observed_at
+               ) VALUES($1,$2,$3,$4,'reserved',$5,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT(outbox_event_id) DO NOTHING""",
             event.id,
             session_name,
@@ -653,10 +829,15 @@ async def reserve_outbound(
             worker_id,
             generation,
             lease_expires_at,
+            account["pinned_account_jid"],
+            account["pin_version"],
+            observed_jid,
+            observed_at,
         )
         stored = await connection.fetchrow(
             """SELECT session_name,conversation_id,supplier_contact_id,state,
-                      post_worker,post_generation,post_lease_expires_at
+                      post_worker,post_generation,post_lease_expires_at,
+                      pinned_account_jid,account_pin_version
                FROM whatsapp_account_send_reservations WHERE outbox_event_id=$1 FOR UPDATE""",
             event.id,
         )
@@ -667,6 +848,8 @@ async def reserve_outbound(
             or stored["state"] != "reserved"
             or stored["post_worker"] != worker_id
             or int(stored["post_generation"] or 0) != generation
+            or stored["pinned_account_jid"] != account["pinned_account_jid"]
+            or int(stored["account_pin_version"] or 0) != int(account["pin_version"])
         ):
             raise RuntimeError("conflicting WhatsApp account reservation exists")
         updated = await connection.execute(
@@ -680,13 +863,26 @@ async def reserve_outbound(
         )
         if updated != "UPDATE 1":
             raise RuntimeError("outbox lease changed before account reservation")
+        # Budget/outbox row-lock waits must not let an old observation commit.
+        if not timedelta(0) <= _now(now) - observed_at <= ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE:
+            raise WhatsAppSendDeferred(
+                available_at=_now(now) + timedelta(minutes=1),
+                reason="whatsapp_account_identity_observation_stale",
+            )
         await connection.execute(
             """INSERT INTO whatsapp_account_control_events(
                    session_name,event_type,reason,actor_user_id,outbox_event_id,details
                ) VALUES($1,'send_reserved','final_post_reservation',NULL,$2,$3::jsonb)""",
             session_name,
             event.id,
-            {"is_new_contact": is_new_contact, "generation": generation},
+            {
+                "is_new_contact": is_new_contact,
+                "generation": generation,
+                "pinned_account_jid": expected_jid,
+                "observed_account_jid": observed_jid,
+                "pin_version": expected_pin_version,
+                "observed_at": observed_at.isoformat(),
+            },
         )
         return WhatsAppAccountReservation(
             outbox_event_id=event.id,
@@ -695,6 +891,8 @@ async def reserve_outbound(
             is_new_contact=is_new_contact,
             generation=generation,
             lease_expires_at=lease_expires_at,
+            pinned_account_jid=account["pinned_account_jid"],
+            account_pin_version=int(account["pin_version"]),
         )
 
 
@@ -745,6 +943,25 @@ async def mark_outcome(
     current = _now(now)
     accepted = _now(accepted_at) if accepted_at is not None else current
     async with connection.transaction():
+        session_name = await connection.fetchval(
+            "SELECT session_name FROM whatsapp_account_send_reservations WHERE outbox_event_id=$1",
+            event_id,
+        )
+        if session_name is None:
+            session_name = await connection.fetchval(
+                """SELECT conversation.session_name FROM outbox_events event
+                   JOIN supplier_conversations conversation
+                     ON conversation.id::text=event.payload->>'conversation_id'
+                   WHERE event.id=$1 AND event.event_type='whatsapp.send_text'""",
+                event_id,
+            )
+        if session_name is None:
+            raise ValueError("WhatsApp account reservation does not exist")
+        await ensure_account(connection, session_name)
+        account = await connection.fetchrow(
+            "SELECT * FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+            session_name,
+        )
         reservation = await connection.fetchrow(
             """SELECT * FROM whatsapp_account_send_reservations
                WHERE outbox_event_id=$1 FOR UPDATE""",
@@ -799,10 +1016,7 @@ async def mark_outcome(
             )
             if reservation is None:
                 raise RuntimeError("legacy WhatsApp reservation adoption failed")
-        account = await connection.fetchrow(
-            "SELECT * FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
-            reservation["session_name"],
-        )
+
         if account is None:
             raise RuntimeError("WhatsApp account control row disappeared")
         old_state = reservation["state"]
@@ -811,19 +1025,27 @@ async def mark_outcome(
         accepted_value = (
             reservation["accepted_at"] or accepted if next_state == "accepted" else None
         )
-        outcome_source = source or {
-            "accepted": "reconciliation" if state == "accepted" else "reservation",
-            "unknown": "reservation",
-            "rejected": "provider_rejection",
-        }[state]
+        outcome_source = (
+            source
+            or {
+                "accepted": "reconciliation" if state == "accepted" else "reservation",
+                "unknown": "reservation",
+                "rejected": "provider_rejection",
+            }[state]
+        )
         if outcome_source not in {
-            "reservation", "http", "reconciliation", "reconstructed_native_trace",
-            "operator_reconciliation", "provider_rejection", "migration",
+            "reservation",
+            "http",
+            "reconciliation",
+            "reconstructed_native_trace",
+            "operator_reconciliation",
+            "provider_rejection",
+            "migration",
         }:
             raise ValueError("invalid WhatsApp send outcome source")
         await connection.execute(
             """UPDATE whatsapp_account_send_reservations SET state=$2,
-                   accepted_at=$3,outcome_source=$4,post_worker=NULL,
+                   accepted_at=$3,outcome_source=$4,post_worker=NULL,post_generation=NULL,
                    post_lease_expires_at=NULL,updated_at=$5
                WHERE outbox_event_id=$1""",
             event_id,
@@ -856,9 +1078,7 @@ async def mark_outcome(
                 now=current,
             )
         else:
-            await _recover_circuit_if_resolved(
-                connection, reservation["session_name"], current
-            )
+            await _recover_circuit_if_resolved(connection, reservation["session_name"], current)
 
 
 async def trip_circuit_breaker(

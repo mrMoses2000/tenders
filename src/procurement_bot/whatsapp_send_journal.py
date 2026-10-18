@@ -9,7 +9,11 @@ from uuid import UUID
 import asyncpg
 
 from procurement_bot.errors import PermanentProviderError
-from procurement_bot.providers.waha import WahaSendResult, normalize_chat_id
+from procurement_bot.providers.waha import (
+    WahaSendResult,
+    normalize_account_jid,
+    normalize_chat_id,
+)
 from procurement_bot.queue import ClaimedOutbox
 from procurement_bot.whatsapp_delivery import parse_whatsapp_delivery_payload
 
@@ -72,6 +76,17 @@ async def load_acceptance(
         or not isinstance(result_identity.get("provider_result"), dict)
     ):
         raise PermanentProviderError("WAHA send journal result is invalid")
+    identity_values = (
+        row["account_jid"],
+        row["account_pin_version"],
+        row["account_identity_observed_at"],
+    )
+    if any(value is not None for value in identity_values):
+        if any(value is None for value in identity_values):
+            raise PermanentProviderError("WAHA send journal account identity is incomplete")
+        normalize_account_jid(row["account_jid"])
+        if int(row["account_pin_version"]) < 1:
+            raise PermanentProviderError("WAHA send journal account pin version is invalid")
     return row, WahaSendResult(
         external_message_id=row["external_message_id"],
         raw=result_identity["provider_result"],
@@ -84,8 +99,17 @@ async def load_reconciliation_identity(
 ) -> dict[str, Any] | None:
     payload, _expected_chat = _expected_payload(event)
     return await connection.fetchrow(
-        "SELECT session_name,external_chat_id FROM supplier_conversations WHERE id=$1",
+        """SELECT conversation.session_name,conversation.external_chat_id,
+                  reservation.pinned_account_jid,reservation.observed_account_jid,
+                  reservation.account_pin_version,reservation.account_identity_observed_at,
+                  reservation.state
+           FROM supplier_conversations conversation
+           LEFT JOIN whatsapp_account_send_reservations reservation
+             ON reservation.outbox_event_id=$2
+            AND reservation.conversation_id=conversation.id
+           WHERE conversation.id=$1""",
         payload.conversation_id,
+        event.id,
     )
 
 
@@ -140,16 +164,57 @@ async def persist_acceptance(
     result: WahaSendResult,
     source: str,
     accepted_at: datetime | None = None,
+    account_jid: str | None = None,
+    account_pin_version: int | None = None,
+    account_identity_observed_at: datetime | None = None,
 ) -> None:
     if source not in {"http", "reconciliation", "reconstructed_native_trace"}:
         raise ValueError("invalid WAHA acceptance source")
     if not session_name or not external_chat_id or not provider_request_id:
         raise ValueError("WAHA acceptance identity is incomplete")
+    identity_values = (account_jid, account_pin_version, account_identity_observed_at)
+    if source == "http" and any(value is None for value in identity_values):
+        raise ValueError("new WAHA acceptance requires an observed account identity")
+    if any(value is not None for value in identity_values):
+        if any(value is None for value in identity_values):
+            raise ValueError("WAHA acceptance account identity is incomplete")
+        account_jid = normalize_account_jid(account_jid)
+        if int(account_pin_version) < 1:
+            raise ValueError("WAHA acceptance account pin version is invalid")
+        if account_identity_observed_at.tzinfo is None:
+            raise ValueError("WAHA account identity observation time must be timezone-aware")
     if source == "reconciliation" and result.external_message_id not in {
         provider_request_id,
         f"true_{external_chat_id}_{provider_request_id}",
     }:
         raise PermanentProviderError("reconciled WAHA message id differs from reservation")
+    if source == "http" or account_jid is not None:
+        # Same account -> reservation order as reserve_outbound/mark_outcome/pin.
+        await connection.fetchrow(
+            "SELECT session_name FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+            session_name,
+        )
+        reservation = await connection.fetchrow(
+            """SELECT session_name,pinned_account_jid,observed_account_jid,
+                      account_pin_version,account_identity_observed_at,state,conversation_id
+               FROM whatsapp_account_send_reservations
+               WHERE outbox_event_id=$1 FOR UPDATE""",
+            event.id,
+        )
+        if (
+            reservation is None
+            or reservation["session_name"] != session_name
+            or reservation["pinned_account_jid"] != account_jid
+            or reservation["observed_account_jid"] != account_jid
+            or reservation["account_pin_version"] != account_pin_version
+            or reservation["account_identity_observed_at"] != account_identity_observed_at
+            or reservation["conversation_id"] != _expected_payload(event)[0].conversation_id
+            or reservation["state"]
+            not in ({"reserved"} if source == "http" else {"reserved", "unknown", "accepted"})
+        ):
+            raise PermanentProviderError(
+                "WAHA acceptance identity does not match the reserved physical action"
+            )
     payload, expected_chat = _expected_payload(event)
     if external_chat_id != expected_chat:
         raise PermanentProviderError("WAHA acceptance chat differs from approved recipient")
@@ -187,8 +252,9 @@ async def persist_acceptance(
         """INSERT INTO whatsapp_send_acceptance_journal(
             outbox_event_id,idempotency_key,session_name,external_chat_id,
             provider_request_id,payload_sha256,external_message_id,source,
-            result_identity,accepted_at
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+            result_identity,accepted_at,account_jid,account_pin_version,
+            account_identity_observed_at
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13)
         ON CONFLICT(outbox_event_id) DO NOTHING""",
         event.id,
         event.idempotency_key,
@@ -200,6 +266,9 @@ async def persist_acceptance(
         source,
         result_identity,
         timestamp,
+        account_jid,
+        account_pin_version,
+        account_identity_observed_at,
     )
     persisted = await connection.fetchrow(
         "SELECT * FROM whatsapp_send_acceptance_journal WHERE outbox_event_id=$1",
@@ -213,6 +282,9 @@ async def persist_acceptance(
         or persisted["provider_request_id"] != provider_request_id
         or persisted["payload_sha256"].strip() != request_hash
         or persisted["external_message_id"] != result.external_message_id
+        or persisted["account_jid"] != account_jid
+        or persisted["account_pin_version"] != account_pin_version
+        or persisted["account_identity_observed_at"] != account_identity_observed_at
     ):
         raise PermanentProviderError("conflicting WAHA acceptance already exists")
 
@@ -239,9 +311,12 @@ async def mark_acceptance_unknown(
         from procurement_bot.pipeline_reviews import record_review
 
         await record_review(
-            connection, case_id=UUID(str(event.payload["case_id"])),
-            kind="unknown_send", subject_id=event.id,
-            conversation_id=conversation_id, reason_code="provider_acceptance_unknown",
+            connection,
+            case_id=UUID(str(event.payload["case_id"])),
+            kind="unknown_send",
+            subject_id=event.id,
+            conversation_id=conversation_id,
+            reason_code="provider_acceptance_unknown",
         )
     return changed == "UPDATE 1"
 

@@ -4,12 +4,14 @@ import asyncio
 import json
 import os
 import posixpath
+import re
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
@@ -196,9 +198,24 @@ class WahaContactCheck:
     chat_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class WahaAccountIdentity:
+    account_jid: str
+    observed_at: datetime
+
+
 def normalize_chat_id(recipient: str) -> str:
     canonical = normalize_phone(recipient)
     return f"{canonical.removeprefix('+')}@c.us"
+
+
+def normalize_account_jid(value: object) -> str:
+    if not isinstance(value, str):
+        raise PermanentProviderError("WAHA authenticated account identity is missing")
+    candidate = value.strip()
+    if not re.fullmatch(r"[0-9]{6,20}@c\.us", candidate):
+        raise PermanentProviderError("WAHA authenticated account identity is invalid")
+    return candidate
 
 
 class WahaClient:
@@ -337,6 +354,36 @@ class WahaClient:
         else:
             result["state"] = "unknown"
         return result
+
+    async def get_account_identity(self) -> WahaAccountIdentity:
+        """Read the authenticated self JID; this is never an outbound operation."""
+
+        if not self._enabled or not self._api_key:
+            raise WahaDisabledError("WAHA access is disabled or unconfigured")
+        response = await self._transport.request(
+            method="GET",
+            url=urljoin(
+                self._base_url,
+                f"api/sessions/{quote(self._session, safe='')}/me",
+            ),
+            headers={"Accept": "application/json", "X-Api-Key": self._api_key},
+            body=None,
+            timeout_seconds=self._timeout_seconds,
+        )
+        if response.status == 404:
+            raise RetryableProviderError("WAHA authenticated account identity is unavailable")
+        if response.status == 429 or response.status >= 500:
+            raise RetryableProviderError(f"WAHA temporary error ({response.status})")
+        if not 200 <= response.status < 300:
+            raise PermanentProviderError(f"WAHA rejected the request ({response.status})")
+        try:
+            value = json.loads(response.body or b"null")
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise PermanentProviderError("WAHA returned an invalid account identity") from exc
+        if not isinstance(value, dict):
+            raise RetryableProviderError("WAHA authenticated account identity is unavailable")
+        account_jid = normalize_account_jid(value.get("id"))
+        return WahaAccountIdentity(account_jid, datetime.now(UTC))
 
     async def get_session_details(self) -> dict[str, Any]:
         result = await self._session_get()

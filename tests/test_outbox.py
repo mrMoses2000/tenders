@@ -5,7 +5,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,10 +21,13 @@ from procurement_bot.outbox import (
     WhatsAppOutboxWorker,
     WhatsAppSendOutcomeUnknown,
 )
-from procurement_bot.providers.waha import WahaSendResult
+from procurement_bot.providers.waha import WahaAccountIdentity, WahaSendResult
 from procurement_bot.queue import ClaimedOutbox
 from procurement_bot.supplier_dialogue import WhatsAppSendDeferred
-from procurement_bot.whatsapp_account import WhatsAppAccountReservation
+from procurement_bot.whatsapp_account import (
+    WhatsAppAccountIdentityPin,
+    WhatsAppAccountReservation,
+)
 from procurement_bot.whatsapp_send_journal import (
     exact_recovered_message,
     load_acceptance,
@@ -144,8 +147,13 @@ async def test_whatsapp_acceptance_journal_persists_and_is_immutable() -> None:
         approval_id = uuid4()
         owner_id = uuid4()
         case_id = uuid4()
+        supplier_id = uuid4()
+        evidence_id = uuid4()
+        contact_id = uuid4()
+        conversation_id = uuid4()
         request_id = "reserved-42"
         key = f"event:{uuid4().hex}"
+        accepted_at = datetime.now(UTC)
         payload = {
             "case_id": str(uuid4()),
             "channel": "whatsapp",
@@ -155,6 +163,7 @@ async def test_whatsapp_acceptance_journal_persists_and_is_immutable() -> None:
             "logical_action_id": "availability-v1",
             "is_followup": False,
         }
+        payload["conversation_id"] = str(conversation_id)
         async with pool.acquire() as connection:
             await connection.execute(
                 "INSERT INTO users(id,telegram_id) VALUES($1,$2)",
@@ -165,6 +174,39 @@ async def test_whatsapp_acceptance_journal_persists_and_is_immutable() -> None:
                 "INSERT INTO procurement_cases(id,owner_user_id) VALUES($1,$2)",
                 case_id,
                 owner_id,
+            )
+            await connection.execute(
+                """INSERT INTO source_evidence(
+                       source_type,source_locator,captured_at,content_sha256,raw_payload,
+                       idempotency_key
+                   ) VALUES('manual','journal-test',now(),$1,'{}'::jsonb,$2)""",
+                "a" * 64,
+                f"journal-evidence:{evidence_id}",
+            )
+            await connection.execute(
+                "INSERT INTO suppliers(id,display_name) VALUES($1,'Journal test supplier')",
+                supplier_id,
+            )
+            await connection.execute(
+                """INSERT INTO supplier_contacts(
+                       id,supplier_id,contact_type,display_value,normalized_value,
+                       source_evidence_id
+                   ) SELECT $1,$2,'phone','+77000000003','77000000003',id
+                     FROM source_evidence WHERE idempotency_key=$3""",
+                contact_id,
+                supplier_id,
+                f"journal-evidence:{evidence_id}",
+            )
+            await connection.execute(
+                """INSERT INTO supplier_conversations(
+                       id,case_id,supplier_id,supplier_contact_id,session_name,
+                       external_chat_id,idempotency_key
+                   ) VALUES($1,$2,$3,$4,'default','77000000003@c.us',$5)""",
+                conversation_id,
+                case_id,
+                supplier_id,
+                contact_id,
+                f"journal-conversation:{conversation_id}",
             )
             payload["case_id"] = str(case_id)
             await connection.execute(
@@ -188,6 +230,28 @@ async def test_whatsapp_acceptance_journal_persists_and_is_immutable() -> None:
                 request_id,
                 approval_id,
             )
+            await connection.execute(
+                """INSERT INTO whatsapp_account_controls(
+                       session_name,pinned_account_jid,pinned_by,pinned_at,
+                       pin_observed_at,pin_version
+                   ) VALUES('default','77000000003@c.us',$1,$2,$2,1)""",
+                owner_id,
+                accepted_at,
+            )
+            await connection.execute(
+                """INSERT INTO whatsapp_account_send_reservations(
+                       outbox_event_id,session_name,conversation_id,supplier_contact_id,
+                       state,is_new_contact,reserved_at,post_worker,post_generation,
+                       post_lease_expires_at,pinned_account_jid,account_pin_version,
+                       observed_account_jid,account_identity_observed_at
+                   ) VALUES($1,'default',$2,$3,'reserved',TRUE,now(),'journal-test',1,
+                            now()+interval '5 minutes','77000000003@c.us',1,
+                            '77000000003@c.us',$4)""",
+                event_id,
+                conversation_id,
+                contact_id,
+                accepted_at,
+            )
         event = ClaimedOutbox(
             id=event_id,
             event_type="whatsapp.send_text",
@@ -200,7 +264,6 @@ async def test_whatsapp_acceptance_journal_persists_and_is_immutable() -> None:
             approval_id=uuid4(),
             provider_request_id=request_id,
         )
-        accepted_at = datetime.now(UTC)
         async with pool.acquire() as connection, connection.transaction():
             await persist_acceptance(
                 connection,
@@ -214,12 +277,18 @@ async def test_whatsapp_acceptance_journal_persists_and_is_immutable() -> None:
                 ),
                 source="http",
                 accepted_at=accepted_at,
+                account_jid="77000000003@c.us",
+                account_pin_version=1,
+                account_identity_observed_at=accepted_at,
             )
         async with pool.acquire() as connection:
             stored = await load_acceptance(connection, event)
             assert stored is not None
             row, result = stored
             assert row["accepted_at"] == accepted_at
+            assert row["account_jid"] == "77000000003@c.us"
+            assert row["account_pin_version"] == 1
+            assert row["account_identity_observed_at"] == accepted_at
             assert result.external_message_id == "true_77000000003@c.us_reserved-42"
             with pytest.raises(
                 asyncpg.PostgresError, match="supplier conversation messages are immutable"
@@ -355,6 +424,10 @@ async def test_whatsapp_worker_passes_outbox_key_to_provider(
         async def new_message_id(self) -> str:
             return "reserved-42"
 
+        async def get_account_identity(self) -> WahaAccountIdentity:
+            calls["identity_checked"] = True
+            return WahaAccountIdentity("77000000003@c.us", datetime.now(UTC))
+
         async def send_text(self, **kwargs: object) -> WahaSendResult:
             calls.update(kwargs)
             return WahaSendResult(external_message_id="wa-42", raw={"id": "wa-42"})
@@ -381,7 +454,11 @@ async def test_whatsapp_worker_passes_outbox_key_to_provider(
     async def fake_acceptance(*_args: object, **_kwargs: object):
         return None
 
-    async def fake_reserve(_pool, reserved_event, *, provider_request_id, worker_id, lease_seconds):
+    async def fake_reserve(_pool, reserved_event, **kwargs):
+        identity = kwargs["identity_observation"]
+        calls["identity_observation"] = (identity.account_jid, kwargs["worker_id"])
+        assert kwargs["expected_account_jid"] == identity.account_jid
+        assert kwargs["expected_pin_version"] == 1
         return WhatsAppAccountReservation(
             outbox_event_id=reserved_event.id,
             session_name="default",
@@ -389,7 +466,12 @@ async def test_whatsapp_worker_passes_outbox_key_to_provider(
             is_new_contact=True,
             generation=1,
             lease_expires_at=datetime.now(UTC),
+            pinned_account_jid="77000000003@c.us",
+            account_pin_version=1,
         )
+
+    async def fake_pin(*_args):
+        return WhatsAppAccountIdentityPin("77000000003@c.us", 1)
 
     async def fake_mark_outcome(*_args: object, **_kwargs: object) -> None:
         return None
@@ -406,6 +488,7 @@ async def test_whatsapp_worker_passes_outbox_key_to_provider(
     monkeypatch.setattr("procurement_bot.outbox.claim_whatsapp_outbox", fake_claim)
     monkeypatch.setattr("procurement_bot.outbox.load_acceptance", fake_acceptance)
     monkeypatch.setattr("procurement_bot.outbox.reserve_outbound", fake_reserve)
+    monkeypatch.setattr("procurement_bot.outbox.load_account_identity_pin", fake_pin)
     monkeypatch.setattr("procurement_bot.outbox.mark_outcome", fake_mark_outcome)
     monkeypatch.setattr("procurement_bot.outbox.persist_acceptance", fake_persist)
 
@@ -441,7 +524,119 @@ async def test_whatsapp_worker_passes_outbox_key_to_provider(
         "external_id": "wa-42",
         "journal_source": "http",
         "completion_after_journal": True,
+        "identity_checked": True,
+        "identity_observation": ("77000000003@c.us", "whatsapp-worker"),
     }
+
+
+@pytest.mark.asyncio
+async def test_pinned_account_mismatch_defers_before_request_id_or_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = replace(
+        _event(
+            "whatsapp.send_text",
+            {
+                "case_id": str(uuid4()),
+                "channel": "whatsapp",
+                "recipient": "+77000000003",
+                "text": "Здравствуйте",
+                "conversation_id": str(uuid4()),
+                "logical_action_id": "availability-v1",
+                "is_followup": False,
+            },
+        ),
+        provider_request_id=None,
+    )
+    actor = ChatActorLease(
+        actor_id=uuid4(),
+        session_name="default",
+        external_chat_id="77000000003@c.us",
+        worker_id="whatsapp-worker",
+        generation=1,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=2),
+    )
+    calls: dict[str, object] = {}
+
+    class Client:
+        session_name = "default"
+
+        async def new_message_id(self) -> str:
+            raise AssertionError("mismatch must not allocate a request ID")
+
+        async def get_account_identity(self) -> WahaAccountIdentity:
+            calls["identity_read"] = True
+            return WahaAccountIdentity("77000000004@c.us", datetime.now(UTC))
+
+        async def send_text(self, **_kwargs: object) -> WahaSendResult:
+            calls["post"] = True
+            raise AssertionError("identity mismatch must block POST")
+
+    async def claim(*_args: object, **_kwargs: object):
+        return event, actor
+
+    async def reserve(*_args, **_kwargs):
+        raise AssertionError("mismatch must not reserve")
+
+    async def pin(*_args):
+        return WhatsAppAccountIdentityPin("77000000003@c.us", 7)
+
+    async def record(_pool, **kwargs):
+        calls["audit"] = kwargs["event_type"]
+        calls["observed"] = kwargs["observed_identity"].account_jid
+
+    async def defer(_pool, _event, **kwargs):
+        calls["deferred"] = kwargs["reason"]
+        return True
+
+    async def empty(*_args: object, **_kwargs: object):
+        return None
+
+    async def allowed(*_args: object, **_kwargs: object):
+        return type(
+            "Delivery",
+            (),
+            {"session_name": "default", "external_chat_id": "77000000003@c.us"},
+        )()
+
+    async def validate(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def mark(_connection, _event_id, **kwargs: object) -> None:
+        calls["outcome"] = kwargs
+
+    async def fail(_pool, _event, _code: str, *, retryable: bool) -> bool:
+        calls["failed_retryable"] = retryable
+        return True
+
+    async def release(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr("procurement_bot.outbox.claim_whatsapp_outbox", claim)
+    monkeypatch.setattr("procurement_bot.outbox.reserve_outbound", reserve)
+    monkeypatch.setattr("procurement_bot.outbox.load_account_identity_pin", pin)
+    monkeypatch.setattr("procurement_bot.outbox.record_account_identity_preflight_event", record)
+    monkeypatch.setattr("procurement_bot.outbox.defer_outbox", defer)
+    monkeypatch.setattr("procurement_bot.outbox.load_acceptance", empty)
+    monkeypatch.setattr("procurement_bot.outbox.assert_whatsapp_delivery_allowed", allowed)
+    monkeypatch.setattr("procurement_bot.outbox.validate_consumed_approval", validate)
+    monkeypatch.setattr("procurement_bot.outbox.mark_outcome", mark)
+    monkeypatch.setattr("procurement_bot.outbox.fail_outbox", fail)
+    monkeypatch.setattr("procurement_bot.outbox.release_chat_actor", release)
+
+    worker = WhatsAppOutboxWorker(
+        pool=_FakePool(),  # type: ignore[arg-type]
+        client=Client(),  # type: ignore[arg-type]
+        worker_id="whatsapp-worker",
+    )
+    assert await worker.run_once()
+    assert calls["identity_read"] is True
+    assert calls["observed"] == "77000000004@c.us"
+    assert "post" not in calls
+    assert "outcome" not in calls
+    assert "failed_retryable" not in calls
+    assert calls["audit"] == "account_identity_mismatch"
+    assert calls["deferred"] == "whatsapp_account_identity_mismatch"
 
 
 @pytest.mark.asyncio
@@ -473,9 +668,13 @@ async def test_reserved_request_without_journal_defers_unknown_and_never_reposts
     class Client:
         session_name = "default"
 
+        async def get_account_identity(self):
+            raise AssertionError("NULL-identity legacy action must not query current account")
+
         async def fetch_message(self, chat_id: str, message_id: str):
-            calls["lookup"] = (chat_id, message_id)
-            return None
+            raise AssertionError(
+                "NULL-identity legacy action must not query message under new owner"
+            )
 
     async def claim(*_args: object, **kwargs: object):
         calls["selected_event_id"] = kwargs.get("event_id")
@@ -485,7 +684,15 @@ async def test_reserved_request_without_journal_defers_unknown_and_never_reposts
         return None
 
     async def identity(*_args: object, **_kwargs: object):
-        return {"session_name": "default", "external_chat_id": "77000000003@c.us"}
+        return {
+            "session_name": "default",
+            "external_chat_id": "77000000003@c.us",
+            "pinned_account_jid": None,
+            "observed_account_jid": None,
+            "account_pin_version": None,
+            "account_identity_observed_at": None,
+            "state": "unknown",
+        }
 
     async def mark_unknown(_connection, _event, *, conversation_id):
         calls["unknown_conversation"] = conversation_id
@@ -512,6 +719,7 @@ async def test_reserved_request_without_journal_defers_unknown_and_never_reposts
     monkeypatch.setattr("procurement_bot.outbox.load_acceptance", no_journal)
     monkeypatch.setattr("procurement_bot.outbox.load_reconciliation_identity", identity)
     monkeypatch.setattr("procurement_bot.outbox.mark_acceptance_unknown", mark_unknown)
+
     async def ignore_account_outcome(*_args: object, **_kwargs: object) -> None:
         return None
 
@@ -529,10 +737,7 @@ async def test_reserved_request_without_journal_defers_unknown_and_never_reposts
     )
     assert await worker.run_once(event_id=event.id)
     assert calls["selected_event_id"] == event.id
-    assert calls["lookup"] == (
-        "77000000003@c.us",
-        "true_77000000003@c.us_reserved-42",
-    )
+    assert "lookup" not in calls
     assert calls["unknown_conversation"] == UUID(event.payload["conversation_id"])
     deferred_id, available_at, reason = calls["deferred"]
     assert deferred_id == event.id
@@ -664,6 +869,9 @@ async def test_lost_chat_actor_cancels_and_reaps_send_and_blocks_event(
         async def new_message_id(self) -> str:
             return "reserved-before-blocked-send"
 
+        async def get_account_identity(self) -> WahaAccountIdentity:
+            return WahaAccountIdentity("77000000003@c.us", datetime.now(UTC))
+
         async def send_text(self, **_kwargs: object) -> WahaSendResult:
             provider_started.set()
             try:
@@ -701,9 +909,7 @@ async def test_lost_chat_actor_cancels_and_reaps_send_and_blocks_event(
     async def empty_acceptance(*_args: object, **_kwargs: object):
         return None
 
-    async def reserve_request(
-        _pool, reserved_event, *, provider_request_id, worker_id, lease_seconds
-    ):
+    async def reserve_request(_pool, reserved_event, **_kwargs):
         return WhatsAppAccountReservation(
             outbox_event_id=reserved_event.id,
             session_name="default",
@@ -711,6 +917,8 @@ async def test_lost_chat_actor_cancels_and_reaps_send_and_blocks_event(
             is_new_contact=True,
             generation=1,
             lease_expires_at=datetime.now(UTC),
+            pinned_account_jid="77000000003@c.us",
+            account_pin_version=1,
         )
 
     async def ignore_account_outcome(*_args: object, **_kwargs: object) -> None:
@@ -722,6 +930,11 @@ async def test_lost_chat_actor_cancels_and_reaps_send_and_blocks_event(
     monkeypatch.setattr("procurement_bot.outbox.load_acceptance", empty_acceptance)
     monkeypatch.setattr("procurement_bot.outbox.mark_acceptance_unknown", ignore_acceptance_unknown)
     monkeypatch.setattr("procurement_bot.outbox.reserve_outbound", reserve_request)
+
+    async def pin(*_args):
+        return WhatsAppAccountIdentityPin("77000000003@c.us", 1)
+
+    monkeypatch.setattr("procurement_bot.outbox.load_account_identity_pin", pin)
     monkeypatch.setattr("procurement_bot.outbox.mark_outcome", ignore_account_outcome)
     monkeypatch.setattr("procurement_bot.outbox.assert_whatsapp_delivery_allowed", allowed)
     monkeypatch.setattr("procurement_bot.outbox.validate_consumed_approval", validate)
@@ -731,7 +944,10 @@ async def test_lost_chat_actor_cancels_and_reaps_send_and_blocks_event(
 
     class LeaseLostWorker(WhatsAppOutboxWorker):
         async def _heartbeat(
-            self, _event: object, _actor: object, lease_lost: asyncio.Event,
+            self,
+            _event: object,
+            _actor: object,
+            lease_lost: asyncio.Event,
             _account_reservation: object,
         ) -> None:
             await provider_started.wait()
@@ -868,6 +1084,9 @@ async def test_waha_unready_session_defers_without_reserving_id_or_posting(
     class Client:
         session_name = "default"
 
+        async def get_account_identity(self):
+            return WahaAccountIdentity("77000000003@c.us", datetime.now(UTC))
+
         async def new_message_id(self) -> str:
             calls["reservation_attempt"] = True
             raise RetryableProviderError("WAHA session is not ready to reserve a message id")
@@ -901,6 +1120,11 @@ async def test_waha_unready_session_defers_without_reserving_id_or_posting(
     monkeypatch.setattr("procurement_bot.outbox.validate_consumed_approval", validate)
     monkeypatch.setattr("procurement_bot.outbox.defer_outbox", defer)
     monkeypatch.setattr("procurement_bot.outbox.release_chat_actor", release)
+
+    async def pin(*_args):
+        return WhatsAppAccountIdentityPin("77000000003@c.us", 1)
+
+    monkeypatch.setattr("procurement_bot.outbox.load_account_identity_pin", pin)
     worker = WhatsAppOutboxWorker(
         pool=_FakePool(),  # type: ignore[arg-type]
         client=Client(),  # type: ignore[arg-type]

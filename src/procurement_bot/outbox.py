@@ -20,7 +20,12 @@ from procurement_bot.chat_actors import (
     renew_chat_actor,
 )
 from procurement_bot.errors import PermanentProviderError, RetryableProviderError, ValidationBlocked
-from procurement_bot.providers.waha import WahaClient, WahaSendResult, normalize_chat_id
+from procurement_bot.providers.waha import (
+    WahaClient,
+    WahaSendResult,
+    normalize_account_jid,
+    normalize_chat_id,
+)
 from procurement_bot.queue import (
     ClaimedOutbox,
     claim_outbox,
@@ -46,7 +51,9 @@ from procurement_bot.telegram_outbox_payloads import (
 )
 from procurement_bot.whatsapp_account import (
     WhatsAppAccountReservation,
+    load_account_identity_pin,
     mark_outcome,
+    record_account_identity_preflight_event,
     renew_post_lease,
     reserve_outbound,
 )
@@ -261,14 +268,30 @@ class WhatsAppOutboxWorker:
                         or identity["external_chat_id"] != chat_id
                     ):
                         raise ValueError("reserved WAHA send identity changed")
-                    expected_full_id = f"true_{chat_id}_{provider_message_id}"
-                    received = await self.client.fetch_message(chat_id, expected_full_id)
-                    result = exact_recovered_message(
-                        received,
-                        expected_chat_id=chat_id,
-                        provider_request_id=provider_message_id,
-                        expected_text=payload_model.text,
-                    )
+                    if (
+                        identity is not None
+                        and identity["observed_account_jid"] is not None
+                        and identity["account_identity_observed_at"] is not None
+                        and identity["account_pin_version"] is not None
+                        and identity["state"] in {"reserved", "unknown", "accepted"}
+                        and identity["pinned_account_jid"] == identity["observed_account_jid"]
+                    ):
+                        live_identity = await self.client.get_account_identity()
+                        if live_identity.account_jid == identity["observed_account_jid"]:
+                            expected_full_id = f"true_{chat_id}_{provider_message_id}"
+                            received = await self.client.fetch_message(chat_id, expected_full_id)
+                            result = exact_recovered_message(
+                                received,
+                                expected_chat_id=chat_id,
+                                provider_request_id=provider_message_id,
+                                expected_text=payload_model.text,
+                            )
+                        else:
+                            result = None
+                    else:
+                        # Legacy reservations have no provable sender account. Do not
+                        # query a message ID under whichever account is connected now.
+                        result = None
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -308,6 +331,9 @@ class WhatsAppOutboxWorker:
                         provider_request_id=provider_message_id,
                         result=result,
                         source="reconciliation",
+                        account_jid=identity["observed_account_jid"],
+                        account_pin_version=identity["account_pin_version"],
+                        account_identity_observed_at=identity["account_identity_observed_at"],
                     )
                     await mark_outcome(
                         connection,
@@ -325,6 +351,42 @@ class WhatsAppOutboxWorker:
                     raise WhatsAppSendDeferred(
                         available_at=acceptance_unknown_due(), reason="waha_session_mismatch"
                     )
+                pin = await load_account_identity_pin(self.pool, delivery.session_name)
+                try:
+                    identity_observation = await self.client.get_account_identity()
+                    observed_jid = normalize_account_jid(identity_observation.account_jid)
+                except (
+                    PermanentProviderError,
+                    RetryableProviderError,
+                    OSError,
+                    TimeoutError,
+                ) as exc:
+                    await record_account_identity_preflight_event(
+                        self.pool,
+                        session_name=delivery.session_name,
+                        outbox_event_id=event.id,
+                        event_type="account_identity_check_failed",
+                        reason="preflight_self_identity_unavailable",
+                        pin=pin,
+                    )
+                    raise WhatsAppSendDeferred(
+                        available_at=acceptance_unknown_due(),
+                        reason="whatsapp_account_identity_check_failed",
+                    ) from exc
+                if observed_jid != pin.account_jid:
+                    await record_account_identity_preflight_event(
+                        self.pool,
+                        session_name=delivery.session_name,
+                        outbox_event_id=event.id,
+                        event_type="account_identity_mismatch",
+                        reason="preflight_self_identity_mismatch",
+                        pin=pin,
+                        observed_identity=identity_observation,
+                    )
+                    raise WhatsAppSendDeferred(
+                        available_at=acceptance_unknown_due(),
+                        reason="whatsapp_account_identity_mismatch",
+                    )
                 try:
                     provider_message_id = await self.client.new_message_id()
                 except RetryableProviderError as exc:
@@ -339,6 +401,10 @@ class WhatsAppOutboxWorker:
                     provider_request_id=provider_message_id,
                     worker_id=self.worker_id,
                     lease_seconds=self.lease_seconds,
+                    identity_observation=identity_observation,
+                    expected_account_jid=pin.account_jid,
+                    expected_pin_version=pin.version,
+                    expected_session_name=delivery.session_name,
                 )
                 if reservation is None:
                     raise WhatsAppSendDeferred(
@@ -378,6 +444,9 @@ class WhatsAppOutboxWorker:
                         provider_request_id=provider_message_id,
                         result=result,
                         source="http",
+                        account_jid=identity_observation.account_jid,
+                        account_pin_version=reservation.account_pin_version,
+                        account_identity_observed_at=identity_observation.observed_at,
                     )
                     await mark_outcome(
                         connection,
@@ -425,7 +494,8 @@ class WhatsAppOutboxWorker:
             raise
         except WhatsAppSendDeferred as exc:
             LOGGER.info(
-                "WhatsApp outbox reconciliation deferred" if event.provider_request_id
+                "WhatsApp outbox reconciliation deferred"
+                if event.provider_request_id
                 else "WhatsApp send deferred",
                 extra={
                     "job_id": event.id,
