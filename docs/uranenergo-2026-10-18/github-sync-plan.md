@@ -19,7 +19,7 @@ codex/uranenergo-pipeline-recovery-2026-10-18
 base 7ea41c0
 ```
 
-Only the new recovery docs under `docs/uranenergo-2026-10-18/` belong in its commit. The dirty source checkout remains untouched. Do not copy its uncommitted runtime changes, outputs, screenshots, build directories, `.env`, credential material, database dumps, raw Telegram files, contact details or case UUIDs into this branch.
+The first recovery commits contained only docs. Commit `2f7832c` is a separate, root-reviewed sanitized source checkpoint of explicitly allowlisted runtime/core/tests/migrations/build files. The dirty source checkout remains untouched; later syncs must continue using isolated worktrees, explicit path allowlists, sanitization, and review. Do not copy its uncommitted runtime changes, outputs, screenshots, build directories, `.env`, credential material, database dumps, raw Telegram files, contact details or case UUIDs into this branch.
 
 ## Repeatable sync procedure
 
@@ -29,7 +29,7 @@ Only the new recovery docs under `docs/uranenergo-2026-10-18/` belong in its com
 4. Review `git diff --cached --name-status`, `git diff --cached --check`, and the full staged patch. Confirm the staged set contains only the intended docs; scan it for credentials, tokens, private contact details, raw customer messages, database IDs/dumps and generated files.
 5. Commit with a narrow message. Check the commit's parents/base and `git show --stat --oneline --decorate HEAD`.
 6. Push the new branch by its exact name. Do not force-push or update `main` or the existing `codex/pipeline-v3-event-core` branch.
-7. Review the pushed commit on GitHub. A PR can be opened separately after the owner reviews the public-facing document contents.
+7. Review the pushed commit on GitHub. No PR or deployment is implied by the checkpoint. Any later PR requires separate owner review of the public-facing source and docs.
 
 ## Preserving the dirty pipeline work
 

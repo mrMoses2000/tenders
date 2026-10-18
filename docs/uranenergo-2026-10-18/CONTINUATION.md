@@ -8,14 +8,15 @@ This continuation is valid only against the pushed review branch below. The serv
 repo: mrMoses2000/tenders (public)
 branch: codex/uranenergo-pipeline-recovery-2026-10-18
 base: origin/main at 7ea41c0
-latest docs handoff commit: 4baa2384fba95352ff955ec9a11cc94231452fe6
+latest sanitized source checkpoint: 2f7832ce706ef2495b7cb127683def4abd5d7e80
+prior server continuation handshake: 4baa2384fba95352ff955ec9a11cc94231452fe6
 initial docs checkpoint commit: 191f4b8ea1b416cd660dae76e06f49cb297ff214
 handoff branch tip: verify with `git ls-remote origin refs/heads/codex/uranenergo-pipeline-recovery-2026-10-18`; it must include this handshake commit
 server checkout commit: report exact value before any action
 requested model: GPT-6.1-SOL, xhigh reasoning (runtime capability must be checked by root)
 ```
 
-The server continuation acknowledged the latest handoff in its isolated branch. See [server-continuation-ack.md](server-continuation-ack.md) for the sanitized read-only status.
+The server continuation acknowledged the prior handoff in its isolated branch. It must now fetch and acknowledge the exact source checkpoint SHA above in a separate clean review worktree. See [server-continuation-ack.md](server-continuation-ack.md) for its last reported status.
 
 Do not continue if the branch or commit differs from the handoff or the expected documents are missing. Report the mismatch before changing anything.
 
@@ -25,15 +26,15 @@ Recover the current UranEnergo case through the already deployed pipeline and Mi
 
 No new WAHA send is permitted until a root-reviewed account-binding design durably pins the intended account identity to each action and compares the live self identity to that pin immediately before sending. A current self-identity check does not establish the account used for historical sends. Preserve unknown-acceptance records and never replay an uncertain send.
 
-The docs branch is based on public `origin/main@7ea41c0` and is **not a runnable copy of the dirty pipeline checkout**. It lacks newer local modules, tests and migrations present in `codex/pipeline-v3-event-core@b4acafe`; see the [verification baseline](verification-baseline.md). The live server may run a third source state. Do not deploy or cherry-pick from this docs branch as if it contains the latest pipeline. The code review identified entities and interfaces but did not query production. The server runtime agent must establish the actual deployed state itself with read-only commands and secret-safe output.
+The recovery branch includes a curated sanitized source checkpoint, but it is **not a release or independently deployable server build**. It omits operator-specific scripts, customer fixtures and some PostgreSQL/external test paths; see the [verification baseline](verification-baseline.md). The live server may run a third source state. Do not deploy from this branch based only on local tests. The server runtime agent must establish the actual deployed state with read-only commands and secret-safe output.
 
 ## Server work sequence
 
-1. **Audit phase only:** fetch the review branch into `<local-path>`, then report its branch and commit alongside the server's live checkout path, branch, commit, remote URL, worktree status, deployed manifest and running app version. Never `git pull`, reset or checkout the new branch over the server's dirty live checkout. Do not start fixes, deployment, supplier outreach or the four-hour run during this phase.
+1. **Isolated source review:** fetch the review branch into a separate clean worktree and confirm the exact remote SHA above. Report that branch/commit alongside the live checkout branch/commit and worktree status. Never pull, reset or checkout this branch over the dirty live checkout. Root has authorized isolated city-policy and structured-TEXT-provider implementation, tests, and curated branch sync; this does not authorize production DB writes, outbound sends, live authentication changes, service changes, deployment, or the four-hour run.
 2. Read project handoff and the documents linked below. Verify owner identity and current target case from PostgreSQL using existing read-only app helpers/queries; capture the 55-item baseline, migration ledger/checksums, status and item IDs in protected private operational notes. Do not put row IDs, source text, phone numbers, secrets or customer PII in the shared repo.
 3. Run existing read-only health/readiness and service-status checks. Check AGY/browser/parser capability, queue/worker liveness and due work. Verify the configured WAHA account identity without logging the value, and report identity binding as a hard outbound gate until root reviews a durable per-action account pin. Keep existing holds, quiet hours, opt-outs, rate limits and unknown-send records intact.
 4. Follow [case-reconciliation-plan.md](case-reconciliation-plan.md): confirm actual Telegram attachment → original artifact → extraction → validated rows. Preserve the source evidence. Link a quote to an existing or newly resolved canonical supplier/offer only when the source establishes item, supplier, variant and price facts. Keep a source-evidence-only row pending if the identity is not established.
-5. Stop after the read-only audit and give root the handshake plus findings, proposed allowlisted files/commands and any unresolved blockers. Begin a fix or the four-hour unattended run only after root has reviewed the audit and confirms execution readiness. When execution starts, let the existing durable scheduler/worker operate without manual case changes. Do not replay unknown WhatsApp sends, bulk retry jobs, fabricate replies, send messages outside the app's current owner/approval controls, change WAHA sessions, apply migrations or create purchase rows from a quotation. If a guard prevents outreach, report that status and continue only safe read-only discovery.
+5. Keep code changes isolated and commit only reviewed paths. Root review of city policy requires delayed supplier replies to remain resumable without blocking the next city after explicit discovery exhaustion or successful budget completion; provider failure or time expiry must hold/pause and must not count as exhaustion. Report implementation and tests to root before curated sync. Do not replay unknown WhatsApp sends, bulk retry jobs, fabricate replies, change WAHA sessions, apply production migrations or create purchase rows from a quotation. If a guard prevents outreach, report it and continue only authorized safe work.
 6. Reconcile after the window: preserve the 55-row baseline and migration checksums; summarize current case state, received documents and extraction quality; per-item supplier contacts versus actual offers, prices and verified technical fit; city coverage in Taraz → Shymkent → Almaty order; dialogue/send/delivery/reply facts; unknowns; remaining blockers; and the actual best shortlist in the current Mini App/report.
 
 ## Required server checkpoint commands
