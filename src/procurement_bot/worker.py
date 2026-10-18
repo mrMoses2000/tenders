@@ -59,6 +59,7 @@ from procurement_bot.offer_technical import (
     technical_assessment_context_hash,
 )
 from procurement_bot.outreach_schedule import begin_outreach, finish_outreach, request_outreach
+from procurement_bot.owner_autonomy import ResearchPolicyDenied, autostart_snapshotted_research
 from procurement_bot.pipeline_runtime import ProviderQuotaDeferred, schedule_due_pipelines
 from procurement_bot.providers.agy import AgyCliStatusError
 from procurement_bot.providers.browser import BrowserResearchPort
@@ -923,6 +924,14 @@ class JobWorker:
             frozenset(expected_keys | locality_keys),
         }:
             raise PermanentProviderError("prepare_research payload is invalid")
+        if self.research_executor is not None:
+            try:
+                if await autostart_snapshotted_research(
+                    self.pool, case_id=case_id, intake_version=intake_version,
+                ):
+                    return
+            except ResearchPolicyDenied as exc:
+                logging.getLogger(__name__).info("research autostart denied: %s", exc)
         row = await self.pool.fetchrow(
             """
             SELECT c.status,c.owner_user_id,u.telegram_id,

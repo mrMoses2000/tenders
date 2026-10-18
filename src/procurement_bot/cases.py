@@ -7,6 +7,11 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from procurement_bot.intake import IntakeResult, ParsedProcurementRequest
+from procurement_bot.owner_autonomy import (
+    ResearchPolicyDenied,
+    apply_intake_research_policy,
+    capture_research_snapshot,
+)
 from procurement_bot.queue import enqueue_job, enqueue_outbox, stable_key
 
 
@@ -90,11 +95,10 @@ async def persist_intake_result(
     source_extraction_id: UUID | None,
     context: IntakeContext,
     result: IntakeResult,
+    customer_id: UUID | None = None,
 ) -> UUID:
     """Atomically apply a parsed request, projections, questions, and TG outbox."""
 
-    payload = result.request.model_dump(mode="json")
-    status = "ready" if result.ready_to_search else "needs_clarification"
     async with pool.acquire() as connection, connection.transaction():
         # Serialise creation/application per Telegram user. AGY runs outside the
         # transaction, so a second message may otherwise create a parallel draft.
@@ -108,6 +112,37 @@ async def persist_intake_result(
         )
         if already_applied is not None:
             return already_applied
+        source_owner = await connection.fetchval(
+            "SELECT user_id FROM messages WHERE id=$1 AND channel='telegram' "
+            "AND direction='inbound'", message_id,
+        )
+        if source_owner != context.user_id:
+            raise ResearchPolicyDenied("intake source does not belong to the authenticated owner")
+        if context.case_id is not None:
+            scope = await connection.fetchrow(
+                "SELECT owner_user_id,customer_id FROM procurement_cases WHERE id=$1 FOR UPDATE",
+                context.case_id,
+            )
+            if scope is None or scope["owner_user_id"] != context.user_id:
+                raise ResearchPolicyDenied("intake case does not belong to the authenticated owner")
+            if customer_id is not None and customer_id != scope["customer_id"]:
+                raise ResearchPolicyDenied("intake project cannot change implicitly")
+            customer_id = scope["customer_id"]
+        if customer_id is not None and not await connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM customers WHERE id=$1 AND owner_user_id=$2 AND active)",
+            customer_id, context.user_id,
+        ):
+            raise ResearchPolicyDenied("intake project does not belong to the authenticated owner")
+        application = None
+        if result.request.source_type == "document" or context.case_id is not None:
+            application = await apply_intake_research_policy(
+                connection, owner_id=context.user_id, customer_id=customer_id,
+                case_id=context.case_id, result=result,
+            )
+            if application is not None:
+                result = application.result
+        payload = result.request.model_dump(mode="json")
+        status = "ready" if result.ready_to_search else "needs_clarification"
         if context.case_id is None:
             active_case = await connection.fetchval(
                 """
@@ -124,8 +159,8 @@ async def persist_intake_result(
                 """
                 INSERT INTO procurement_cases(
                     id,owner_user_id,source_message_id,title,city,search_area_text,
-                    delivery_address,status
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    delivery_address,status,customer_id
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                 """,
                 case_id,
                 context.user_id,
@@ -135,6 +170,7 @@ async def persist_intake_result(
                 result.request.search_area_text or "",
                 result.request.delivery_address or "",
                 status,
+                customer_id,
             )
             version = 1
         else:
@@ -188,6 +224,22 @@ async def persist_intake_result(
             result.parser_name,
             payload,
         )
+        if application is not None:
+            snapshot_id = await capture_research_snapshot(
+                connection, application=application, case_id=case_id,
+                owner_id=context.user_id, customer_id=customer_id, intake_version=version,
+            )
+            await connection.execute(
+                """INSERT INTO workflow_events(case_id,event_type,actor_type,actor_id,
+                idempotency_key,data) VALUES($1,'owner_research_policy_applied','worker',
+                'intake',$2,$3::jsonb) ON CONFLICT (idempotency_key) DO NOTHING""",
+                case_id, stable_key("workflow.research-policy-applied", case_id, version),
+                {"snapshot_id": str(snapshot_id), "profile_id": str(application.profile_id),
+                 "source_payload_sha256": application.source_hash,
+                 "applied_payload_sha256": application.applied_hash,
+                 "applied_defaults": application.snapshot["applied_defaults"],
+                 "conflicts": application.snapshot["conflicts"]},
+            )
         if context.request is not None and context.request.items == result.request.items:
             # A geography answer cannot change item identity or delete financial
             # records created before a locality lookup asked a follow-up question.
