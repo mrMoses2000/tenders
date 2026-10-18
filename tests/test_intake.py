@@ -32,9 +32,7 @@ def patch_for(
         "current_request": current_json,
         "input_source_type": source_type.value,
         "open_clarification": (
-            open_clarification.model_dump(mode="json")
-            if open_clarification is not None
-            else None
+            open_clarification.model_dump(mode="json") if open_clarification is not None else None
         ),
     }
     _, context_hash = canonical_json_hash(context)
@@ -84,10 +82,16 @@ async def test_process_can_apply_only_an_explicit_scope_default():
 @pytest.mark.parametrize("source_type", [SourceType.TEXT, SourceType.VOICE])
 @pytest.mark.parametrize("topic", ["city_missing", "locality_resolution"])
 async def test_process_passes_the_one_visible_question_as_context(source_type, topic):
-    current = ParsedProcurementRequest(items=[ProcurementItem(
-        name="Марля", quantity=100, tender_unit_price_private=Decimal("1234"),
-        source_reference="table:2:row:3",
-    )])
+    current = ParsedProcurementRequest(
+        items=[
+            ProcurementItem(
+                name="Марля",
+                quantity=100,
+                tender_unit_price_private=Decimal("1234"),
+                source_reference="table:2:row:3",
+            )
+        ]
+    )
     clarification = IntakeClarificationContext(
         topic=topic,
         question="В каком городе искать товар?",
@@ -138,7 +142,7 @@ PRICED_TABLE = (
 
 
 @pytest.mark.asyncio
-async def test_explicit_document_table_preserves_rows_prices_specs_and_asks_city():
+async def test_document_table_without_currency_preserves_rows_and_specs_and_asks_city():
     extractor = FakeExtractor({})
     result = await IntakeService(extractor).process(PRICED_TABLE, source_type="document")
     assert extractor.calls == []
@@ -146,19 +150,64 @@ async def test_explicit_document_table_preserves_rows_prices_specs_and_asks_city
     assert len(result.request.items) == 2
     item = result.request.items[0]
     assert item.quantity == Decimal("5.50")
-    assert item.tender_unit_price_private == Decimal("3000")
+    assert item.tender_unit_price_private is None
     assert item.requirements[0].expected_value == "Индикаторный\nСиний"
     assert item.source_reference == "table:2:row:2"
+    assert result.request.items[1].tender_unit_price_private is None
+    assert result.request.warnings == [
+        "Цена в документе не включена в финансовые показатели: валюта не подтверждена как KZT."
+    ]
     assert result.request.delivery_address == "Республика Казахстан, п. Таукент"
     assert result.request.city is None
     assert result.clarifications == ["В каком городе искать товар?"]
 
 
-@pytest.mark.parametrize("bad", [
-    PRICED_TABLE.replace("5,50", "не указано"),
-    PRICED_TABLE.replace("2 | Светильник", "3 | Светильник"),
-    PRICED_TABLE.replace("3 000", "договорная"),
-])
+@pytest.mark.parametrize(
+    ("price_header", "expected_prices", "has_warning"),
+    [
+        ("Цена, KZT", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена, тенге", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена, тг", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена, ₸", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена за единицу, KZT", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена (KZT)", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена в теңге за единицу", [Decimal("3000"), Decimal("1000")], False),
+        ("Цена (KZT", [None, None], True),
+        ("Цена KZT)", [None, None], True),
+        ("Цена, USD", [None, None], True),
+        ("Цена, KZT/USD", [None, None], True),
+        ("Цена, KZT/JPY", [None, None], True),
+        ("Цена, KZT/KGS", [None, None], True),
+        ("Цена, тенге/рублях", [None, None], True),
+        ("Цена, KZT за договором", [None, None], True),
+    ],
+)
+def test_priced_table_currency_must_be_explicit_and_supported(
+    price_header, expected_prices, has_warning
+):
+    table = PRICED_TABLE.replace("Цена | Стоимость", f"{price_header} | Стоимость")
+    request = _parse_priced_table(table)
+
+    assert request is not None
+    assert [item.tender_unit_price_private for item in request.items] == expected_prices
+    assert [item.name for item in request.items] == ["Силикагель", "Светильник"]
+    assert [item.quantity for item in request.items] == [Decimal("5.50"), Decimal("10")]
+    assert [item.unit for item in request.items] == ["кг", "шт"]
+    assert [item.requirements[0].expected_value for item in request.items] == [
+        "Индикаторный\nСиний",
+        "60 Вт",
+    ]
+    assert bool(request.warnings) is has_warning
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        PRICED_TABLE.replace("5,50", "не указано"),
+        PRICED_TABLE.replace("2 | Светильник", "3 | Светильник"),
+        PRICED_TABLE.replace("3 000", "договорная"),
+    ],
+)
 def test_unreliable_table_falls_back_without_partial_rows(bad):
     assert _parse_priced_table(bad) is None
 

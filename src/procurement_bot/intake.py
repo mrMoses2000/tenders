@@ -53,7 +53,10 @@ class ProcurementItem(StrictModel):
     quantity: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=6)
     unit: CleanText | None = Field(default=None, max_length=80)
     tender_unit_price_private: Decimal | None = Field(
-        default=None, ge=0, max_digits=16, decimal_places=4,
+        default=None,
+        ge=0,
+        max_digits=16,
+        decimal_places=4,
         description="Explicit customer tender unit price; never a supplier quote; unknown is null",
     )
     requirements: list[ProcurementRequirement] = Field(default_factory=list, max_length=100)
@@ -162,18 +165,17 @@ def _merge_request(
             update[field_name] = value
     if proposal.items:
         prior_by_source = {
-            item.source_reference: item
-            for item in current.items
-            if item.source_reference
+            item.source_reference: item for item in current.items if item.source_reference
         }
         update["items"] = [
-            item.model_copy(update={
-                "tender_unit_price_private": prior_by_source[
-                    item.source_reference
-                ].tender_unit_price_private
-            })
-            if item.tender_unit_price_private is None
-            and item.source_reference in prior_by_source
+            item.model_copy(
+                update={
+                    "tender_unit_price_private": prior_by_source[
+                        item.source_reference
+                    ].tender_unit_price_private
+                }
+            )
+            if item.tender_unit_price_private is None and item.source_reference in prior_by_source
             else item
             for item in proposal.items
         ]
@@ -224,13 +226,29 @@ def _table_decimal(value: str) -> Decimal | None:
         return None
 
 
+def _price_header_is_explicit_kzt(value: str) -> bool:
+    """Accept a price only when its entire header has one known KZT form."""
+    return (
+        re.fullmatch(
+            r"""
+        \s*(?:цена|стоимость)\s*
+        (?:за\s+(?:1\s+)?(?:ед\.?|единицу|шт\.?|штуку)\s*)?
+        (?:[,;:]\s*|\s+(?:в\s+)?)?
+        (?:\(\s*(?:KZT|тенге|теңге|тг\.?|₸)\s*\)|(?:KZT|тенге|теңге|тг\.?|₸))
+        (?:\s+за\s+(?:1\s+)?(?:ед\.?|единицу|шт\.?|штуку))?
+        \s*
+        """,
+            value,
+            flags=re.IGNORECASE | re.VERBOSE,
+        )
+        is not None
+    )
+
+
 def _parse_priced_table(text: str) -> ParsedProcurementRequest | None:
     """Read explicit seven-column tender rows without inferring search locality."""
-    rows = [
-        (locator, content.rstrip())
-        for locator, content in _TABLE_ROW.findall(text)
-    ]
-    item_tables: set[str] = set()
+    rows = [(locator, content.rstrip()) for locator, content in _TABLE_ROW.findall(text)]
+    item_tables: dict[str, bool] = {}
     for locator, content in rows:
         header = [part.strip().lower() for part in content.split(" | ")]
         if len(header) == 7 and (
@@ -241,20 +259,22 @@ def _parse_priced_table(text: str) -> ParsedProcurementRequest | None:
             and "стоимость" in header[5]
             and "характеристика" in header[6]
         ):
-            item_tables.add(locator.split(":")[1])
+            item_tables[locator.split(":")[1]] = _price_header_is_explicit_kzt(header[4])
     if not item_tables:
         return None
 
     items: list[ProcurementItem] = []
     delivery_address: str | None = None
     deadline_text: str | None = None
+    price_currency_warning = False
     for locator, content in rows:
         cells = [part.strip() for part in content.split(" | ", 6)]
         if len(cells) == 2 and not cells[0] and "Республика Казахстан" in cells[1]:
             delivery_address = cells[1][:500]
         if len(cells) == 2 and cells[0].lower() == "срок поставки":
             deadline_text = cells[1][:240]
-        if locator.split(":")[1] not in item_tables:
+        table_id = locator.split(":")[1]
+        if table_id not in item_tables:
             continue
         if not re.fullmatch(r"\d+", cells[0]):
             continue
@@ -266,16 +286,25 @@ def _parse_priced_table(text: str) -> ParsedProcurementRequest | None:
         price = _table_decimal(cells[4])
         if (cells[4] and price is None) or (price is not None and price < 0):
             return None
+        if price is not None and not item_tables[table_id]:
+            # Preserve the source artifact as evidence, but never let persistence
+            # label an unstated or foreign currency amount as KZT.
+            price = None
+            price_currency_warning = True
         spec = cells[6]
         if len(spec) > 1000:
             return None
-        requirements = [
-            ProcurementRequirement(
-                name="Техническая характеристика",
-                expected_value=spec,
-                source_reference=locator,
-            )
-        ] if spec else []
+        requirements = (
+            [
+                ProcurementRequirement(
+                    name="Техническая характеристика",
+                    expected_value=spec,
+                    source_reference=locator,
+                )
+            ]
+            if spec
+            else []
+        )
         try:
             items.append(
                 ProcurementItem(
@@ -296,6 +325,14 @@ def _parse_priced_table(text: str) -> ParsedProcurementRequest | None:
         delivery_address=delivery_address,
         deadline_text=deadline_text,
         items=items,
+        warnings=(
+            [
+                "Цена в документе не включена в финансовые показатели: "
+                "валюта не подтверждена как KZT.",
+            ]
+            if price_currency_warning
+            else []
+        ),
     )
 
 
@@ -323,8 +360,11 @@ class IntakeService:
             source in {SourceType.TEXT, SourceType.VOICE}
             and current is not None
             and open_clarification is not None
-            and open_clarification.topic in {
-                "city_missing", "search_scope_missing", "search_area_missing",
+            and open_clarification.topic
+            in {
+                "city_missing",
+                "search_scope_missing",
+                "search_area_missing",
                 "locality_resolution",
             }
         )
@@ -395,8 +435,6 @@ class IntakeService:
             applied_defaults=applied_defaults,
             ready_to_search=report.ready_to_search,
             parser_name=(
-                "priced-table-intake"
-                if tabular is not None and current is None
-                else "agy-intake"
+                "priced-table-intake" if tabular is not None and current is None else "agy-intake"
             ),
         )
