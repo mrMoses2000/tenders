@@ -270,6 +270,10 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
 
 
 .stage-summary { margin: 13px 0 12px; padding: 13px 0; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); }
+.case-diagnostics { margin: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.case-diagnostics > summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; color: var(--ink-soft); font-size: 14px; font-weight: 650; }
+.case-diagnostics-content { padding-bottom: 6px; }
+.case-diagnostics-content .data-note { font-size: 12px; }
 .stage-explainer { margin: 8px 0 13px; color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
 .stage-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(156px, 1fr)); gap: 7px; }
 .stage-filter { min-height: 44px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 0; background: var(--surface); color: var(--ink); text-align: left; font-size: 12px; line-height: 1.35; font-weight: 650; }
