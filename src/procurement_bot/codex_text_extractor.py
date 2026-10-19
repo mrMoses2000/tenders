@@ -109,10 +109,10 @@ class CodexTextProfile:
             raise ValueError("model/effort is outside the reviewed allowlist")
         if (
             type(self.timeout_seconds) not in (int, float)
-            or not 0 < self.timeout_seconds <= 60
+            or not 0 < self.timeout_seconds <= 180
             or not isfinite(self.timeout_seconds)
         ):
-            raise ValueError("timeout must be finite and between zero and sixty seconds")
+            raise ValueError("timeout must be finite and at most 180 seconds")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,22 +171,7 @@ async def _run_cli(invocation: TextInvocation) -> CliResult:
             finally:
                 process.stdin.close()
             stdout, _stderr, exit_code = await asyncio.gather(*readers, waiter)
-        diagnostic = "cli_nonzero_exit"
-        # Classify bounded bytes in memory; never retain or expose provider diagnostics.
-        lowered = _stderr.lower()
-        for code, markers in (
-            (
-                "cli_config_error",
-                (b"error loading configuration", b"unknown field", b"invalid type"),
-            ),
-            ("cli_auth_failed", (b"not logged in", b"authentication", b"unauthorized", b"401")),
-            ("cli_home_missing", (b"home directory", b"codex_home")),
-            ("cli_state_read_only", (b"read-only file system",)),
-            ("cli_model_unavailable", (b"model is not supported", b"model not found")),
-        ):
-            if any(marker in lowered for marker in markers):
-                diagnostic = code
-                break
+        diagnostic = _classify_cli_failure(stdout, _stderr)
         return CliResult(exit_code, stdout, diagnostic)
     except TimeoutError:
         raise CodexTextError("cli_timeout") from None
@@ -199,6 +184,35 @@ async def _run_cli(invocation: TextInvocation) -> CliResult:
                 task.cancel()
         await asyncio.gather(*readers, waiter, return_exceptions=True)
         await process.wait()
+
+
+def _classify_cli_failure(stdout: bytes, stderr: bytes) -> str:
+    """Return a fixed diagnostic without retaining provider error text."""
+    try:
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            event = _json(line)
+            if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
+                continue
+            error = event.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            if code == "invalid_json_schema":
+                return "cli_invalid_schema"
+    except (ValueError, UnicodeError):
+        pass
+
+    lowered = stderr.lower()
+    for code, markers in (
+        ("cli_config_error", (b"error loading configuration", b"unknown field", b"invalid type")),
+        ("cli_auth_failed", (b"not logged in", b"authentication", b"unauthorized", b"401")),
+        ("cli_home_missing", (b"home directory not found", b"home directory does not exist")),
+        ("cli_state_read_only", (b"read-only file system",)),
+        ("cli_model_unavailable", (b"model is not supported", b"model not found")),
+    ):
+        if any(marker in lowered for marker in markers):
+            return code
+    return "cli_nonzero_exit"
 
 
 def _json(raw: str | bytes) -> Any:
@@ -220,6 +234,10 @@ def _strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     # model_json_schema returns a fresh structure; do not alter the caller's model.
     def close(value):
         if isinstance(value, dict):
+            # The CLI schema subset rejects regex lookarounds used by Pydantic's
+            # Decimal constraints. Pydantic still validates the returned model.
+            value.pop("pattern", None)
+            value.pop("default", None)
             if value.get("type") == "object":
                 if value.get("additionalProperties") is not False:
                     raise ValueError("output objects must forbid extra fields")
@@ -455,6 +473,7 @@ class OptInCodexTextExtractor:
                     if result.diagnostic_code
                     in {
                         "cli_config_error",
+                        "cli_invalid_schema",
                         "cli_auth_failed",
                         "cli_home_missing",
                         "cli_state_read_only",
