@@ -24,14 +24,15 @@ No backend fields or API semantics will change in this UI slice.
 Show a compact stage summary above the existing item search, with counts and filters derived from one mutually exclusive primary classification per stable request item. Render collapsible group sections rather than a flat wall of 55 rows. Keep all original item IDs, line numbers, item forms, comparisons, and accounting controls in the existing item cards.
 
 Primary classification precedence:
-1. Full existing recorded purchase or an effective owner sourcing instruction pinned to the current parse hash. Show whether it is an accounting purchase, an owner-declared exclusion, or owner-reported quantity to source around; state when the instruction is not yet applied to a run plan.
-2. Evidence-only owner purchase claim: show “Покупка требует сверки”; it must not exclude the item.
+1. Full existing recorded purchase, an effective current-hash owner skip, or an effective owner bought/reduce instruction whose finite compatible quantity is at least the original quantity. Partial bought/reduce instructions retain the item’s actual sourcing stage and appear as secondary owner-instruction details; they never imply accounting purchase. State when an instruction is only for the next plan.
+2. Evidence-only owner purchase claim: show “Покупка требует сверки”; it must not exclude the item. A current-hash effective partial instruction does not replace the item’s actual sourcing stage.
 3. Source or item needs clarification.
 4. At least one supplier-confirmed comparable option (real persisted comparison state only).
 5. Supplier candidates from actual offers or per-item found leads.
-6. Queued, active, or paused research.
-7. Completed/partial/failed research requiring review, distinct from “not searched”.
-8. Not started, only when no progress and no higher-priority state exists.
+6. Queued or active research.
+7. Paused research, visibly distinct from active search.
+8. Completed/partial/failed research requiring review, distinct from “not searched”.
+9. Not started, only when no progress and no higher-priority state exists.
 
 The case-level waiting-reply count is a separate summary metric labeled as conversations, not item count. Keep secondary badges available inside each row; they do not increment another primary-group count. Never interpret an item ready status or a price alone as purchase readiness.
 
@@ -39,7 +40,7 @@ The case-level waiting-reply count is a separate summary metric labeled as conve
 
 - mini_app/app.js: pure stage-classification/grouping helpers, summary controls, grouped item containers, and search/offer-filter integration; preserve current item card and purchase/accounting flows.
 - mini_app/app.css: restrained styles reusing existing palette, dividers, control heights, and type scale; responsive single-column layout.
-- tests/test_mini_app_stage_groups.py: isolated Node tests for precedence, count exclusivity, “not searched” versus finished/failed search, and case-level waiting chat treatment. No production fixture data.
+- tests/test_mini_app_stage_groups.py: isolated Node tests for precedence, full versus partial owner instructions, paused versus active search, count exclusivity, “not searched” versus finished/failed search, and case-level waiting chat treatment. No production fixture data.
 - This strategy document.
 
 ## Verification

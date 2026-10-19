@@ -766,6 +766,7 @@ const caseStageGroups = [
   ["comparable_options", "Есть сравнимое КП"],
   ["supplier_candidates", "Кандидаты поставщиков"],
   ["in_research", "Поиск идёт"],
+  ["paused", "Поиск приостановлен"],
   ["research_review", "Поиск завершён · нужна проверка"],
   ["not_started", "Поиск не запущен"]
 ];
@@ -777,11 +778,37 @@ function effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash) {
       && evidence.source_payload_sha256 === currentSourceHash) || null;
 }
 
+function isFullOwnerSourcingInstruction(item, instruction) {
+  if (!instruction) return false;
+  if (instruction.disposition === "skip") return true;
+  if (!["bought", "reduce_quantity"].includes(instruction.disposition)) return false;
+  const instructedQuantity = Number(instruction.quantity);
+  const originalQuantity = Number(item?.quantity);
+  return Number.isFinite(instructedQuantity) && Number.isFinite(originalQuantity)
+    && originalQuantity > 0 && instructedQuantity >= originalQuantity
+    && String(instruction.unit || "") === String(item?.unit || "");
+}
+
+function ownerInstructionBadgeLabel(item, sourceItem, currentSourceHash) {
+  const instruction = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
+  if (!instruction || isFullOwnerSourcingInstruction(item, instruction)) return null;
+  const quantityText = Number.isFinite(Number(instruction.quantity))
+    ? Number(instruction.quantity) + " " + (instruction.unit || item?.unit || "") : "количество не указано";
+  const planText = sourceItem?.disposition_applied_to_plan
+    ? "учтено в привязке плана" : "учтётся в следующем плане";
+  const instructionText = instruction.disposition === "bought"
+    ? "Владелец сообщает о покупке " + quantityText
+    : "По указанию владельца искать остаток после " + quantityText;
+  return instructionText + " · " + planText;
+}
+
 function classifyCaseItemStage(item, sourceItem, progress, offers, currentSourceHash) {
   const instruction = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
-  if (sourceItem?.stage === "bought" || instruction) return "owner_sourcing";
-  if (sourceItem?.stage === "evidence_only"
-      || (sourceItem?.sourcing_evidence || []).length > 0) return "purchase_review";
+  if (sourceItem?.stage === "bought" || isFullOwnerSourcingInstruction(item, instruction)) {
+    return "owner_sourcing";
+  }
+  if (!instruction && (sourceItem?.stage === "evidence_only"
+      || (sourceItem?.sourcing_evidence || []).length > 0)) return "purchase_review";
   if (sourceItem?.stage === "needs_review" || item.status === "needs_clarification") {
     return "needs_clarification";
   }
@@ -793,7 +820,8 @@ function classifyCaseItemStage(item, sourceItem, progress, offers, currentSource
   if ((offers || []).length > 0 || Number(progress?.found_leads || 0) > 0) {
     return "supplier_candidates";
   }
-  if (["queued", "researching", "paused"].includes(progress?.status)
+  if (progress?.status === "paused") return "paused";
+  if (["queued", "researching"].includes(progress?.status)
       || item.status === "researching") return "in_research";
   if (item.status === "offers_found") return "supplier_candidates";
   if (["succeeded", "partial", "failed"].includes(progress?.status)
@@ -805,7 +833,10 @@ function caseStageBadgeLabel(stageKey, sourceItem, currentSourceHash) {
   if (stageKey === "owner_sourcing") {
     if (sourceItem?.stage === "bought") return "Закуплено · учёт";
     const instruction = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
-    if (instruction?.disposition === "skip") return "Исключено владельцем";
+    if (instruction?.disposition === "skip") {
+      return sourceItem?.disposition_applied_to_plan
+        ? "Исключено владельцем" : "Исключение в следующем плане";
+    }
     if (instruction?.disposition === "bought") return "Покупка заявлена владельцем";
     if (instruction?.disposition === "reduce_quantity") return "Количество изменено владельцем";
   }
@@ -1874,7 +1905,7 @@ function sourcingInstructionForm(caseId, item, sourceItem, currentSourceHash) {
     const remaining = Math.max(0, Number(item.quantity || 0) - quantityValue);
     if (existing.disposition === "skip") {
       saved.append(el("p", "data-note",
-        "Позиция исключена из поиска по указанию владельца. Это sourcing instruction, не запись бухгалтерского учёта."));
+        "Позиция исключена из поиска по указанию владельца. Указание меняет только поиск; бухгалтерская запись не создана."));
     } else if (existing.disposition === "bought") {
       saved.append(el("p", "data-note", "Владелец сообщает о покупке "
         + quantity(quantityValue, item.unit || "") + "; для поиска останется "
@@ -2311,6 +2342,14 @@ async function openDetail(id, options = {}) {
       statusBadges.append(itemBadge(item));
       statusBadges.append(el("span", "badge stage-badge",
         caseStageBadgeLabel(stageKey, sourceItem, sourceVisibility?.source_payload_sha256)));
+      const ownerInstructionLabel = ownerInstructionBadgeLabel(item, sourceItem,
+        sourceVisibility?.source_payload_sha256);
+      if (ownerInstructionLabel) {
+        statusBadges.append(el("span", "badge warn", ownerInstructionLabel));
+      }
+      if (progressByItem.get(item.id)?.status === "paused" && stageKey !== "paused") {
+        statusBadges.append(el("span", "badge warn", "Поиск приостановлен"));
+      }
       if (Number(item.in_transit_quantity || 0) > 0) {
         const transitBadge = el("span", "badge delivery-badge",
           "В пути · " + fmtNumber(item.in_transit_quantity));
