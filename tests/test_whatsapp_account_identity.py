@@ -1194,6 +1194,72 @@ async def test_pin_rechecks_active_owner_after_provider_observation(identity_pg,
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("race", ["case_owner_transfer", "actor_deactivation"])
+async def test_hold_release_rechecks_owner_after_account_lock(identity_pg, race, monkeypatch):
+    from procurement_bot import whatsapp_account
+    from procurement_bot.whatsapp_account import ensure_account, set_account_hold
+
+    pool, owner_id, _conversation_id, _contact_id = identity_pg
+    session_name = _IdentityClient.session_name
+    other_owner = uuid4()
+    await pool.execute(
+        "INSERT INTO users(id,telegram_id,display_name) VALUES($1,$2,$3)",
+        other_owner,
+        int(uuid4().int % 2_000_000_000) + 2_000_000_000,
+        "Synthetic alternate owner",
+    )
+    async with pool.acquire() as connection:
+        await ensure_account(connection, session_name)
+
+    original = whatsapp_account._lock_authorize_session_owner
+    calls = 0
+
+    async def change_scope_then_recheck(
+        connection, locked_session, actor_user_id, *, require_all=True
+    ):
+        nonlocal calls
+        calls += 1
+        if race == "case_owner_transfer":
+            await connection.execute(
+                """UPDATE procurement_cases SET owner_user_id=$2
+                   WHERE id=(SELECT case_id FROM supplier_conversations WHERE session_name=$1)""",
+                locked_session,
+                other_owner,
+            )
+        else:
+            await connection.execute("UPDATE users SET active=FALSE WHERE id=$1", owner_id)
+        return await original(
+            connection,
+            locked_session,
+            actor_user_id,
+            require_all=require_all,
+        )
+
+    monkeypatch.setattr(
+        whatsapp_account, "_lock_authorize_session_owner", change_scope_then_recheck
+    )
+    async with pool.acquire() as connection:
+        with pytest.raises(PermissionError, match="own the active cases"):
+            await set_account_hold(
+                connection,
+                session_name,
+                held=False,
+                reason="synthetic concurrent ownership change",
+                actor_user_id=owner_id,
+            )
+
+    assert calls == 1
+    assert await pool.fetchval(
+        "SELECT operator_held FROM whatsapp_account_controls WHERE session_name=$1",
+        session_name,
+    ) is True
+    assert await pool.fetchval(
+        "SELECT active FROM users WHERE id=$1",
+        owner_id,
+    ) is True
+
+
+@pytest.mark.postgres
 async def test_exact_legacy_unknown_quarantine_preserves_unknown_and_independent_gates(identity_pg):
     from procurement_bot.whatsapp_account import (
         attest_legacy_unknown_inventory,
@@ -1269,6 +1335,13 @@ async def test_exact_legacy_unknown_quarantine_preserves_unknown_and_independent
         reason="attested synthetic old unknown",
         operator_idempotency_key="quarantine-command-01",
     )
+    empty_inventory = await load_legacy_unknown_inventory(
+        pool,
+        session_name=_IdentityClient.session_name,
+        actor_user_id=owner_id,
+    )
+    assert empty_inventory["reservation_ids"] == []
+    assert empty_inventory["reservation_count"] == 0
     reservation = await pool.fetchrow(
         """SELECT state,pinned_account_jid,account_pin_version,
                   observed_account_jid,account_identity_observed_at

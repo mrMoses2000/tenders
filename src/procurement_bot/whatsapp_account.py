@@ -137,6 +137,10 @@ async def _legacy_unknown_inventory(
              AND reservation.account_pin_version IS NULL
              AND reservation.observed_account_jid IS NULL
              AND reservation.account_identity_observed_at IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                 WHERE item.outbox_event_id=reservation.outbox_event_id
+             )
            ORDER BY reservation.outbox_event_id""",
         session_name,
         cutoff,
@@ -496,6 +500,8 @@ async def _lock_authorize_session_owner(
     connection: asyncpg.Connection,
     session_name: str,
     actor_user_id: UUID,
+    *,
+    require_all: bool = True,
 ) -> list[asyncpg.Record]:
     """Lock the active actor and all session case links after the account lock."""
 
@@ -520,7 +526,14 @@ async def _lock_authorize_session_owner(
         actor is None
         or not actor["active"]
         or not cases
-        or any(row["owner_user_id"] != actor_user_id for row in cases)
+        or (
+            require_all
+            and any(row["owner_user_id"] != actor_user_id for row in cases)
+        )
+        or (
+            not require_all
+            and not any(row["owner_user_id"] == actor_user_id for row in cases)
+        )
     ):
         raise PermissionError("actor must own the active cases using this WhatsApp session")
     return cases
@@ -808,6 +821,12 @@ async def set_account_hold(
         )
         if row is None:
             raise RuntimeError("WhatsApp account control row disappeared")
+        await _lock_authorize_session_owner(
+            connection,
+            session_name,
+            actor_user_id,
+            require_all=not held,
+        )
         if not held:
             unresolved = await connection.fetchval(
                 """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations reservation

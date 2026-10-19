@@ -8,7 +8,8 @@ const $ = id => document.getElementById(id);
 const state = {tab: "cases", q: "", status: "", city: "", offset: 0, loading: false,
   controller: null, listRevision: 0, detailId: null, detailRevision: 0,
   detailController: null, detailRefreshController: null, detailSnapshot: null,
-  authenticated: false};
+  authenticated: false, whatsappAccounts: [], legacyInventories: Object.create(null),
+  operatorKeys: Object.create(null), whatsappSnapshot: null};
 const detailColumns = {spec: false, history: false, finance: true, delivery: true};
 try { Object.assign(detailColumns, JSON.parse(localStorage.getItem("tender-detail-columns") || "{}")); } catch (_) { /* private storage */ }
 const configurableFields = ["Требуется", "Этап по Notion", "Поставлено по Notion", "Техспек",
@@ -2629,6 +2630,244 @@ async function openDetail(id, options = {}) {
     }
   }
 }
+function flashToast(message) {
+  const node = $("toast");
+  node.textContent = message;
+  node.hidden = false;
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => { node.hidden = true; }, 3200);
+}
+async function operatorCommandKey(name, binding) {
+  const digest = await crypto.subtle.digest("SHA-256",
+    new TextEncoder().encode(String(binding)));
+  const suffix = Array.from(new Uint8Array(digest),
+    byte => byte.toString(16).padStart(2, "0")).join("").slice(0, 32);
+  name += ":" + suffix;
+  if (state.operatorKeys[name]) return state.operatorKeys[name];
+  const storageKey = "tender-operator-command:" + name;
+  try {
+    const saved = sessionStorage.getItem(storageKey);
+    if (saved) return state.operatorKeys[name] = saved;
+  } catch (_) { /* private storage */ }
+  const key = "op-" + crypto.randomUUID();
+  state.operatorKeys[name] = key;
+  try { sessionStorage.setItem(storageKey, key); } catch (_) { /* private storage */ }
+  return key;
+}
+function clearOperatorCommandKey(name, binding) {
+  const digestPromise = crypto.subtle.digest("SHA-256",
+    new TextEncoder().encode(String(binding)));
+  digestPromise.then(digest => {
+    const suffix = Array.from(new Uint8Array(digest),
+      byte => byte.toString(16).padStart(2, "0")).join("").slice(0, 32);
+    const storageKey = "tender-operator-command:" + name + ":" + suffix;
+    const stored = state.operatorKeys[name + ":" + suffix];
+    delete state.operatorKeys[name + ":" + suffix];
+    try {
+      if (stored) sessionStorage.removeItem(storageKey);
+    } catch (_) { /* private storage */ }
+  });
+}
+function ageLabel(seconds) {
+  if (seconds === null || seconds === undefined) return "нет";
+  const value = Math.max(0, Number(seconds));
+  if (value < 60) return Math.floor(value) + " сек.";
+  if (value < 3600) return Math.floor(value / 60) + " мин.";
+  if (value < 86400) return Math.floor(value / 3600) + " ч.";
+  return Math.floor(value / 86400) + " дн.";
+}
+function waProviderLabel(value) {
+  return ({unknown: "не проверен", clear: "ограничений не выявлено", restricted: "ограничен",
+    timelock: "временная блокировка", capped: "лимит", unavailable: "недоступен"})[value] || "неизвестно";
+}
+function waAccountCard(account, pinSessionName) {
+  const card = el("article", "wa-account-card");
+  const heading = el("div", "wa-account-heading");
+  heading.append(el("div", "wa-account-name", account.session_name));
+  const pinState = account.account_identity_pinned
+    ? "Закреплён " + (account.masked_account_jid || "аккаунт скрыт") + " · версия " + account.account_pin_version
+    : "Аккаунт не закреплён";
+  heading.append(el("span", "badge " + (account.account_identity_pinned ? "mute" : "warn"), pinState));
+  card.append(heading);
+  const facts = el("div", "wa-account-facts");
+  facts.append(el("p", "", "Удержание оператора: " +
+    (account.operator_held ? "включено" : "выключено") +
+    (account.operator_hold_reason ? " · " + account.operator_hold_reason : "")));
+  facts.append(el("p", "", "Контур: " +
+    (account.circuit_open ? "разомкнут" : "закрыт") +
+    (account.circuit_reason ? " · " + account.circuit_reason : "")));
+  facts.append(el("p", "", "Провайдер: " + waProviderLabel(account.provider_state) +
+    " · проверка " + fmtDateTime(account.provider_observed_at)));
+  facts.append(el("p", "", "Неопределённые: " + account.unresolved_reservations +
+    " · возраст старейшей " + ageLabel(account.oldest_unresolved_age_seconds)));
+  facts.append(el("p", "", "Все неизвестные: " + account.unknown_reservations +
+    " · подтверждённые исторические: " + account.quarantined_unknown_reservations +
+    " · возраст старейшей " + ageLabel(account.oldest_quarantined_unknown_age_seconds)));
+  card.append(facts);
+  if (pinSessionName === account.session_name) {
+    const details = el("details", "wa-action");
+    details.append(el("summary", "", "Закрепить подтверждённый аккаунт"));
+    const form = el("div", "wa-form");
+    const jid = el("input");
+    jid.type = "text"; jid.autocomplete = "off"; jid.maxLength = 64;
+    jid.placeholder = "Номер@c.us";
+    jid.setAttribute("aria-label", "Ожидаемый JID собственного аккаунта WhatsApp");
+    const reason = el("input");
+    reason.type = "text"; reason.maxLength = 240;
+    reason.placeholder = "Причина закрепления";
+    reason.setAttribute("aria-label", "Причина закрепления аккаунта");
+    const submit = el("button", "entry-submit", "Проверить и закрепить");
+    submit.type = "button";
+    const feedback = el("p", "entry-feedback");
+    submit.addEventListener("click", async () => {
+      if (!jid.value.trim() || !reason.value.trim()) {
+        feedback.textContent = "Укажите ожидаемый аккаунт и причину.";
+        return;
+      }
+      submit.disabled = true; feedback.textContent = "";
+      const keyName = "pin:" + account.session_name;
+      try {
+        await apiWrite("/api/whatsapp/account-pin", {
+          session_name: account.session_name,
+          expected_account_jid: jid.value.trim(),
+          reason: reason.value.trim(),
+          idempotency_key: await operatorCommandKey(
+            keyName, jid.value.trim() + "\u0000" + reason.value.trim())
+        });
+        clearOperatorCommandKey(
+          keyName, jid.value.trim() + "\u0000" + reason.value.trim());
+        jid.value = "";
+        feedback.className = "wa-success";
+        feedback.textContent = "Аккаунт закреплён. Удержание и контур не изменены.";
+        flashToast("Аккаунт закреплён; удержание и контур не изменены.");
+        await refreshWhatsappAccounts();
+      } catch (error) {
+        feedback.className = "entry-feedback";
+        feedback.textContent = error.message;
+      } finally { submit.disabled = false; }
+    });
+    form.append(fieldLabel("Подтверждённый JID своего аккаунта", jid),
+      fieldLabel("Причина", reason), submit, feedback);
+    details.append(form); card.append(details);
+  }
+  const review = el("details", "wa-action");
+  review.append(el("summary", "", "Проверить исторические неизвестные"));
+  const reviewBody = el("div", "wa-form");
+  const loadInventory = el("button", "entry-submit", "Загрузить точный список для проверки");
+  loadInventory.type = "button";
+  const inventoryNote = el("p", "data-note");
+  reviewBody.append(loadInventory, inventoryNote);
+  const quarantineForm = el("div", "wa-quarantine-form");
+  const source = el("input");
+  source.type = "text"; source.maxLength = 160; source.placeholder = "Ссылка/номер доказательства";
+  source.setAttribute("aria-label", "Ссылка на основание проверки");
+  const reason = el("input");
+  reason.type = "text"; reason.maxLength = 240; reason.placeholder = "Причина подтверждения";
+  reason.setAttribute("aria-label", "Причина подтверждения исторических неизвестных");
+  const confirmLabel = el("label", "wa-confirm");
+  const confirm = el("input"); confirm.type = "checkbox";
+  confirmLabel.append(confirm, el("span", "", "Подтверждаю только показанный точный снимок."));
+  const submit = el("button", "entry-submit", "Подтвердить этот список");
+  submit.type = "button"; submit.disabled = true;
+  const feedback = el("p", "entry-feedback");
+  quarantineForm.append(fieldLabel("Основание (ссылка или ID)", source),
+    fieldLabel("Причина", reason), confirmLabel, submit, feedback);
+  quarantineForm.hidden = true;
+  reviewBody.append(quarantineForm);
+  const renderInventory = inventory => {
+    state.legacyInventories[account.session_name] = inventory;
+    if (!inventory.reservation_count) {
+      inventoryNote.textContent = "Подходящих исторических записей нет.";
+      quarantineForm.hidden = true;
+      return;
+    }
+    inventoryNote.textContent = "Записей: " + inventory.reservation_count +
+      " · старейшая: " + ageLabel(inventory.oldest_age_seconds) +
+      " · снимок SHA-256: " + inventory.inventory_sha256.slice(0, 16) + "…";
+    quarantineForm.hidden = false;
+    submit.disabled = true;
+    confirm.checked = false;
+    confirm.onchange = () => {
+      submit.disabled = !confirm.checked || !source.value.trim() || !reason.value.trim();
+    };
+    source.oninput = reason.oninput = () => {
+      submit.disabled = !confirm.checked || !source.value.trim() || !reason.value.trim();
+    };
+    submit.onclick = async () => {
+      const current = state.legacyInventories[account.session_name];
+      if (!current || !confirm.checked || !source.value.trim() || !reason.value.trim()) return;
+      submit.disabled = true; feedback.textContent = "";
+      const keyName = "legacy:" + account.session_name + ":" + current.inventory_sha256;
+      try {
+        const result = await apiWrite("/api/whatsapp/legacy-unknown-quarantine", {
+          session_name: account.session_name,
+          reservation_ids: current.reservation_ids,
+          inventory_sha256: current.inventory_sha256,
+          source_reference: source.value.trim(),
+          reason: reason.value.trim(),
+          idempotency_key: await operatorCommandKey(
+            keyName, source.value.trim() + "\u0000" + reason.value.trim())
+        });
+        clearOperatorCommandKey(
+          keyName, source.value.trim() + "\u0000" + reason.value.trim());
+        delete state.legacyInventories[account.session_name];
+        feedback.className = "wa-success";
+        feedback.textContent = "Подтверждено записей: " + result.reservation_count +
+          ". Исходные отправки и история остались без изменений.";
+        flashToast("Исторические неизвестные подтверждены; записи отправок сохранены.");
+        await refreshWhatsappAccounts();
+      } catch (error) {
+        feedback.className = "entry-feedback";
+        feedback.textContent = error.message;
+        submit.disabled = false;
+      }
+    };
+  };
+  loadInventory.addEventListener("click", async () => {
+    loadInventory.disabled = true; inventoryNote.textContent = "Загружаю снимок…";
+    try {
+      const inventory = await api("/api/whatsapp/legacy-unknown-inventory?session_name=" +
+        encodeURIComponent(account.session_name));
+      renderInventory(inventory);
+    } catch (error) { inventoryNote.textContent = error.message; }
+    finally { loadInventory.disabled = false; }
+  });
+  const existing = state.legacyInventories[account.session_name];
+  if (existing) renderInventory(existing);
+  review.append(reviewBody); card.append(review);
+  return card;
+}
+function fieldLabel(label, input) {
+  const wrapper = el("label", "entry-field");
+  wrapper.append(el("span", "", label), input);
+  return wrapper;
+}
+async function refreshWhatsappAccounts() {
+  if (!state.authenticated) return;
+  const panel = $("whatsapp-operator");
+  const root = $("wa-account-list");
+  if (!panel || !root) return;
+  try {
+    const data = await api("/api/whatsapp/accounts");
+    const snapshot = JSON.stringify(data);
+    if (snapshot === state.whatsappSnapshot && !panel.hidden) return;
+    if (panel.contains(document.activeElement)
+        && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+    state.whatsappSnapshot = snapshot;
+    state.whatsappAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+    root.replaceChildren();
+    if (!state.whatsappAccounts.length) {
+      root.append(el("p", "data-note", "Нет активных WhatsApp-диалогов в ваших заявках."));
+    } else {
+      state.whatsappAccounts.forEach(account => root.append(waAccountCard(account, data.pin_session_name)));
+    }
+    panel.hidden = false;
+  } catch (error) {
+    root.replaceChildren(el("p", "entry-feedback", error.message));
+    panel.hidden = false;
+  }
+}
+
 async function refreshDashboard({background = false} = {}) {
   if (!initData || !state.authenticated) return;
   if ($("detail").open && !background) return;
@@ -2696,7 +2935,11 @@ $("search").addEventListener("input", event => {
 $("status-filter").addEventListener("change", event => { state.status = event.target.value; load(); });
 $("city-filter").addEventListener("change", event => { state.city = event.target.value; load(); });
 $("load-more").addEventListener("click", () => { if (!state.loading) load(true); });
-$("refresh").addEventListener("click", refreshDashboard);
+$("refresh").addEventListener("click", async () => {
+  await refreshDashboard();
+  await refreshWhatsappAccounts();
+});
+$("wa-operator-refresh").addEventListener("click", refreshWhatsappAccounts);
 $("close-detail").addEventListener("click", () => $("detail").close());
 $("detail").addEventListener("close", () => {
   state.detailRevision += 1;
@@ -2709,7 +2952,10 @@ $("detail").addEventListener("close", () => {
 setInterval(() => {
   if (!state.authenticated || document.visibilityState !== "visible") return;
   if ($("detail").open) refreshOpenDetail();
-  else refreshDashboard({background: true});
+  else {
+    refreshDashboard({background: true});
+    refreshWhatsappAccounts();
+  }
 }, 30000);
 
 async function start() {
@@ -2724,7 +2970,7 @@ async function start() {
     const user = await api("/api/me");
     state.authenticated = true;
     $("account-name").textContent = user.display_name || "Мой кабинет";
-    await refreshDashboard();
+    await Promise.all([refreshDashboard(), refreshWhatsappAccounts()]);
   } catch (error) {
     document.querySelector(".stats").hidden = true;
     $("controls").hidden = true;

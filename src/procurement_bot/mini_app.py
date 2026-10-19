@@ -8,7 +8,7 @@ import hmac
 import json
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlparse
 from uuid import UUID
@@ -79,11 +79,19 @@ from procurement_bot.owner_autonomy import (
     replace_research_profile,
     revoke_research_profile,
 )
+from procurement_bot.providers.waha import WahaClient
 from procurement_bot.queue import enqueue_job, stable_key
 from procurement_bot.research_workflow import ResearchStartDenied
 from procurement_bot.resources import resource_path
 from procurement_bot.supplier_contact_scope import case_owned_supplier_contact_evidence
 from procurement_bot.supplier_media import media_storage_path
+from procurement_bot.whatsapp_account import get_account_state
+from procurement_bot.whatsapp_operator import (
+    AuthenticatedOperatorContext,
+    legacy_inventory_from_operator_context,
+    pin_from_operator_context,
+    quarantine_from_operator_context,
+)
 
 STATIC = resource_path("mini_app")
 MAX_AGE_SECONDS = 24 * 60 * 60
@@ -2138,6 +2146,249 @@ async def supplier_detail(request: web.Request) -> web.Response:
     )
 
 
+def _same_mini_app_origin(request: web.Request) -> bool:
+    origin = request.headers.get("Origin", "")
+    configured = request.app["settings"].mini_app_public_url
+    try:
+        received = urlparse(origin)
+        expected = urlparse(configured)
+        if (
+            not origin
+            or not configured
+            or received.scheme != "https"
+            or received.hostname is None
+            or received.path not in ("", "/")
+            or received.query
+            or received.fragment
+            or received.username
+            or received.password
+            or expected.scheme != "https"
+            or expected.hostname is None
+        ):
+            return False
+        received_port = received.port or 443
+        expected_port = expected.port or 443
+    except ValueError:
+        return False
+    return (
+        received.scheme == expected.scheme
+        and received.hostname.lower() == expected.hostname.lower()
+        and received_port == expected_port
+    )
+
+
+async def _operator_command_body(
+    request: web.Request, expected_fields: set[str]
+) -> dict[str, object]:
+    if not _same_mini_app_origin(request):
+        raise web.HTTPForbidden(text="same-origin request required")
+    body = await _body(request)
+    if set(body) != expected_fields:
+        raise ValueError("Invalid operator request")
+    return body
+
+
+def _operator_context(request: web.Request) -> AuthenticatedOperatorContext:
+    return AuthenticatedOperatorContext(
+        actor_user_id=request["owner_id"],
+        authentication_source="telegram_mini_app_init_data",
+    )
+
+
+def _masked_account_jid(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    local, separator, domain = value.partition("@")
+    if not separator or domain != "c.us" or not local.isdigit():
+        return None
+    return f"••••{local[-4:]}@c.us"
+
+
+async def whatsapp_accounts(request: web.Request) -> web.Response:
+    owner_id = request["owner_id"]
+    pool: asyncpg.Pool = request.app["pool"]
+    async with pool.acquire() as connection:
+        sessions = await connection.fetch(
+            """SELECT conversation.session_name
+               FROM supplier_conversations conversation
+               JOIN procurement_cases procurement_case
+                 ON procurement_case.id=conversation.case_id
+               WHERE procurement_case.status NOT IN ('closed','cancelled','selected')
+               GROUP BY conversation.session_name
+               HAVING bool_and(procurement_case.owner_user_id=$1)
+               ORDER BY conversation.session_name""",
+            owner_id,
+        )
+        accounts: list[dict[str, object]] = []
+        for session in sessions:
+            session_name = session["session_name"]
+            state = await get_account_state(connection, session_name)
+            row = await connection.fetchrow(
+                """SELECT pinned_account_jid FROM whatsapp_account_controls
+                   WHERE session_name=$1""",
+                session_name,
+            )
+            oldest_unresolved = await connection.fetchval(
+                """SELECT min(reservation.reserved_at)
+                   FROM whatsapp_account_send_reservations reservation
+                   WHERE reservation.session_name=$1 AND (
+                       reservation.state='reserved'
+                       OR (reservation.state='unknown' AND NOT EXISTS (
+                           SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                           WHERE item.outbox_event_id=reservation.outbox_event_id
+                       )))""",
+                session_name,
+            )
+            pinned_jid = row["pinned_account_jid"] if row is not None else None
+            accounts.append({
+                "session_name": session_name,
+                "operator_held": bool(state["operator_held"]),
+                "operator_hold_reason": state["operator_hold_reason"],
+                "circuit_open": bool(state["circuit_open"]),
+                "circuit_reason": state["circuit_reason"],
+                "provider_state": state["provider_state"],
+                "provider_observed_at": state["provider_observed_at"],
+                "account_identity_pinned": bool(pinned_jid),
+                "account_pin_version": int(state["account_pin_version"]),
+                "masked_account_jid": _masked_account_jid(pinned_jid),
+                "unresolved_reservations": int(state["unresolved_reservations"]),
+                "oldest_unresolved_age_seconds": (
+                    max(0, int((datetime.now(UTC) - oldest_unresolved).total_seconds()))
+                    if oldest_unresolved is not None else None
+                ),
+                "unknown_reservations": int(state["unknown_reservations"]),
+                "quarantined_unknown_reservations": int(
+                    state["quarantined_unknown_reservations"]
+                ),
+                "oldest_quarantined_unknown_age_seconds": (
+                    state["oldest_quarantined_unknown_age_seconds"]
+                ),
+            })
+    settings: Settings = request.app["settings"]
+    configured_session = settings.waha_session
+    pin_available = bool(
+        settings.waha_enabled
+        and settings.waha_api_key.get_secret_value().strip()
+    )
+    return _json(request, {
+        "accounts": accounts,
+        "pin_session_name": configured_session if pin_available else None,
+    })
+
+
+async def whatsapp_legacy_unknown_inventory(request: web.Request) -> web.Response:
+    session_name = request.query.get("session_name", "")
+    if not session_name or len(session_name) > 128 or session_name.strip() != session_name:
+        return _json(request, {"error": "Invalid session"}, status=400)
+    try:
+        inventory = await legacy_inventory_from_operator_context(
+            request.app["pool"],
+            auth=_operator_context(request),
+            session_name=session_name,
+        )
+        return _json(request, inventory)
+    except PermissionError:
+        return _json(request, {"error": "operation unavailable"}, status=403)
+    except ValueError:
+        return _json(request, {"error": "Invalid request"}, status=400)
+
+
+async def pin_whatsapp_account_api(request: web.Request) -> web.Response:
+    try:
+        body = await _operator_command_body(
+            request,
+            {"session_name", "expected_account_jid", "reason", "idempotency_key"},
+        )
+        session_name = body["session_name"]
+        expected_jid = body["expected_account_jid"]
+        reason = body["reason"]
+        idempotency_key = body["idempotency_key"]
+        settings: Settings = request.app["settings"]
+        if (
+            not isinstance(session_name, str)
+            or session_name != settings.waha_session
+            or not isinstance(expected_jid, str)
+            or len(expected_jid) > 64
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 240
+            or not isinstance(idempotency_key, str)
+        ):
+            raise ValueError("Invalid operator request")
+        client = WahaClient(
+            base_url=settings.waha_base_url,
+            api_key=settings.waha_api_key.get_secret_value(),
+            session=settings.waha_session,
+            enabled=settings.waha_enabled,
+            outbound_enabled=settings.waha_outbound_enabled,
+            timeout_seconds=settings.waha_timeout_seconds,
+        )
+        version = await pin_from_operator_context(
+            request.app["pool"],
+            client,
+            auth=_operator_context(request),
+            expected_account_jid=expected_jid,
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return _json(request, {
+            "account_pin_version": version,
+            "masked_account_jid": _masked_account_jid(expected_jid),
+        })
+    except web.HTTPException:
+        raise
+    except PermissionError:
+        return _json(request, {"error": "operation unavailable"}, status=403)
+    except ValueError:
+        return _json(request, {"error": "Invalid request"}, status=400)
+    except Exception:
+        return _json(request, {"error": "account identity check failed"}, status=502)
+
+
+async def quarantine_legacy_unknown_api(request: web.Request) -> web.Response:
+    try:
+        body = await _operator_command_body(
+            request,
+            {
+                "session_name", "reservation_ids", "inventory_sha256",
+                "source_reference", "reason", "idempotency_key",
+            },
+        )
+        session_name = body["session_name"]
+        raw_ids = body["reservation_ids"]
+        if (
+            not isinstance(session_name, str)
+            or not session_name
+            or len(session_name) > 128
+            or session_name.strip() != session_name
+            or not isinstance(raw_ids, list)
+            or not 1 <= len(raw_ids) <= 200
+            or any(not isinstance(value, str) for value in raw_ids)
+        ):
+            raise ValueError("Invalid operator request")
+        reservation_ids = [_uuid(value) for value in raw_ids]
+        for field in ("inventory_sha256", "source_reference", "reason", "idempotency_key"):
+            if not isinstance(body[field], str):
+                raise ValueError("Invalid operator request")
+        result = await quarantine_from_operator_context(
+            request.app["pool"],
+            auth=_operator_context(request),
+            session_name=session_name,
+            reservation_ids=reservation_ids,
+            inventory_sha256=body["inventory_sha256"],
+            source_reference=body["source_reference"],
+            reason=body["reason"],
+            idempotency_key=body["idempotency_key"],
+        )
+        return _json(request, result)
+    except web.HTTPException:
+        raise
+    except PermissionError:
+        return _json(request, {"error": "operation unavailable"}, status=403)
+    except ValueError:
+        return _json(request, {"error": "Invalid request"}, status=400)
+
+
 async def css(_request: web.Request) -> web.FileResponse:
     return web.FileResponse(STATIC / "app.css")
 
@@ -2191,6 +2442,14 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_get("/api/ready", readiness)
     app.router.add_get("/api/me", me)
     app.router.add_get("/api/summary", summary)
+    app.router.add_get("/api/whatsapp/accounts", whatsapp_accounts)
+    app.router.add_get(
+        "/api/whatsapp/legacy-unknown-inventory", whatsapp_legacy_unknown_inventory
+    )
+    app.router.add_post("/api/whatsapp/account-pin", pin_whatsapp_account_api)
+    app.router.add_post(
+        "/api/whatsapp/legacy-unknown-quarantine", quarantine_legacy_unknown_api
+    )
     app.router.add_get("/api/cases", cases)
     app.router.add_get("/api/cases/{case_id}", case_detail)
     app.router.add_get("/api/cases/{case_id}/source-visibility", case_source_visibility)
