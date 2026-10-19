@@ -267,3 +267,24 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
  .supplier-media { display: block; max-width: 100%; max-height: 480px; margin-top: 8px; }
+
+
+.stage-summary { margin: 13px 0 12px; padding: 13px 0; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); }
+.stage-explainer { margin: 8px 0 13px; color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
+.stage-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(156px, 1fr)); gap: 7px; }
+.stage-filter { min-height: 44px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 0; background: var(--surface); color: var(--ink); text-align: left; font-size: 12px; line-height: 1.35; font-weight: 650; }
+.stage-filter:hover { border-color: var(--ink); }
+.stage-filter[aria-pressed="true"] { border-color: var(--dark); background: var(--dark); color: white; }
+.stage-waiting { margin: 10px 0 0; padding: 8px 0 0; border-top: 1px solid var(--line); color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+.stage-groups { margin-top: 13px; border-top: 1px solid var(--ink); }
+.stage-group { border-bottom: 1px solid var(--line); }
+.stage-group-summary { display: flex; min-height: 52px; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 2px; cursor: pointer; color: var(--ink); font-size: 14px; line-height: 1.35; font-weight: 700; }
+.stage-group-summary::marker { color: var(--muted); }
+.stage-group-count { flex: none; min-width: 30px; padding: 4px 7px; border: 1px solid var(--line); color: var(--ink-soft); text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.stage-group-items { padding-bottom: 4px; }
+.stage-badge { max-width: 190px; min-height: 27px; white-space: normal; text-align: center; font-size: 12px; line-height: 1.25; }
+@media (max-width: 520px) {
+  .stage-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stage-filter { padding: 7px; }
+  .stage-badge { max-width: 145px; }
+}
