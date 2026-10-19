@@ -1,5 +1,22 @@
 # Connected synthetic checkpoint for Luna — 2026-10-19
 
+## Current integrated account-operator checkpoint — 2026-10-19
+
+The published account-operator branch at `e1cf00a7f31031386df6475f0afec46c2ffb55bd` was merged normally into this isolated integration branch. Merge commit: `22a1312` (`Merge branch codex/uranenergo-account-operator-miniapp-2026-10-19`). The merge preserved the integration-side source-bound research retry fix from `c7e4294`; no conflicts or manual resolutions were needed. The older writer checkpoint below is retained as history and is superseded for current status by this section.
+
+The Mini App exposes authenticated account readback, explicit identity pinning, and exact-snapshot legacy-unknown attestation. It does not expose hold/circuit release. The research tick may now request the existing coalesced draft-preparation job during a still-running native research run when a persisted exact/confirm/lead offer exists and the native WhatsApp/auto-preparation settings are enabled. The held/unpinned account path still does not prepare reminders or reacquire dialogue slots. Draft preparation remains approval-gated; physical send authorization and delivery checks were not changed. Migration 045 is present in this isolated source tree only and has not been applied in production. No 046 runtime is included.
+
+Selected verification on the merged tree:
+
+- `tests/test_uran_connected_postgres.py tests/test_whatsapp_account_identity.py`: **46 passed**, 14 dependency/aiohttp warnings, using disposable schemas on verified `127.0.0.1:55450/test_uran_integrated`. This includes the connected owner/API workflow, held-account synthetic delivery guard, and source-bound index-0 skip/replay that preserves the original second-item UUID.
+- `tests/test_mini_app_whatsapp_operator.py`: **1 passed**, 3 existing aiohttp AppKey warnings, on the required separate `127.0.0.1:55451/test_uran_account_operator` target.
+- Held-research tick cases: **5 passed** on verified `127.0.0.1:55450/test_uran_integrated`.
+- Ruff, Python compileall, Node 22 syntax check (`node --check mini_app/app.js`), and `git diff --check HEAD^1 HEAD`: passed.
+
+Both PostgreSQL targets were already running and were checked before connecting. Tests used generated fixtures and stubbed network boundaries; no production database, live WAHA request, provider search, service change, or external message was part of these checks.
+
+Validation limits: an earlier broad run found 15 failures in `test_autonomous_pipeline.py` and `test_pipeline_reviews.py`, and reproduced the same names on clean baseline `5f2ba1f`. The complete broad set was not rerun after this merge, so this checkpoint claims only the selected checks above. At report time, the first production Taraz run was blocked at the search-profile loader by a `SearchProfileConflict`; the separate activation checkout owns that small fix. This merged integration source must not be packaged or released until the reviewed fix SHA is included and the Taraz run advances. No production migration 045, pin, quarantine, hold/circuit action, or worker restart is authorized by this checkpoint.
+
 This is an uncommitted implementation checkpoint, not completion of the city-runtime assignment or deployment approval. The only runtime change is inside `JobWorker._prepare_supplier_outreach`: draft/conversation preparation no longer requires an already open/pinned account or an outbound-enabled provider client. Session availability, contact verification, and repository owner/contact/opt-out checks remain. Physical send authorization and delivery code are unchanged.
 
 ## Exact revisions
