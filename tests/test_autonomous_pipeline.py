@@ -1741,6 +1741,124 @@ async def test_tick_repairs_search_and_coalesces_while_outbound_stays_held(pipel
 
 
 @pytest.mark.postgres
+async def test_tick_prepares_native_lead_draft_while_account_is_held(pipeline_db):
+    from types import SimpleNamespace
+
+    from procurement_bot.autonomous_pipeline import run_pipeline_tick
+
+    pool, case, _owner, run, executor = pipeline_db
+    supplier_id = await pool.fetchval(
+        "INSERT INTO suppliers(display_name) VALUES('Synthetic lead') RETURNING id"
+    )
+    request_item_id = await pool.fetchval(
+        "SELECT id FROM request_items WHERE case_id=$1 ORDER BY line_number LIMIT 1", case
+    )
+    await pool.execute(
+        "INSERT INTO offers(request_item_id,supplier_id,idempotency_key) "
+        "VALUES($1,$2,$3)",
+        request_item_id,
+        supplier_id,
+        str(uuid4()),
+    )
+
+    class Client:
+        session_name = "test"
+        outbound_enabled = False
+
+        async def get_account_restrictions(self):
+            return {"state": "unavailable"}
+
+        async def get_session_status(self):
+            return "STOPPED"
+
+    worker = SimpleNamespace(
+        pool=pool,
+        waha_client=Client(),
+        research_executor=executor,
+        whatsapp_enabled=True,
+        research_auto_prepare_outreach=True,
+    )
+    await run_pipeline_tick(worker, case)
+    await run_pipeline_tick(worker, case)
+
+    summary = await pool.fetchval(
+        "SELECT last_tick_summary FROM case_pipeline_runtime WHERE case_id=$1", case
+    )
+    assert summary["account"]["operator_held"] is True
+    assert summary["account"]["outbound_allowed"] is False
+    assert await pool.fetchval(
+        "SELECT count(*) FROM jobs WHERE kind='prepare_supplier_outreach' "
+        "AND status IN ('pending','retry','running')"
+    ) == 1
+    assert await pool.fetchval(
+        "SELECT count(*) FROM outbox_events WHERE event_type='whatsapp.send_text'"
+    ) == 0
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    ("has_offer", "whatsapp_enabled", "auto_prepare", "source_kind"),
+    [
+        (False, True, True, "telegram"),
+        (True, False, True, "telegram"),
+        (True, True, False, "telegram"),
+        (True, True, True, "notion_import"),
+    ],
+)
+async def test_held_tick_skips_draft_without_native_preparation_scope(
+    pipeline_db, has_offer, whatsapp_enabled, auto_prepare, source_kind
+):
+    from types import SimpleNamespace
+
+    from procurement_bot.autonomous_pipeline import run_pipeline_tick
+
+    pool, case, _owner, _run, executor = pipeline_db
+    await pool.execute("UPDATE procurement_cases SET source_kind=$2 WHERE id=$1", case, source_kind)
+    if has_offer:
+        supplier_id = await pool.fetchval(
+            "INSERT INTO suppliers(display_name) VALUES('Synthetic lead') RETURNING id"
+        )
+        request_item_id = await pool.fetchval(
+            "SELECT id FROM request_items WHERE case_id=$1 ORDER BY line_number LIMIT 1", case
+        )
+        await pool.execute(
+            "INSERT INTO offers(request_item_id,supplier_id,idempotency_key) "
+            "VALUES($1,$2,$3)",
+            request_item_id,
+            supplier_id,
+            str(uuid4()),
+        )
+
+    class Client:
+        session_name = "test"
+        outbound_enabled = False
+
+        async def get_account_restrictions(self):
+            return {"state": "unavailable"}
+
+        async def get_session_status(self):
+            return "STOPPED"
+
+    await run_pipeline_tick(
+        SimpleNamespace(
+            pool=pool,
+            waha_client=Client(),
+            research_executor=executor,
+            whatsapp_enabled=whatsapp_enabled,
+            research_auto_prepare_outreach=auto_prepare,
+        ),
+        case,
+    )
+    assert await pool.fetchval(
+        "SELECT count(*) FROM jobs WHERE kind='prepare_supplier_outreach' "
+        "AND status IN ('pending','retry','running')"
+    ) == 0
+    assert await pool.fetchval(
+        "SELECT count(*) FROM outbox_events WHERE event_type='whatsapp.send_text'"
+    ) == 0
+
+
+@pytest.mark.postgres
 async def test_history_does_not_advance_when_private_quarantine_is_full(pipeline_db, monkeypatch):
     from procurement_bot.transport_recovery import reconcile_history
 

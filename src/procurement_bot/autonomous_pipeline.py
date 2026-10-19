@@ -440,7 +440,34 @@ async def run_pipeline_tick(worker, case_id: UUID) -> None:
         generation = await c.fetchval(
             "SELECT tick_generation FROM case_pipeline_runtime WHERE case_id=$1", case_id
         )
-        if outbound_ready:
+        draft_preparation_during_research = False
+        if (
+            getattr(worker, "whatsapp_enabled", False)
+            and getattr(worker, "research_auto_prepare_outreach", True)
+        ):
+            draft_preparation_during_research = bool(await c.fetchval(
+                """SELECT EXISTS(
+                       SELECT 1
+                       FROM research_runs run
+                       JOIN procurement_cases procurement_case
+                         ON procurement_case.id=run.case_id
+                       JOIN case_pipeline_runtime runtime
+                         ON runtime.case_id=procurement_case.id
+                        AND runtime.research_run_id=run.id
+                       WHERE run.id=$1 AND run.status='running'
+                         AND runtime.enabled AND NOT runtime.paused
+                         AND procurement_case.source_kind IS DISTINCT FROM 'notion_import'
+                         AND EXISTS (
+                             SELECT 1 FROM offers offer
+                             JOIN request_items item ON item.id=offer.request_item_id
+                             WHERE item.case_id=procurement_case.id
+                               AND offer.status=ANY($2::text[])
+                         )
+                   )""",
+                run_id,
+                ["exact", "confirm", "lead"],
+            ))
+        if outbound_ready or draft_preparation_during_research:
             await request_outreach(
                 c, case_id=case_id, source_key=stable_key("pipeline-outreach", case_id, generation)
             )

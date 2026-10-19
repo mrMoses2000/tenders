@@ -18,6 +18,11 @@ from procurement_bot.config import Settings
 from procurement_bot.db import run_migrations
 from procurement_bot.mini_app import create_mini_app
 from procurement_bot.providers.waha import WahaAccountIdentity, WahaClient
+from scripts.postgres_test_safety import (
+    UnsafeTestDatabaseError,
+    configured_postgres_target,
+    verify_postgres_test_connection,
+)
 
 
 def _signed_data(token: str, telegram_id: int) -> str:
@@ -36,6 +41,17 @@ async def test_whatsapp_operator_api_auth_owner_origin_and_pin_idempotency(
     dsn = os.getenv("TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("TEST_POSTGRES_DSN is not set")
+    target = configured_postgres_target(dsn)
+    if (
+        target.database != "test_uran_account_operator"
+        or target.host is None
+        or target.port != 55451
+    ):
+        raise UnsafeTestDatabaseError(
+            "Mini App operator tests require the dedicated loopback "
+            "test_uran_account_operator:55451 target"
+        )
+    await verify_postgres_test_connection(dsn, target)
     schema = f"miniapp_whatsapp_operator_{uuid4().hex}"
     admin = await asyncpg.connect(dsn)
     await admin.execute(f'CREATE SCHEMA "{schema}"')
