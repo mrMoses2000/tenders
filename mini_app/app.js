@@ -759,6 +759,147 @@ function itemBadge(item) {
   if (item.source_record_url) return el("span", "badge warn", "История из Notion");
   return badge(item.status);
 }
+const caseStageGroups = [
+  ["owner_sourcing", "Уже закуплено / исключено"],
+  ["purchase_review", "Покупка требует сверки"],
+  ["needs_clarification", "Нужно уточнить"],
+  ["comparable_options", "Есть сравнимое КП"],
+  ["supplier_candidates", "Кандидаты поставщиков"],
+  ["in_research", "Поиск идёт"],
+  ["paused", "Поиск приостановлен"],
+  ["research_review", "Поиск завершён · нужна проверка"],
+  ["not_started", "Поиск не запущен"]
+];
+
+function effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash) {
+  if (!currentSourceHash) return null;
+  return (sourceItem?.sourcing_evidence || []).find(evidence =>
+    evidence.applies_to_sourcing === true
+      && evidence.source_payload_sha256 === currentSourceHash) || null;
+}
+
+function isFullOwnerSourcingInstruction(item, instruction) {
+  if (!instruction) return false;
+  if (instruction.disposition === "skip") return true;
+  if (!["bought", "reduce_quantity"].includes(instruction.disposition)) return false;
+  const instructedQuantity = Number(instruction.quantity);
+  const originalQuantity = Number(item?.quantity);
+  return Number.isFinite(instructedQuantity) && Number.isFinite(originalQuantity)
+    && originalQuantity > 0 && instructedQuantity >= originalQuantity
+    && String(instruction.unit || "") === String(item?.unit || "");
+}
+
+function ownerInstructionBadgeLabel(item, sourceItem, currentSourceHash) {
+  const instruction = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
+  if (!instruction || isFullOwnerSourcingInstruction(item, instruction)) return null;
+  const quantityText = Number.isFinite(Number(instruction.quantity))
+    ? Number(instruction.quantity) + " " + (instruction.unit || item?.unit || "") : "количество не указано";
+  const planText = sourceItem?.disposition_applied_to_plan
+    ? "учтено в привязке плана" : "учтётся в следующем плане";
+  const instructionText = instruction.disposition === "bought"
+    ? "Владелец сообщает о покупке " + quantityText
+    : "По указанию владельца искать остаток после " + quantityText;
+  return instructionText + " · " + planText;
+}
+
+function classifyCaseItemStage(item, sourceItem, progress, offers, currentSourceHash) {
+  const instruction = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
+  if (sourceItem?.stage === "bought" || isFullOwnerSourcingInstruction(item, instruction)) {
+    return "owner_sourcing";
+  }
+  if (!instruction && (sourceItem?.stage === "evidence_only"
+      || (sourceItem?.sourcing_evidence || []).length > 0)) return "purchase_review";
+  if (sourceItem?.stage === "needs_review"
+      || (!sourceItem && item.status === "needs_clarification")) {
+    return "needs_clarification";
+  }
+  if ((offers || []).some(offer => offer.comparison?.rank !== null
+      && offer.comparison?.rank !== undefined
+      && offer.comparison?.price_state === "supplier_confirmed")) {
+    return "comparable_options";
+  }
+  if ((offers || []).length > 0 || Number(progress?.found_leads || 0) > 0) {
+    return "supplier_candidates";
+  }
+  if (progress?.status === "paused") return "paused";
+  if (["queued", "researching"].includes(progress?.status)
+      || item.status === "researching") return "in_research";
+  if (item.status === "offers_found") return "supplier_candidates";
+  if (["succeeded", "partial", "failed"].includes(progress?.status)
+      || item.status === "no_match") return "research_review";
+  return "not_started";
+}
+
+function caseStageBadgeLabel(stageKey, sourceItem, currentSourceHash) {
+  if (stageKey === "owner_sourcing") {
+    if (sourceItem?.stage === "bought") return "Закуплено · учёт";
+    const instruction = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
+    if (instruction?.disposition === "skip") {
+      return sourceItem?.disposition_applied_to_plan
+        ? "Исключено владельцем" : "Исключение в следующем плане";
+    }
+    if (instruction?.disposition === "bought") return "Покупка заявлена владельцем";
+    if (instruction?.disposition === "reduce_quantity") return "Количество изменено владельцем";
+  }
+  return caseStageGroups.find(([key]) => key === stageKey)?.[1] || "Этап не указан";
+}
+
+function renderCaseStageSummary(groupedItems, itemCount, onSelect) {
+  const element = el("section", "stage-summary");
+  element.setAttribute("aria-label", "Сводка по этапам позиций");
+  const filters = el("div", "stage-filters");
+  const buttons = new Map();
+  const addFilter = (key, label, count) => {
+    const button = el("button", "stage-filter", label + " · " + count);
+    button.type = "button";
+    button.setAttribute("aria-pressed", key === "all" ? "true" : "false");
+    button.addEventListener("click", () => onSelect(key));
+    buttons.set(key, button);
+    filters.append(button);
+  };
+  addFilter("all", "Все позиции", itemCount);
+  groupedItems.groups.filter(group => group.items.length > 0).forEach(group =>
+    addFilter(group.key, group.label, group.items.length));
+  element.append(filters);
+  const waiting = el("p", "stage-waiting");
+  waiting.textContent = groupedItems.waitingConversations === null
+    ? "Ожидание ответа: счётчик недоступен"
+    : "Ожидают ответа: " + countLabel(groupedItems.waitingConversations,
+      "диалог", "диалога", "диалогов") + " · число диалогов, не позиций";
+  element.append(waiting);
+  return {element, buttons};
+}
+
+function groupCaseItems(items, sourceVisibility, researchProgress, offers, waitingChats) {
+  const sourceByItem = new Map((sourceVisibility?.items || [])
+    .map(source => [source.item_id, source]));
+  const progressByItem = new Map((researchProgress || [])
+    .map(progress => [progress.request_item_id, progress]));
+  const offersByItem = new Map();
+  (offers || []).forEach(offer => {
+    const group = offersByItem.get(offer.request_item_id) || [];
+    group.push(offer);
+    offersByItem.set(offer.request_item_id, group);
+  });
+  const groups = caseStageGroups.map(([key, label]) => ({key, label, items: []}));
+  const byKey = new Map(groups.map(group => [group.key, group]));
+  const assignments = new Map();
+  for (const item of items || []) {
+    const stage = classifyCaseItemStage(item, sourceByItem.get(item.id),
+      progressByItem.get(item.id), offersByItem.get(item.id),
+      sourceVisibility?.source_payload_sha256);
+    byKey.get(stage).items.push(item);
+    assignments.set(item.id, stage);
+  }
+  return {
+    groups,
+    assignments,
+    waitingConversations: waitingChats === null || waitingChats === undefined
+      || !Number.isFinite(Number(waitingChats))
+      ? null : Math.max(0, Number(waitingChats))
+  };
+}
+
 function renderSupplierMedia(row, entry) {
         if (row.media_kind) {
           entry.append(meta(row.media_kind === "audio" ? "Голосовое" : "Фото",
@@ -1696,12 +1837,174 @@ function researchGeographyText(decision) {
     ? labels[decision] : null;
 }
 
-function sourceItemPanel(source) {
+function caseAdoptionPanel(caseId) {
+  const panel = el("details", "entry-panel");
+  panel.append(el("summary", "", "Подключить существующую заявку к исследованию"));
+  panel.append(el("p", "data-note", "Сначала проверим текущий разбор, позиции и действующее согласие. Заявка и её позиции не будут переписаны."));
+  const preflightButton = el("button", "entry-submit", "Проверить заявку");
+  preflightButton.type = "button";
+  const feedback = el("p", "entry-feedback");
+  panel.append(preflightButton, feedback);
+  preflightButton.addEventListener("click", async () => {
+    preflightButton.disabled = true;
+    feedback.textContent = "Сверяем текущие позиции и согласие…";
+    try {
+      const facts = await api("/api/cases/" + encodeURIComponent(caseId) + "/owner-research-preflight");
+      feedback.textContent = "Проверено: " + facts.items.length + " исходных позиций · города " +
+        facts.ordered_cities.join(" → ") + " · SHA разбора " + facts.source_payload_sha256.slice(0, 12) + "…";
+      const form = el("form", "entry-form");
+      const assertionWrap = el("label", "entry-field");
+      assertionWrap.append(el("span", "", "Подтверждение владельца"));
+      const assertion = el("textarea");
+      assertion.required = true;
+      assertion.maxLength = 2000;
+      assertion.value = "Подтверждаю подключение именно этой существующей заявки к исследованию по указанному согласию.";
+      assertionWrap.append(assertion);
+      const referenceWrap = el("label", "entry-field");
+      referenceWrap.append(el("span", "", "Основание подключения"));
+      const reference = el("input");
+      reference.required = true;
+      reference.maxLength = 500;
+      reference.value = "owner-confirmed-existing-case";
+      referenceWrap.append(reference);
+      const adopt = el("button", "entry-submit", "Подтвердить и поставить поиск в очередь");
+      adopt.type = "submit";
+      const result = el("p", "entry-feedback");
+      form.append(assertionWrap, referenceWrap, adopt, result);
+      panel.append(form);
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        adopt.disabled = true;
+        result.textContent = "Фиксируем подтверждение владельца…";
+        try {
+          await apiWrite("/api/cases/" + encodeURIComponent(caseId) + "/owner-research-adopt", {
+            preflight_sha256: facts.preflight_sha256,
+            owner_assertion: assertion.value.trim(),
+            adoption_reference: reference.value.trim()
+          });
+          result.textContent = "Подключено. Нативная очередь получила задание подготовить поиск.";
+          await openDetail(caseId);
+        } catch (error) {
+          result.textContent = error.message;
+          adopt.disabled = false;
+        }
+      });
+    } catch (error) {
+      feedback.textContent = error.message;
+      preflightButton.disabled = false;
+    }
+  });
+  return panel;
+}
+
+function sourcingInstructionForm(caseId, item, sourceItem, currentSourceHash) {
+  const existing = effectiveOwnerSourcingInstruction(sourceItem, currentSourceHash);
+  if (existing) {
+    const saved = el("details", "entry-panel source-instruction");
+    saved.append(el("summary", "", "Указание владельца для текущего разбора"));
+    const quantityValue = Number(existing.quantity || 0);
+    const remaining = Math.max(0, Number(item.quantity || 0) - quantityValue);
+    if (existing.disposition === "skip") {
+      saved.append(el("p", "data-note",
+        "Позиция исключена из поиска по указанию владельца. Указание меняет только поиск; бухгалтерская запись не создана."));
+    } else if (existing.disposition === "bought") {
+      saved.append(el("p", "data-note", "Владелец сообщает о покупке "
+        + quantity(quantityValue, item.unit || "") + "; для поиска останется "
+        + quantity(remaining, item.unit || "") + ". Это не подтверждённый учётной системой платёж."));
+    } else {
+      saved.append(el("p", "data-note", "По указанию владельца искать "
+        + quantity(remaining, item.unit || "") + " из исходных "
+        + quantity(item.quantity, item.unit || "") + ". Это не бухгалтерская запись."));
+    }
+    if (existing.source_reference) {
+      saved.append(el("p", "data-note", "Источник, указанный владельцем: " + existing.source_reference));
+    }
+    saved.append(el("p", "data-note", sourceItem.disposition_applied_to_plan
+      ? "Указание включено в привязку плана поиска."
+      : "Указание сохранено, но ещё не включено в привязку плана поиска."));
+    saved.append(el("p", "data-note", "Исправление эффективного указания требует проверки новой версии разбора."));
+    return saved;
+  }
+
+  const details = el("details", "entry-panel");
+  details.append(el("summary", "", "Свидетельство о закупке или исключении позиции"));
+  details.append(el("p", "data-note", "По умолчанию это только свидетельство. Отдельный флажок явно применяет указание владельца к следующему плану поиска; SHA источника указывается владельцем и не проверяется как байты файла."));
+  const form = el("form", "entry-form");
+  const [sourceField, sourceRef] = inputField("Источник / ссылка владельца", "text", {maxLength: 500, required: true});
+  const [hashField, sourceHash] = inputField("SHA-256 источника (указан владельцем)", "text", {
+    maxLength: 64, minLength: 64, required: true, pattern: "[0-9a-f]{64}"});
+  const [kindField, kind] = selectField("Указание по позиции", [
+    ["skip", "Уже обеспечено · исключить из поиска"],
+    ["bought", "Уже закуплено · указать купленное количество"],
+    ["reduce_quantity", "Уменьшить искомое количество"]
+  ]);
+  const [quantityField, amount] = inputField("Уже купленное количество", "number", {
+    step: "0.000001", min: "0.000001", max: String(item.quantity || ""), required: true});
+  const [assertionField, assertion] = inputField("Подтверждение владельца", "text", {
+    maxLength: 4000, required: true});
+  const [reasonField, reason] = inputField("Почему источник соответствует этой точной позиции", "text", {
+    maxLength: 2000, required: true});
+  const applyWrap = el("label", "entry-field");
+  const apply = el("input");
+  apply.type = "checkbox";
+  const canApply = Boolean(sourceItem && Array.isArray(sourceItem.issues)
+    && sourceItem.issues.length === 0);
+  apply.disabled = !canApply;
+  const applyText = el("span", "", canApply
+    ? "Явно применить к следующему плану поиска по этой точной позиции"
+    : "Нужно уточнить позицию; это свидетельство не будет менять план поиска");
+  applyWrap.append(apply, applyText);
+  const feedback = el("p", "entry-feedback");
+  const save = el("button", "entry-submit", "Сохранить свидетельство владельца");
+  save.type = "submit";
+  const setQuantityState = () => {
+    quantityField.hidden = kind.value === "skip";
+    amount.required = kind.value !== "skip";
+  };
+  kind.addEventListener("change", setQuantityState);
+  setQuantityState();
+  form.append(sourceField, hashField, kindField, quantityField, assertionField, reasonField,
+    applyWrap, save, feedback);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    save.disabled = true;
+    feedback.textContent = "Сохраняем…";
+    try {
+      await apiWrite("/api/cases/" + encodeURIComponent(caseId) + "/items/" +
+        encodeURIComponent(item.id) + "/sourcing-dispositions", {
+          source_kind: "operator_attestation", source_artifact_id: null,
+          source_reference: sourceRef.value.trim(), source_sha256: sourceHash.value.trim(),
+          disposition: kind.value, quantity: kind.value === "skip" ? null : amount.value,
+          unit: item.unit || "", owner_assertion: assertion.value.trim(),
+          exact_match_rationale: reason.value.trim(), applies_to_sourcing: apply.checked,
+          source_payload_sha256: apply.checked ? currentSourceHash : null,
+          idempotency_key: crypto.randomUUID()
+        });
+      feedback.textContent = apply.checked
+        ? "Указание владельца сохранено и связано с текущим разбором для следующего плана поиска."
+        : "Свидетельство сохранено. Объём поиска не менялся.";
+      await openDetail(caseId);
+    } catch (error) {
+      feedback.textContent = error.message;
+      save.disabled = false;
+    }
+  });
+  return details;
+}
+
+function sourceItemPanel(source, currentSourceHash) {
   const panel = el("details", "item-requirements-panel");
   const stages = {ready_for_search: "Готово к поиску", needs_review: "Нужно уточнение",
     comparable_quote: "Есть сравнимое КП", bought: "Закуплено, подтверждено",
-    evidence_only: "Есть свидетельство владельца"};
-  panel.append(el("summary", "", stages[source.stage] || "Источник позиции"));
+    evidence_only: "Есть свидетельство владельца · поиск не изменён",
+    owner_excluded_from_sourcing: "По явному указанию владельца исключено из поиска"};
+  const currentInstruction = effectiveOwnerSourcingInstruction(source, currentSourceHash);
+  const stageLabel = source.stage === "bought" ? "Закуплено, внесено в учёт"
+    : currentInstruction?.disposition === "skip"
+      ? "Исключено из поиска по указанию владельца"
+      : source.sourcing_evidence?.length ? "Покупка требует сверки"
+        : stages[source.stage] || "Источник позиции";
+  panel.append(el("summary", "", stageLabel));
   if (source.source_reference) panel.append(el("p", "data-note", "Источник: " + source.source_reference));
   const issues = (source.issues || []).map(issue => ({name_missing: "Не указано название",
     low_confidence: "Низкая уверенность распознавания",
@@ -1717,10 +2020,20 @@ function sourceItemPanel(source) {
     if (evidence.source_reference) panel.append(el("p", "data-note",
       (evidence.source_kind === "operator_attestation" ? "Источник, указанный владельцем: "
         : "Источник: ") + evidence.source_reference));
-    panel.append(el("p", "data-note", evidence.source_kind === "operator_attestation"
-      ? "SHA-256 источника заявлен владельцем; свидетельство сохранено для проверки."
-      : "SHA-256 файла Telegram сохранён."));
-    panel.append(el("p", "data-note", "Объём поиска ещё не изменён."));
+    panel.append(el("p", "data-note", evidence.source_sha256_basis === "owner_declared"
+      ? "SHA-256 заявлен владельцем; файл не проверялся системой."
+      : "SHA-256 файла Telegram проверен по сохранённому источнику."));
+    const appliesToCurrentParse = evidence.applies_to_sourcing
+      && evidence.source_payload_sha256 === currentSourceHash;
+    panel.append(el("p", "data-note", appliesToCurrentParse
+      ? "Указание владельца связано с текущей версией разбора. "
+        + (source.disposition_applied_to_plan
+          ? "Оно включено в привязку плана поиска. "
+          : "Оно ещё не включено в привязку плана поиска. ")
+        + "Это не запись в бухгалтерии."
+      : evidence.applies_to_sourcing
+        ? "Инструкция относилась к другой версии разбора; текущий поиск она не меняет."
+        : "Покупка требует сверки: свидетельство не меняет поиск и не подтверждает факт бухгалтерского учёта."));
   }
   return panel;
 }
@@ -1787,6 +2100,9 @@ async function openDetail(id, options = {}) {
     });
     body.append(grid, detailOptions());
     const sourceVisibility = data.source_visibility;
+    if (sourceVisibility?.research_consent === "manual" && c.status === "ready") {
+      body.append(caseAdoptionPanel(id));
+    }
     if (sourceVisibility?.warnings?.length) {
       const warnings = el("details", "item-requirements-panel");
       warnings.append(el("summary", "", "Замечания к источнику · " + sourceVisibility.warnings.length));
@@ -1795,59 +2111,66 @@ async function openDetail(id, options = {}) {
     }
     if (sourceVisibility?.report_checkpoint_at) body.append(el("p", "data-note",
       "Контрольная отметка: " + fmtDateTime(sourceVisibility.report_checkpoint_at)));
+    const stageOverviewSlot = el("div", "stage-overview-slot");
+    body.append(stageOverviewSlot);
+    const diagnostics = el("details", "case-diagnostics");
+    diagnostics.append(el("summary", "", "Ход поиска и диагностика"));
+    const diagnosticContent = el("div", "case-diagnostics-content");
+    diagnostics.append(diagnosticContent);
+    body.append(diagnostics);
     const metrics = data.pipeline_metrics;
     if (metrics) {
-      body.append(el("h3", "", "Поиск, предложения и связь"));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("h3", "", "Поиск, предложения и связь"));
+      diagnosticContent.append(el("p", "data-note",
         `Лиды: ${metrics.leads}; публичные цены: ${metrics.public_prices}; ` +
         `цены из ответов: ${metrics.supplier_prices}; сопоставимые подтверждённые: ${metrics.comparable_quotes}.`));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Принято WAHA: ${metrics.accepted}; в журнале диалогов: ${metrics.outbound_projected}; ` +
         `доставлено: ${metrics.delivered}; прочитано: ${metrics.read}; ` +
         `доставка не подтверждена: ${metrics.delivery_unknown}; ошибки ACK: ${metrics.delivery_failed}.`));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Приём попытки отправки не подтверждён: ${metrics.acceptance_unknown ?? 0}; ` +
         `принято WAHA, ожидает записи в диалог: ${metrics.accepted_pending_projection ?? 0}.`));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Незавершённые переговоры: ${metrics.waiting_chats}; рабочие группы: ${metrics.active_groups}. ` +
         "Недоступная история WAHA не доказывает отсутствие ответа."));
     }
     const health = data.pipeline_health;
     if (health?.provider_auth?.available === false) {
-      body.append(el("p", "data-note", "Авторизация обработчика AGY отсутствует. " +
+      diagnosticContent.append(el("p", "data-note", "Авторизация обработчика AGY отсутствует. " +
         "Задания, которым он нужен, ожидают восстановления доступа; сообщения сохранены."));
     }
     if (health) {
       const account = health.account || {};
       const ingress = health.ingress || {};
       const research = health.research || {};
-      body.append(el("h3", "", "Надёжность и ожидания"));
+      diagnosticContent.append(el("h3", "", "Надёжность и ожидания"));
       if (Number(account.accounts || 0) > 0) {
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `WhatsApp-сессии: ${account.accounts}; на ручной паузе: ${account.held}; ` +
           `с ограничением/timelock: ${account.restricted}; недоступны по GET: ${account.unavailable}; ` +
           `защитный контур открыт: ${account.circuits_open}; ` +
           `состояние неизвестно: ${account.state_unknown}; разрешено по сохранённым правилам: ${account.outbound_allowed}.`));
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Фактический статус WAHA по последнему GET: ${account.session_status || "не записан"}; ` +
           `состояние аккаунта наблюдалось: ${fmtDateTime(account.provider_observed_at)}; ` +
           `следующая проверка аккаунта: ${fmtDateTime(account.next_probe_at)}.`));
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Суточные лимиты связанных сессий: ${account.daily_message_limit ?? 0} сообщений, ` +
           `${account.daily_new_contact_limit ?? 0} новых контактов; ` +
           `одновременные отправки по аккаунтам: ${account.max_concurrent_posts ?? 0}. ` +
           `Рабочие группы назначаются отдельно: ${metrics?.active_groups ?? 0}.`));
       }
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Webhook события за 7 дней (вся система): приняты ${ingress.accepted_7d ?? 0}, ` +
         `проигнорированы ${ingress.ignored_7d ?? 0}, отклонены ${ingress.rejected_7d ?? 0}; ` +
         `последнее событие: ${fmtDateTime(ingress.last_seen_at)}.`));
       if (research.run_status) {
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Состояние поиска: ${research.run_status}; причина ожидания: ${pipelineWaitLabel(research.wait_reason)}; ` +
           `последний сохранённый прогресс: ${fmtDateTime(research.last_real_progress_at)}; ` +
           `следующее пробуждение: ${fmtDateTime(research.next_wake_at)}.`));
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Заданий очереди без активного владельца: ${research.queued_without_runnable_job}; ` +
           `с завершённым заданием: ${research.queued_with_terminal_job}; ` +
           `остановка без задания: ${research.stalled ? "да" : "нет"}.`));
@@ -1855,19 +2178,19 @@ async function openDetail(id, options = {}) {
     }
     const reviews = data.pipeline_reviews;
     if (reviews && Object.keys(reviews.counts || {}).length) {
-      body.append(el("h3", "", "Требуется проверка"));
+      diagnosticContent.append(el("h3", "", "Требуется проверка"));
       const labels = {unknown_send: "Результат отправки не подтверждён",
         blocked_reply: "Ответ ждёт подтверждения исходного сообщения",
         reply_processing_failed: "Ошибка обработки сохранённого ответа"};
       Object.entries(reviews.counts).forEach(([kind, count]) => {
-        body.append(el("p", "data-note", `${labels[kind] || kind}: ${count}.`));
+        diagnosticContent.append(el("p", "data-note", `${labels[kind] || kind}: ${count}.`));
       });
-      body.append(el("p", "data-note", "Исходные сообщения и идентификаторы сохранены. " +
+      diagnosticContent.append(el("p", "data-note", "Исходные сообщения и идентификаторы сохранены. " +
         "Неопределённые отправки не повторяются автоматически."));
-      if (reviews.truncated) body.append(el("p", "data-note",
+      if (reviews.truncated) diagnosticContent.append(el("p", "data-note",
         "Показаны первые 100 записей; общий счётчик включает остальные."));
       (reviews.items || []).forEach(review => {
-        body.append(el("p", "data-note", `${labels[review.kind] || review.kind}: ` +
+        diagnosticContent.append(el("p", "data-note", `${labels[review.kind] || review.kind}: ` +
           `${review.subject_id}; причина: ${review.reason_code}; ` +
           `последняя проверка: ${fmtDateTime(review.last_seen_at)}.`));
         const context = [];
@@ -1898,16 +2221,16 @@ async function openDetail(id, options = {}) {
               (review.reply_job_error_code || "нет") + ".");
           }
         }
-        if (context.length) body.append(el("p", "data-note", context.join(" ")));
+        if (context.length) diagnosticContent.append(el("p", "data-note", context.join(" ")));
       });
     }
     const runtime = data.pipeline_runtime;
     if (runtime?.enabled) {
       if (runtime.last_tick_summary?.waha_status && runtime.last_tick_summary.waha_status !== "WORKING") {
-        body.append(el("p", "data-note", "WhatsApp недоступен: " + runtime.last_tick_summary.waha_status +
+        diagnosticContent.append(el("p", "data-note", "WhatsApp недоступен: " + runtime.last_tick_summary.waha_status +
           ". Отправки ожидают восстановления соединения."));
       }
-      body.append(el("p", "data-note", runtime.paused ? "Пайплайн приостановлен владельцем."
+      diagnosticContent.append(el("p", "data-note", runtime.paused ? "Пайплайн приостановлен владельцем."
         : runtime.quota_probe_at ? "Ожидание лимита. Следующая проверка: " + fmtDate(runtime.quota_probe_at)
         : "Следующая проверка очереди: " + fmtDate(runtime.next_tick_at)));
     }
@@ -1969,31 +2292,72 @@ async function openDetail(id, options = {}) {
     if (editable && data.outreach_drafts?.length) {
       body.append(outreachDraftsPanel(id, data.outreach_drafts, data.outreach_enabled));
     }
-    body.append(el("h3", "", "Позиции и выбор поставщика"));
-    body.append(el("p", "data-note", "Сравнивается цена товара на нужную партию. " +
-      "Доставка войдёт в факт после внесения рейса; НДС отдельно не рассчитывается."));
+    stageOverviewSlot.append(el("h3", "", "Позиции по этапам"));
+    stageOverviewSlot.append(el("p", "stage-explainer", "Этапы показывают ход сверки и поиска, а не готовность к покупке. " +
+      "Сравнимым считается только подтверждённая цена по нужной партии и проверенному ТЗ."));
+    const groupedItems = groupCaseItems(data.items, sourceVisibility, progressRows,
+      data.offers, metrics?.waiting_chats);
+    let activeStageFilter = "all";
+    let filterItems;
+    let stageSections;
+    const stageSummaryModel = renderCaseStageSummary(groupedItems, data.items.length, key => {
+      activeStageFilter = key;
+      stageSummaryModel.buttons.forEach((button, buttonKey) =>
+        button.setAttribute("aria-pressed", buttonKey === key ? "true" : "false"));
+      if (key !== "all") stageSections.get(key).section.open = true;
+      filterItems();
+    });
+    stageOverviewSlot.append(stageSummaryModel.element);
+
     const itemFilter = el("div", "item-filter");
     const itemSearch = el("input", "offer-search item-search");
     itemSearch.type = "search";
     itemSearch.placeholder = "Название, номер или техспек позиции";
     itemSearch.setAttribute("aria-label", "Поиск позиций в заявке");
     const offerFilter = el("select", "item-filter-select");
-    [["all", "Все позиции"], ["with", "С предложениями"], ["without", "Без предложений"]]
+    [["all", "Все предложения"], ["with", "Есть предложения"], ["without", "Нет предложений"]]
       .forEach(([value, label]) => offerFilter.add(new Option(label, value)));
     offerFilter.setAttribute("aria-label", "Фильтр позиций по предложениям");
     const filteredCount = el("span", "data-note");
     itemFilter.append(itemSearch, offerFilter, filteredCount);
     body.append(itemFilter);
+    const stageList = el("div", "stage-groups");
+    stageSections = new Map();
+    groupedItems.groups.forEach(group => {
+      const section = el("details", "stage-group");
+      section.open = ["needs_clarification", "comparable_options"].includes(group.key);
+      const summary = el("summary", "stage-group-summary");
+      const title = el("span", "", group.label);
+      const count = el("span", "stage-group-count", String(group.items.length));
+      summary.append(title, count);
+      const content = el("div", "stage-group-items");
+      section.append(summary, content);
+      section.hidden = group.items.length === 0;
+      stageList.append(section);
+      stageSections.set(group.key, {section, summary, count, content});
+    });
     if (data.offers_truncated) body.append(el("p", "data-note", "Загружены не все предложения. Обновите заявку, чтобы получить оставшиеся."));
     if (!data.items.length) body.append(empty("Позиций пока нет", "Бот добавит их после обработки заявки."));
+    body.append(stageList);
     const itemBoxes = [];
     data.items.forEach(item => {
       const box = el("div", "item-card");
       const sourceItem = sourceVisibility?.items?.find(row => row.item_id === item.id);
-      itemBoxes.push({item, box});
+      const stageKey = groupedItems.assignments.get(item.id) || "not_started";
+      itemBoxes.push({item, box, stageKey});
       const head = el("div", "item-head");
       const statusBadges = el("div", "item-statuses");
       statusBadges.append(itemBadge(item));
+      statusBadges.append(el("span", "badge stage-badge",
+        caseStageBadgeLabel(stageKey, sourceItem, sourceVisibility?.source_payload_sha256)));
+      const ownerInstructionLabel = ownerInstructionBadgeLabel(item, sourceItem,
+        sourceVisibility?.source_payload_sha256);
+      if (ownerInstructionLabel) {
+        statusBadges.append(el("span", "badge warn", ownerInstructionLabel));
+      }
+      if (progressByItem.get(item.id)?.status === "paused" && stageKey !== "paused") {
+        statusBadges.append(el("span", "badge warn", "Поиск приостановлен"));
+      }
       if (Number(item.in_transit_quantity || 0) > 0) {
         const transitBadge = el("span", "badge delivery-badge",
           "В пути · " + fmtNumber(item.in_transit_quantity));
@@ -2058,7 +2422,15 @@ async function openDetail(id, options = {}) {
         "Поставлено по Notion", quantity(item.reported_delivered_quantity, item.unit)
       ));
       if (item.specification_text) box.append(detailField("Техспек", item.specification_text, "spec"));
-      if (sourceItem) box.append(sourceItemPanel(sourceItem));
+      if (sourceItem) box.append(sourceItemPanel(sourceItem, sourceVisibility?.source_payload_sha256));
+      const currentOwnerInstruction = effectiveOwnerSourcingInstruction(
+        sourceItem, sourceVisibility?.source_payload_sha256);
+      if ((sourceVisibility?.research_consent === "manual"
+          && sourceVisibility?.source_payload_sha256 && c.status === "ready")
+          || currentOwnerInstruction) {
+        box.append(sourcingInstructionForm(
+          id, item, sourceItem, sourceVisibility.source_payload_sha256));
+      }
       box.append(itemRequirementsPanel(id, item, data.requirements || [], editable));
       if (item.reconciliation_label) box.append(detailField("Уточнение", item.reconciliation_label, "history"));
       if (item.location_label) box.append(detailField("Местонахождение по Notion", item.location_label, "history"));
@@ -2208,20 +2580,31 @@ async function openDetail(id, options = {}) {
       }
       box.append(offerArea);
       if (editable) box.append(eventForm(id, item, data));
-      body.append(box);
+      stageSections.get(stageKey).content.append(box);
     });
-    const filterItems = () => {
+    filterItems = () => {
       const needle = itemSearch.value.trim().toLocaleLowerCase("ru");
       let shown = 0;
-      itemBoxes.forEach(({item, box}) => {
+      const visibleByStage = new Map();
+      itemBoxes.forEach(({item, box, stageKey}) => {
         const text = (item.line_number + " " + item.name + " " + (item.specification_text || ""))
           .toLocaleLowerCase("ru");
         const hasOffers = Number(item.offer_count) > 0;
-        const visible = text.includes(needle) && (offerFilter.value === "all"
-          || (offerFilter.value === "with" && hasOffers)
-          || (offerFilter.value === "without" && !hasOffers));
+        const visible = text.includes(needle)
+          && (activeStageFilter === "all" || activeStageFilter === stageKey)
+          && (offerFilter.value === "all"
+            || (offerFilter.value === "with" && hasOffers)
+            || (offerFilter.value === "without" && !hasOffers));
         box.hidden = !visible;
-        if (visible) shown += 1;
+        if (visible) {
+          shown += 1;
+          visibleByStage.set(stageKey, (visibleByStage.get(stageKey) || 0) + 1);
+        }
+      });
+      stageSections.forEach(({section, count}, key) => {
+        const visibleCount = visibleByStage.get(key) || 0;
+        section.hidden = visibleCount === 0;
+        count.textContent = String(visibleCount);
       });
       filteredCount.textContent = "Показано " + shown + " из " + itemBoxes.length;
     };

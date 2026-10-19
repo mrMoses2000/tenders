@@ -21,7 +21,7 @@ import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 from docx import Document
 
-from procurement_bot.approvals import approve_request
+from procurement_bot.approvals import approve_request, payload_sha256
 from procurement_bot.cases import IntakeContext, persist_intake_result
 from procurement_bot.config import Settings
 from procurement_bot.db import _init_connection, run_migrations
@@ -32,12 +32,16 @@ from procurement_bot.mini_app import create_mini_app
 from procurement_bot.owner_autonomy import (
     ResearchAutomationPolicy,
     ResearchPolicyDenied,
+    adopt_existing_case_for_research,
     autostart_snapshotted_research,
     bind_research_policy,
+    load_case_source_visibility,
+    preflight_existing_case_adoption,
     record_sourcing_disposition,
     replace_research_profile,
     revoke_research_profile,
 )
+from procurement_bot.queue import stable_key
 from procurement_bot.research_workflow import ResearchStartDenied, start_approved_research
 from procurement_bot.worker import JobWorker
 from scripts.postgres_test_safety import configured_postgres_target, verify_postgres_test_connection
@@ -416,6 +420,176 @@ async def test_project_profile_applies_only_authenticated_exact_project_intake(o
     assert await state.pool.fetchval("SELECT status FROM research_runs") == "running"
 
 
+
+
+async def test_existing_manual_case_adoption_is_exact_and_does_not_rewrite_items(owner_pg):
+    state = owner_pg
+    case, _, original = await intake_case(state, request=request_facts(city="City A"))
+    await enroll(state)
+    before_items = await state.pool.fetch(
+        "SELECT id,line_number,name,quantity,unit FROM request_items "
+        "WHERE case_id=$1 ORDER BY line_number",
+        case,
+    )
+    before_parse = await state.pool.fetchrow(
+        "SELECT id,version,normalized_payload FROM case_parse_versions "
+        "WHERE case_id=$1 AND status='applied'",
+        case,
+    )
+    async with state.pool.acquire() as c:
+        preflight = await preflight_existing_case_adoption(c, case_id=case, owner_id=state.owner)
+        assert preflight["ordered_cities"] == ["City A", "City B", "City C"]
+        assert preflight["source_payload_sha256"] == payload_sha256(
+            before_parse["normalized_payload"],
+        )
+        with pytest.raises(ResearchPolicyDenied):
+            await adopt_existing_case_for_research(
+                c, case_id=case, owner_id=state.owner,
+                expected_preflight_sha256="0" * 64, owner_assertion="confirm exact case",
+                adoption_reference="synthetic-existing-case",
+            )
+        snapshot_id = await adopt_existing_case_for_research(
+            c, case_id=case, owner_id=state.owner,
+            expected_preflight_sha256=preflight["preflight_sha256"],
+            owner_assertion="I confirm this exact existing case and current parse.",
+            adoption_reference="synthetic-existing-case",
+        )
+    after_items = await state.pool.fetch(
+        "SELECT id,line_number,name,quantity,unit FROM request_items "
+        "WHERE case_id=$1 ORDER BY line_number",
+        case,
+    )
+    after_parse = await state.pool.fetchrow(
+        "SELECT id,version,normalized_payload FROM case_parse_versions "
+        "WHERE case_id=$1 AND status='applied'",
+        case,
+    )
+    assert after_items == before_items
+    assert after_parse["id"] == before_parse["id"]
+    assert after_parse["normalized_payload"] == before_parse["normalized_payload"]
+    snapshot = await state.pool.fetchrow(
+        "SELECT snapshot FROM case_research_policy_snapshots WHERE id=$1", snapshot_id,
+    )
+    assert snapshot["snapshot"]["adoption"]["preflight_sha256"] == preflight["preflight_sha256"]
+    assert [row["item_id"] for row in snapshot["snapshot"]["items"]] == [
+        str(row["id"]) for row in before_items
+    ]
+    adoption_job_key = stable_key(
+        "owner-case-adoption", case, before_parse["id"], preflight["preflight_sha256"],
+    )
+    assert await state.pool.fetchval(
+        "SELECT count(*) FROM jobs WHERE idempotency_key=$1 AND kind='prepare_research'",
+        adoption_job_key,
+    ) == 1
+    assert original.request.city == "City A"
+
+
+
+
+async def test_miniapp_owner_adoption_requires_authenticated_exact_preflight(owner_pg):
+    state = owner_pg
+    case, _, _ = await intake_case(state, request=request_facts(city="City A"))
+    await enroll(state)
+    async with mini_client(state) as client:
+        path = f"/api/cases/{case}/owner-research-preflight"
+        assert (await client.get(path)).status == 401
+        foreign = await client.get(path, headers=signed_headers(800_000_001))
+        assert foreign.status == 409
+        preflight_response = await client.get(path, headers=signed_headers())
+        assert preflight_response.status == 200
+        preflight = await preflight_response.json()
+        adopt_path = f"/api/cases/{case}/owner-research-adopt"
+        body = {"preflight_sha256": preflight["preflight_sha256"],
+                "owner_assertion": "I explicitly adopt this exact current case.",
+                "adoption_reference": "synthetic-owner-adoption"}
+        assert (await client.post(adopt_path, json=body)).status == 401
+        stale = await client.post(adopt_path, json={**body, "preflight_sha256": "0" * 64},
+                                  headers=signed_headers())
+        assert stale.status == 409
+        adopted = await client.post(adopt_path, json=body, headers=signed_headers())
+        assert adopted.status == 202
+        replay = await client.post(adopt_path, json=body, headers=signed_headers())
+        assert replay.status == 202
+        assert (await adopted.json())["snapshot_id"] == (await replay.json())["snapshot_id"]
+    assert await state.pool.fetchval(
+        "SELECT count(*) FROM case_research_policy_snapshots WHERE case_id=$1", case,
+    ) == 1
+
+async def test_owner_attested_source_bound_skip_preserves_original_plan_indices(owner_pg):
+    state = owner_pg
+    case, _, _ = await intake_case(state, request=request_facts(city="City A"))
+    await enroll(state)
+    async with state.pool.acquire() as c:
+        preflight = await preflight_existing_case_adoption(c, case_id=case, owner_id=state.owner)
+        await adopt_existing_case_for_research(
+            c, case_id=case, owner_id=state.owner,
+            expected_preflight_sha256=preflight["preflight_sha256"],
+            owner_assertion="I explicitly authorize research for this existing case.",
+            adoption_reference="synthetic-existing-case",
+        )
+        item = await c.fetchrow(
+            "SELECT id,quantity,unit FROM request_items WHERE case_id=$1 AND line_number=1", case,
+        )
+        parse = await c.fetchrow(
+            "SELECT id,normalized_payload FROM case_parse_versions "
+            "WHERE case_id=$1 AND status='applied'",
+            case,
+        )
+        parse_hash = payload_sha256(parse["normalized_payload"])
+        instruction_id = await record_sourcing_disposition(
+            c, owner_id=state.owner, case_id=case, item_id=item["id"], artifact_id=None,
+            artifact_sha256="b" * 64, source_kind="operator_attestation",
+            source_reference="owner-photo:synthetic-brush-row-4", disposition="skip",
+            quantity=None, unit=item["unit"],
+            owner_assertion="I already bought this exact brush item in the stated source row.",
+            exact_match_rationale="The source row matches this exact canonical item.",
+            idempotency_key="effective-owner-skip", applies_to_sourcing=True,
+            expected_source_payload_sha256=parse_hash,
+        )
+        row = await c.fetchrow(
+            "SELECT source_sha256_basis,applies_to_sourcing,source_parse_version_id,"
+            "source_payload_sha256 FROM item_sourcing_dispositions WHERE id=$1", instruction_id,
+        )
+        assert row["source_sha256_basis"] == "owner_declared"
+        assert row["applies_to_sourcing"] is True
+        assert row["source_parse_version_id"] == parse["id"]
+        assert row["source_payload_sha256"] == parse_hash
+    await worker_for(state)._prepare_research({"case_id": str(case), "intake_version": 1})
+    run = await state.pool.fetchrow("SELECT search_scope FROM research_runs WHERE case_id=$1", case)
+    plan = run["search_scope"]["plan"]
+    assert {branch["item_index"] for branch in plan["source_plans"]} == {1}
+    assert run["search_scope"]["sourcing_instruction_ids"] == [str(instruction_id)]
+    assert await state.pool.fetchval(
+        "SELECT quantity FROM request_items WHERE case_id=$1 AND line_number=1", case,
+    ) == Decimal("2")
+    assert await state.pool.fetchval("SELECT count(*) FROM purchase_items") == 0
+    async with state.pool.acquire() as c:
+        visibility = await load_case_source_visibility(c, case_id=case, owner_id=state.owner)
+    first = visibility["items"][0]
+    assert first["sourcing_evidence"][0]["actual_skip"] is True
+    assert first["disposition_applied_to_plan"] is True
+
+
+async def test_evidence_only_operator_disposition_is_not_actual_skip(owner_pg):
+    state = owner_pg
+    case, _, _ = await intake_case(state, request=request_facts(city="City A"))
+    item = await state.pool.fetchrow(
+        "SELECT id,unit FROM request_items WHERE case_id=$1 AND line_number=1", case,
+    )
+    async with state.pool.acquire() as c:
+        await record_sourcing_disposition(
+            c, owner_id=state.owner, case_id=case, item_id=item["id"], artifact_id=None,
+            artifact_sha256="c" * 64, source_kind="operator_attestation",
+            source_reference="owner-photo:evidence-only", disposition="skip", quantity=None,
+            unit=item["unit"], owner_assertion="This looks like the requested item.",
+            exact_match_rationale="Evidence was noted, but no sourcing change was authorized.",
+            idempotency_key="evidence-only-no-skip",
+        )
+        projection = await load_case_source_visibility(c, case_id=case, owner_id=state.owner)
+    assert projection["items"][0]["sourcing_evidence"][0]["actual_skip"] is False
+    assert projection["items"][0]["disposition_applied_to_plan"] is False
+    assert projection["items"][0]["stage"] == "evidence_only"
+
 async def test_immutable_episodes_null_uniqueness_and_snapshot_and_binding(owner_pg):
     state = owner_pg
     first = await enroll(state)
@@ -551,20 +725,20 @@ async def test_operator_attestation_records_external_source_without_telegram_art
             await c.execute(
                 """INSERT INTO item_sourcing_dispositions(
                 case_id,request_item_id,owner_user_id,source_kind,source_reference,
-                artifact_sha256,disposition,unit,owner_assertion,exact_match_rationale,
-                evidence_sha256,idempotency_key)
-                VALUES($1,$2,$3,'operator_attestation',NULL,$4,'skip','m','attested',
-                'exact mapping',$5,'partial-provenance')""",
+                artifact_sha256,source_sha256_basis,disposition,unit,owner_assertion,
+                exact_match_rationale,evidence_sha256,idempotency_key)
+                VALUES($1,$2,$3,'operator_attestation',NULL,$4,'owner_declared',
+                'skip','m','attested','exact mapping',$5,'partial-provenance')""",
                 case, item, state.owner, "d" * 64, "e" * 64,
             )
         with pytest.raises(asyncpg.PostgresError, match="item owner/case mismatch"):
             await c.execute(
                 """INSERT INTO item_sourcing_dispositions(
                 case_id,request_item_id,owner_user_id,source_kind,source_reference,
-                artifact_sha256,disposition,unit,owner_assertion,exact_match_rationale,
-                evidence_sha256,idempotency_key)
-                VALUES($1,$2,$3,'operator_attestation',$4,$5,'skip','m','attested',
-                'exact mapping',$6,'wrong-owner-provenance')""",
+                artifact_sha256,source_sha256_basis,disposition,unit,owner_assertion,
+                exact_match_rationale,evidence_sha256,idempotency_key)
+                VALUES($1,$2,$3,'operator_attestation',$4,$5,'owner_declared',
+                'skip','m','attested','exact mapping',$6,'wrong-owner-provenance')""",
                 case, item, state.other, kwargs["source_reference"], "d" * 64, "e" * 64,
             )
         assert await c.fetchval("SELECT count(*) FROM purchase_items") == 0

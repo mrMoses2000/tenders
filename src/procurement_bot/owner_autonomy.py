@@ -239,6 +239,185 @@ async def capture_research_snapshot(
     )
 
 
+
+async def _existing_case_adoption_facts(
+    connection: asyncpg.Connection, *, case_id: UUID, owner_id: UUID,
+) -> tuple[dict[str, Any], Any, Any, list[Any]]:
+    case = await connection.fetchrow(
+        """SELECT id,owner_user_id,customer_id,status,city,search_area_text,
+        delivery_address FROM procurement_cases WHERE id=$1 AND owner_user_id=$2
+        FOR SHARE""", case_id, owner_id,
+    )
+    if case is None or case["status"] != "ready":
+        raise ResearchPolicyDenied("only this owner's ready case can be adopted")
+    parse = await connection.fetchrow(
+        """SELECT id,version,normalized_payload FROM case_parse_versions
+        WHERE case_id=$1 AND status='applied' FOR SHARE""", case_id,
+    )
+    if parse is None:
+        raise ResearchPolicyDenied("applied canonical parse is required")
+    source_hash = payload_sha256(parse["normalized_payload"])
+    request = ParsedProcurementRequest.model_validate(parse["normalized_payload"])
+    report = evaluate_missing_blockers(
+        request, SearchScopePolicy.require_explicit(), allow_partial_items=True,
+    )
+    items = await connection.fetch(
+        """SELECT id,line_number,name,quantity,unit FROM request_items
+        WHERE case_id=$1 ORDER BY line_number FOR SHARE""", case_id,
+    )
+    if len(items) != len(request.items):
+        raise ResearchPolicyDenied("canonical parse and stable item projection differ")
+    item_facts = []
+    for index, (row, parsed_item) in enumerate(zip(items, request.items, strict=True)):
+        if (row["line_number"] != index + 1 or row["name"] != parsed_item.name
+                or row["quantity"] != parsed_item.quantity
+                or row["unit"] != (parsed_item.unit or "")):
+            raise ResearchPolicyDenied("canonical parse and stable item identity differ")
+        item_facts.append({
+            "item_id": str(row["id"]), "line_number": row["line_number"],
+            "name": row["name"],
+            "quantity": str(row["quantity"]) if row["quantity"] is not None else None,
+            "unit": row["unit"], "item_index": index,
+        })
+    if not report.ready_to_search or request.city != case["city"]:
+        raise ResearchPolicyDenied("case is not ready or its canonical geography differs")
+    if await connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM research_runs WHERE case_id=$1)", case_id,
+    ):
+        raise ResearchPolicyDenied("case already has research runs")
+    if await connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM case_research_policy_snapshots WHERE case_id=$1)",
+        case_id,
+    ):
+        raise ResearchPolicyDenied("case already has an owner research snapshot")
+    profile = await connection.fetchrow(
+        """SELECT p.id,p.version,p.policy,p.policy_sha256,p.consent_reference,p.consent_text
+        FROM owner_research_automation_profiles p JOIN users u
+        ON u.id=p.owner_user_id AND u.active
+        WHERE p.owner_user_id=$1 AND p.customer_id IS NOT DISTINCT FROM $2
+          AND p.research_autostart AND p.revoked_at IS NULL FOR SHARE OF p,u""",
+        owner_id, case["customer_id"],
+    )
+    if profile is None or payload_sha256(profile["policy"]) != profile["policy_sha256"]:
+        raise ResearchPolicyDenied("an active, valid owner consent profile is required")
+    policy = ResearchAutomationPolicy.model_validate(profile["policy"])
+    if (request.city != policy.ordered_cities[0]
+            or request.search_scope != policy.search_scope):
+        raise ResearchPolicyDenied("canonical geography must match the first owner policy tier")
+    facts = {
+        "case_id": str(case_id), "owner_id": str(owner_id),
+        "customer_id": str(case["customer_id"]) if case["customer_id"] else None,
+        "case_status": case["status"], "parse_version_id": str(parse["id"]),
+        "intake_version": parse["version"], "source_payload_sha256": source_hash,
+        "profile_id": str(profile["id"]), "profile_version": profile["version"],
+        "profile_policy_sha256": profile["policy_sha256"],
+        "consent_sha256": payload_sha256({"reference": profile["consent_reference"],
+                                           "text": profile["consent_text"]}),
+        "city": request.city, "search_scope": request.search_scope,
+        "items": item_facts,
+    }
+    facts["preflight_sha256"] = payload_sha256(facts)
+    return facts, case, (parse, profile, request, report), items
+
+
+async def preflight_existing_case_adoption(
+    connection: asyncpg.Connection, *, case_id: UUID, owner_id: UUID,
+) -> dict[str, Any]:
+    """Read-only preflight: never rewrites case, parse, or request-item projections."""
+    facts, _case, details, _items = await _existing_case_adoption_facts(
+        connection, case_id=case_id, owner_id=owner_id,
+    )
+    parse, profile, request, report = details
+    return {
+        "case_id": str(case_id), "intake_version": parse["version"],
+        "source_payload_sha256": facts["source_payload_sha256"],
+        "preflight_sha256": facts["preflight_sha256"],
+        "profile_id": str(profile["id"]), "profile_policy_sha256": profile["policy_sha256"],
+        "city": request.city, "search_scope": request.search_scope,
+        "ordered_cities": list(
+            ResearchAutomationPolicy.model_validate(profile["policy"]).ordered_cities
+        ),
+        "ready_to_search": report.ready_to_search, "items": facts["items"],
+    }
+
+
+async def adopt_existing_case_for_research(
+    connection: asyncpg.Connection, *, case_id: UUID, owner_id: UUID,
+    expected_preflight_sha256: str, owner_assertion: str, adoption_reference: str,
+) -> UUID:
+    """Owner-attested opt-in for one unchanged imported case, without rewriting source rows."""
+    if (not re.fullmatch(r"[0-9a-f]{64}", expected_preflight_sha256)
+            or not owner_assertion.strip() or len(owner_assertion) > 2000
+            or not adoption_reference.strip() or len(adoption_reference) > 500):
+        raise ResearchPolicyDenied("exact preflight and owner adoption attestation are required")
+    async with connection.transaction():
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", f"owner-case-adopt:{case_id}",
+        )
+        prior = await connection.fetchrow(
+            """SELECT id,snapshot FROM case_research_policy_snapshots
+            WHERE case_id=$1 AND owner_user_id=$2""", case_id, owner_id,
+        )
+        if prior is not None:
+            adoption = prior["snapshot"].get("adoption", {})
+            if adoption.get("preflight_sha256") == expected_preflight_sha256:
+                return prior["id"]
+            raise ResearchPolicyDenied("case already has a different owner research snapshot")
+        facts, case, details, _items = await _existing_case_adoption_facts(
+            connection, case_id=case_id, owner_id=owner_id,
+        )
+        if facts["preflight_sha256"] != expected_preflight_sha256:
+            raise ResearchPolicyDenied("case or consent changed; rerun the read-only preflight")
+        parse, profile, request, report = details
+        applied_hash = facts["source_payload_sha256"]
+        snapshot = {
+            "contract_version": 1, "profile_id": str(profile["id"]),
+            "profile_version": profile["version"], "policy": profile["policy"],
+            "profile_policy_sha256": profile["policy_sha256"],
+            "consent_sha256": facts["consent_sha256"],
+            "source_payload_sha256": applied_hash, "applied_payload_sha256": applied_hash,
+            "source_geography": {key: request.model_dump(mode="json")[key]
+                                 for key in ("city", "search_scope", "search_area_text")},
+            "applied_defaults": {}, "conflicts": [],
+            "automatic_start_eligible": report.ready_to_search,
+            "items": [{"item_index": row["item_index"], "item_id": row["item_id"],
+                       "issues": item_search_issues(request.items[row["item_index"]]),
+                       "source_reference": request.items[row["item_index"]].source_reference}
+                      for row in facts["items"]],
+            "adoption": {"preflight_sha256": expected_preflight_sha256,
+                         "owner_assertion": owner_assertion.strip(),
+                         "adoption_reference": adoption_reference.strip(),
+                         "item_ids_sha256": payload_sha256({"items": facts["items"]})},
+        }
+        snapshot_id = await connection.fetchval(
+            """INSERT INTO case_research_policy_snapshots(case_id,parse_version_id,intake_version,
+            profile_id,owner_user_id,customer_id,source_payload_sha256,applied_payload_sha256,
+            snapshot,snapshot_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+            RETURNING id""",
+            case_id, parse["id"], parse["version"], profile["id"], owner_id,
+            case["customer_id"], applied_hash, applied_hash, snapshot, payload_sha256(snapshot),
+        )
+        from procurement_bot.queue import enqueue_job, stable_key
+        await enqueue_job(
+            connection, kind="prepare_research",
+            payload={"case_id": str(case_id), "intake_version": parse["version"]},
+            idempotency_key=stable_key(
+                "owner-case-adoption", case_id, parse["id"], expected_preflight_sha256,
+            ),
+        )
+        await connection.execute(
+            """INSERT INTO workflow_events(case_id,event_type,actor_type,actor_id,
+            idempotency_key,data) VALUES(
+            $1,'owner_research_case_adopted','user',$2,$3,$4::jsonb)
+            ON CONFLICT (idempotency_key) DO NOTHING""",
+            case_id, str(owner_id),
+            stable_key("owner-case-adoption-event", case_id, parse["id"]),
+            {"snapshot_id": str(snapshot_id), "preflight_sha256": expected_preflight_sha256,
+             "source_payload_sha256": applied_hash, "profile_id": str(profile["id"])},
+        )
+        return snapshot_id
+
+
 async def load_valid_snapshot(
     connection: asyncpg.Connection, *, snapshot_id: UUID, case_id: UUID,
 ) -> asyncpg.Record:
@@ -276,18 +455,36 @@ async def load_valid_snapshot(
     return row
 
 
-def build_profile_research_plan(request: ParsedProcurementRequest, *, snapshot: dict[str, Any]):
-    """Research clear lines with original indices; never compact downstream item mappings."""
+def build_profile_research_plan(
+    request: ParsedProcurementRequest, *, snapshot: dict[str, Any],
+    sourcing_adjustments: dict[int, Decimal | None] | None = None,
+):
+    """Research clear lines with original indices and explicit owner quantities."""
     from procurement_bot.research import build_research_plan
     from procurement_bot.research_repository import recompute_plan_sha256
 
-    indices = [index for index, item in enumerate(request.items) if not item_search_issues(item)]
-    if not indices:
-        raise ResearchPolicyDenied("no clear items available for automatic research")
+    adjustments = sourcing_adjustments or {}
+    selected: list[tuple[int, ProcurementItem]] = []
+    for index, original in enumerate(request.items):
+        if item_search_issues(original):
+            continue
+        if index in adjustments:
+            adjustment = adjustments[index]
+            if adjustment is None or original.quantity is None:
+                continue
+            remaining = original.quantity - adjustment
+            if remaining <= 0:
+                continue
+            selected.append((index, original.model_copy(update={"quantity": remaining})))
+        else:
+            selected.append((index, original))
+    if not selected:
+        raise ResearchPolicyDenied("no clear items remain available for automatic research")
     if request.city != snapshot["policy"]["ordered_cities"][0]:
         raise ResearchPolicyDenied("initial plan must use exactly the first sourcing city")
+    indices = [index for index, _ in selected]
     plan = build_research_plan(
-        request.model_copy(update={"items": [request.items[index] for index in indices]}),
+        request.model_copy(update={"items": [item for _, item in selected]}),
         include_olx=True,
     )
     plan = plan.model_copy(update={"source_plans": [
@@ -321,10 +518,16 @@ async def bind_research_policy(
     if (actual_plan_sha256 != plan_sha256 or not isinstance(plan, dict)
             or plan.get("city") != first_city):
         raise ResearchPolicyDenied("research plan hash or initial city differs from policy")
+    instruction_ids = scope.get("sourcing_instruction_ids", [])
+    if not isinstance(instruction_ids, list) or any(
+        not isinstance(value, str) for value in instruction_ids
+    ):
+        raise ResearchPolicyDenied("research sourcing instruction binding is malformed")
     binding = {"snapshot_id": str(snapshot_id), "snapshot_sha256": row["snapshot_sha256"],
                "case_id": str(case_id), "research_run_id": str(run_id),
                "plan_sha256": plan_sha256, "parse_version_id": str(row["parse_version_id"]),
-               "applied_payload_sha256": row["applied_payload_sha256"]}
+               "applied_payload_sha256": row["applied_payload_sha256"],
+               "sourcing_instruction_ids": instruction_ids}
     digest = payload_sha256(binding)
     authorization = await connection.fetchrow(
         """INSERT INTO research_policy_authorizations(snapshot_id,research_run_id,plan_sha256,
@@ -367,10 +570,16 @@ async def validate_research_policy_binding(
         raise ResearchPolicyDenied("authorized run plan is invalid") from exc
     if actual_plan_sha256 != plan_sha256:
         raise ResearchPolicyDenied("authorized run plan changed after binding")
+    scope = run["search_scope"]
+    if isinstance(scope, str):
+        import json
+        scope = json.loads(scope)
+    instruction_ids = scope.get("sourcing_instruction_ids", [])
     expected = {"snapshot_id": str(row["id"]), "snapshot_sha256": row["snapshot_sha256"],
                 "case_id": str(case_id), "research_run_id": str(run_id),
                 "plan_sha256": plan_sha256, "parse_version_id": str(row["parse_version_id"]),
-                "applied_payload_sha256": row["applied_payload_sha256"]}
+                "applied_payload_sha256": row["applied_payload_sha256"],
+                "sourcing_instruction_ids": instruction_ids}
     if auth["binding"] != expected or approved_by != row["owner_user_id"]:
         raise ResearchPolicyDenied("research policy owner or exact binding mismatch")
     return row
@@ -401,13 +610,42 @@ async def autostart_snapshotted_research(
         if snapshot is None or not snapshot["snapshot"]["automatic_start_eligible"]:
             return False
         valid = await load_valid_snapshot(connection, snapshot_id=snapshot["id"], case_id=case_id)
+        request = ParsedProcurementRequest.model_validate(valid["normalized_payload"])
+        instructions = await connection.fetch(
+            """SELECT d.id,d.request_item_id,d.disposition,d.quantity,i.line_number,
+            i.name,i.quantity AS original_quantity,i.unit
+            FROM item_sourcing_dispositions d JOIN request_items i
+            ON i.id=d.request_item_id AND i.case_id=d.case_id
+            WHERE d.case_id=$1 AND d.owner_user_id=$2 AND d.applies_to_sourcing
+              AND d.source_parse_version_id=$3 AND d.source_payload_sha256=$4
+            ORDER BY d.request_item_id""",
+            case_id, valid["owner_user_id"], valid["parse_version_id"],
+            valid["applied_payload_sha256"],
+        )
+        adjustments: dict[int, Decimal | None] = {}
+        instruction_ids: list[str] = []
+        for instruction in instructions:
+            index = instruction["line_number"] - 1
+            if (index < 0 or index >= len(request.items)
+                    or request.items[index].name != instruction["name"]
+                    or request.items[index].quantity != instruction["original_quantity"]
+                    or request.items[index].unit != instruction["unit"]):
+                raise ResearchPolicyDenied("source-bound item identity drifted before planning")
+            adjustments[index] = (
+                None if instruction["disposition"] == "skip" else instruction["quantity"]
+            )
+            instruction_ids.append(str(instruction["id"]))
         plan = build_profile_research_plan(
-            ParsedProcurementRequest.model_validate(valid["normalized_payload"]),
-            snapshot=valid["snapshot"],
+            request, snapshot=valid["snapshot"], sourcing_adjustments=adjustments,
         )
         persisted = await persist_research_plan(
             connection, case_id=case_id, plan=plan, requested_by=valid["owner_user_id"],
         )
+        if instruction_ids:
+            await connection.execute(
+                "UPDATE research_runs SET search_scope=search_scope || $2::jsonb WHERE id=$1",
+                persisted.id, {"sourcing_instruction_ids": instruction_ids},
+            )
         binding = await bind_research_policy(
             connection, snapshot_id=valid["id"], case_id=case_id,
             run_id=persisted.id, plan_sha256=plan.plan_sha256,
@@ -479,8 +717,9 @@ async def guard_profile_research_work(
             )
         except (ResearchPolicyDenied, ResearchStartDenied) as exc:
             await connection.execute(
-                "UPDATE case_pipeline_runtime SET paused=true,wake_reason='research_policy_review',"
-                "updated_at=now() WHERE case_id=$1", runtime["case_id"],
+                "UPDATE case_pipeline_runtime SET paused=true, "
+                "wake_reason='research_policy_review', updated_at=now() "
+                "WHERE case_id=$1", runtime["case_id"],
             )
             await connection.execute(
                 """INSERT INTO workflow_events(case_id,event_type,actor_type,actor_id,
@@ -501,10 +740,12 @@ async def record_sourcing_disposition(
     quantity: Decimal | None, unit: str, owner_assertion: str, exact_match_rationale: str,
     idempotency_key: str, source_kind: Literal["telegram_artifact", "operator_attestation"]
     = "telegram_artifact", source_reference: str | None = None,
+    applies_to_sourcing: bool = False, expected_source_payload_sha256: str | None = None,
 ) -> UUID:
-    """Record an exact reviewed assertion, without inferring accounting facts.
+    """Record owner evidence; only an explicit parse-bound instruction changes plan scope.
 
-    This interface records evidence only. Run filtering is intentionally a later integration.
+    Operator-attested hashes are owner-declared, not independently file-verified.
+    Neither evidence nor sourcing instructions create accounting records.
     """
     if disposition not in {"bought", "skip", "reduce_quantity"}:
         raise ResearchPolicyDenied("unsupported sourcing disposition")
@@ -528,8 +769,9 @@ async def record_sourcing_disposition(
         raise ResearchPolicyDenied("unsupported sourcing evidence kind")
     async with connection.transaction():
         item = await connection.fetchrow(
-            """SELECT i.quantity,i.unit FROM request_items i JOIN procurement_cases c
-            ON c.id=i.case_id JOIN users u ON u.id=c.owner_user_id AND u.active
+            """SELECT i.id,i.line_number,i.name,i.quantity,i.unit,c.customer_id
+            FROM request_items i JOIN procurement_cases c ON c.id=i.case_id
+            JOIN users u ON u.id=c.owner_user_id AND u.active
             WHERE i.id=$1 AND c.id=$2 AND c.owner_user_id=$3 FOR SHARE OF i,c,u""",
             item_id, case_id, owner_id,
         )
@@ -551,22 +793,65 @@ async def record_sourcing_disposition(
             raise ResearchPolicyDenied("exact compatible unit and bounded quantity required")
         if disposition != "skip" and quantity is None:
             raise ResearchPolicyDenied("bought/reduction quantity required")
+
+        parse_version_id = None
+        source_payload_sha256 = None
+        if applies_to_sourcing:
+            if not isinstance(expected_source_payload_sha256, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_source_payload_sha256,
+            ):
+                raise ResearchPolicyDenied("current canonical parse hash is required")
+            parse = await connection.fetchrow(
+                """SELECT id,normalized_payload FROM case_parse_versions
+                WHERE case_id=$1 AND status='applied' FOR SHARE""", case_id,
+            )
+            if (parse is None or payload_sha256(parse["normalized_payload"])
+                    != expected_source_payload_sha256):
+                raise ResearchPolicyDenied(
+                    "canonical parse changed; refresh the case before applying"
+                )
+            parsed = ParsedProcurementRequest.model_validate(parse["normalized_payload"])
+            index = item["line_number"] - 1
+            if (index < 0 or index >= len(parsed.items)
+                    or parsed.items[index].name != item["name"]
+                    or parsed.items[index].quantity != item["quantity"]
+                    or parsed.items[index].unit != item["unit"]):
+                raise ResearchPolicyDenied("stable item mapping differs from canonical source")
+            if item_search_issues(parsed.items[index]):
+                raise ResearchPolicyDenied(
+                    "ambiguous or candidate items cannot change automatic sourcing scope"
+                )
+            parse_version_id = parse["id"]
+            source_payload_sha256 = expected_source_payload_sha256
+        elif expected_source_payload_sha256 is not None:
+            raise ResearchPolicyDenied(
+                "parse hash is valid only for an explicit sourcing instruction"
+            )
+
         facts = {"case_id": str(case_id), "item_id": str(item_id),
                  "source_kind": source_kind,
+                 "source_sha256_basis": "telegram_verified" if source_kind == "telegram_artifact"
+                 else "owner_declared",
                  "artifact_id": str(artifact_id) if artifact_id else None,
                  "source_reference": source_reference, "artifact_sha256": artifact_sha256,
                  "disposition": disposition,
                  "quantity": str(quantity) if quantity is not None else None,
                  "unit": unit, "owner_assertion": owner_assertion,
-                 "exact_match_rationale": exact_match_rationale, "owner_id": str(owner_id)}
+                 "exact_match_rationale": exact_match_rationale, "owner_id": str(owner_id),
+                 "applies_to_sourcing": applies_to_sourcing,
+                 "source_parse_version_id": str(parse_version_id) if parse_version_id else None,
+                 "source_payload_sha256": source_payload_sha256}
         digest = payload_sha256(facts)
         row = await connection.fetchrow(
             """INSERT INTO item_sourcing_dispositions(case_id,request_item_id,owner_user_id,
-            source_kind,source_artifact_id,source_reference,artifact_sha256,disposition,quantity,
+            source_kind,source_artifact_id,source_reference,artifact_sha256,source_sha256_basis,
+            source_parse_version_id,source_payload_sha256,applies_to_sourcing,disposition,quantity,
             unit,owner_assertion,exact_match_rationale,evidence_sha256,idempotency_key)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING
-            RETURNING id,evidence_sha256""", case_id, item_id, owner_id, source_kind, artifact_id,
-            source_reference, artifact_sha256, disposition, quantity, unit, owner_assertion,
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            ON CONFLICT DO NOTHING RETURNING id,evidence_sha256""",
+            case_id, item_id, owner_id, source_kind, artifact_id, source_reference, artifact_sha256,
+            facts["source_sha256_basis"], parse_version_id, source_payload_sha256,
+            applies_to_sourcing, disposition, quantity, unit, owner_assertion,
             exact_match_rationale, digest, idempotency_key,
         )
         if row is None:
@@ -577,7 +862,6 @@ async def record_sourcing_disposition(
         if row is None or row["evidence_sha256"] != digest:
             raise ResearchPolicyDenied("sourcing disposition replay differs")
         return row["id"]
-
 
 def _source_pointer(value: str | None) -> str | None:
     # Extraction locators are useful; filesystem locations and credential URLs
@@ -616,7 +900,8 @@ async def load_case_source_visibility(
     )
     dispositions = await connection.fetch(
         """SELECT id,request_item_id,source_kind,source_artifact_id,source_reference,
-        artifact_sha256,disposition,quantity,unit,owner_assertion,exact_match_rationale,created_at
+        artifact_sha256,source_sha256_basis,source_parse_version_id,source_payload_sha256,
+        applies_to_sourcing,disposition,quantity,unit,owner_assertion,exact_match_rationale,created_at
         FROM item_sourcing_dispositions WHERE case_id=$1 AND owner_user_id=$2
         ORDER BY created_at,id""", case_id, owner_id,
     )
@@ -624,6 +909,15 @@ async def load_case_source_visibility(
         "SELECT active_city_tier,report_checkpoint_at FROM case_pipeline_runtime WHERE case_id=$1",
         case_id,
     )
+    authorized = await connection.fetchrow(
+        """SELECT a.binding FROM research_policy_authorizations a
+        JOIN research_runs r ON r.id=a.research_run_id
+        WHERE r.case_id=$1 ORDER BY r.created_at DESC LIMIT 1""", case_id,
+    )
+    bound_instruction_ids = set()
+    if authorized is not None:
+        binding = authorized["binding"]
+        bound_instruction_ids = set(binding.get("sourcing_instruction_ids", []))
     output_items = []
     for row in items:
         index = row["line_number"] - 1
@@ -638,6 +932,9 @@ async def load_case_source_visibility(
             row["purchased_quantity"] >= row["quantity"]
         ):
             stage = "bought"
+        elif any(fact["applies_to_sourcing"] and fact["disposition"] == "skip"
+                 for fact in evidence):
+            stage = "owner_excluded_from_sourcing"
         elif evidence:
             stage = "evidence_only"
         output_items.append({
@@ -650,13 +947,21 @@ async def load_case_source_visibility(
                              for req in normalized.requirements] if aligned else [],
             "sourcing_evidence": [
                 {**fact, "source_reference": _source_pointer(fact["source_reference"]),
-                 "source_sha256": fact["artifact_sha256"]}
+                 "source_sha256": fact["artifact_sha256"],
+                 "actual_skip": bool(fact["applies_to_sourcing"]
+                                      and fact["disposition"] == "skip")}
                 for fact in evidence
             ],
-            "disposition_applied_to_plan": False,
+            "disposition_applied_to_plan": any(
+                str(fact["id"]) in bound_instruction_ids for fact in evidence
+            ),
         })
     return {
         "case_id": str(case_id), "intake_version": case["version"],
+        "source_payload_sha256": (
+            payload_sha256(case["normalized_payload"])
+            if case["normalized_payload"] is not None else None
+        ),
         "warnings": request.warnings if request else [],
         "ambiguous_fields": request.ambiguous_fields if request else [],
         "sourcing_city": case["city"], "delivery_destination": case["delivery_address"],
