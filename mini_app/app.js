@@ -737,7 +737,7 @@ function badge(status) {
       ["closed", "draft", "inactive", "merged"].includes(status) ? "mute" : "";
   return el("span", "badge " + tone, labels[status] || status);
 }
-function itemBadge(item) {
+function itemBadge(item, sourceItem) {
   const hasFacts = item.event_count || item.purchased_quantity !== null || item.accepted_quantity !== null;
   if (hasFacts) {
     const required = item.quantity === null ? null : Number(item.quantity);
@@ -757,6 +757,7 @@ function itemBadge(item) {
     return el("span", "badge " + (rejected > 0 ? "danger" : ""), label);
   }
   if (item.source_record_url) return el("span", "badge warn", "История из Notion");
+  if (sourceItem) return null;
   return badge(item.status);
 }
 const caseStageGroups = [
@@ -2347,7 +2348,8 @@ async function openDetail(id, options = {}) {
       itemBoxes.push({item, box, stageKey});
       const head = el("div", "item-head");
       const statusBadges = el("div", "item-statuses");
-      statusBadges.append(itemBadge(item));
+      const legacyStatusBadge = itemBadge(item, sourceItem);
+      if (legacyStatusBadge) statusBadges.append(legacyStatusBadge);
       statusBadges.append(el("span", "badge stage-badge",
         caseStageBadgeLabel(stageKey, sourceItem, sourceVisibility?.source_payload_sha256)));
       const ownerInstructionLabel = ownerInstructionBadgeLabel(item, sourceItem,
