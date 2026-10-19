@@ -39,8 +39,13 @@ must both be hash-bound in a snapshot. Delivery facts are never sourcing default
    attestation carrying a source reference and owner-declared SHA-256. Operator
    hashes are claims, not server-verified file bytes. Both paths require an exact
    owner/case/item mapping and verbatim assertion; they remain separate from
-   accounting. Current dispositions are visible as evidence only and do not yet
-   change plan quantities or exclude rows from research.
+   accounting. Evidence-only is the default and is explicitly marked as not an
+   actual sourcing skip. An additional owner action may opt into a parse-hash-bound
+   sourcing instruction for one exact clear request_item_id: a skip excludes that
+   line, while bought/reduced quantities subtract only the explicitly stated amount
+   from the next native plan. The immutable instruction IDs are bound into the run
+   authorization. Candidate/ambiguous items are rejected; request_items and
+   purchase/accounting rows are never rewritten.
 
 Affected files: new owner-autonomy module, migration 044, cases.py, dialogue.py,
 worker.py, research_workflow.py, mini_app.py, mini_app/app.js and focused tests/docs.
@@ -53,19 +58,20 @@ and provider failure remain native queue states, never market exhaustion. First
 plan uses exactly the first policy city. Ordered city scheduling and the report
 checkpoint runtime hook remain explicitly pending integration; no fake SLA timer.
 
-This slice binds profiles only during new Telegram intake or an already
-profile-bound continuation. Existing manually imported cases remain manual until a separate owner-attested adoption
-flow supplies a read-only parse-hash/stable-item-ID preflight and captures the
-current applied parse without replacing its item projection. No live
-environment, production database, WhatsApp or payment surface was used.
+New intake still binds the profile automatically only when the owner has an
+active matching profile. A separate authenticated Mini App adoption action now
+supports an existing manual case: read-only preflight pins the applied parse hash,
+profile episode and exact stable item IDs; the explicit owner POST rechecks them
+under locks and captures a snapshot without rewriting the parse or item projection.
+It queues the existing native prepare_research path. The production current case
+has not been adopted and its photo/source records have not been imported.
 
-Verification ran synthetic documents and fake providers against the real
-migrations in random schemas of the isolated local `.operator-test-pg` cluster
-(TCP 127.0.0.1:55448, database `test_uran_owner`), guarded by
-`scripts/postgres_test_safety.py`. The focused command
-`bash .operator-test-pg/run-tests.sh tests/test_owner_autonomy_postgres.py -q`
-passed **22 tests**. Ruff, Python compileall, Node `--check`, and
-`git diff --check` passed. The pytest output had 14 dependency/framework warnings
-(SWIG deprecations and aiohttp app/request key notices). No production services or
-providers were called. Connected attachment/discovery/RFQ/quote behavior and the
-current imported-case adoption flow remain outside this checkpoint.
+Verification used synthetic cases in random schemas on the explicitly pinned,
+loopback-only test_uran_integrated database (TCP 127.0.0.1:55450), guarded by
+scripts/postgres_test_safety.py. The focused owner-autonomy PostgreSQL module
+passed **26 tests**, including adoption, evidence-only vs effective owner skip,
+original index retention and no accounting writes. PostgreSQL safety tests passed
+17 cases; Ruff, Python compileall, Node --check, and git diff --check passed.
+The pytest output had 16 dependency/framework warnings (SWIG deprecations and
+aiohttp app/request key notices). No production services or providers were called.
+The first-request supplier-draft gate remains a separate integration-lead change.

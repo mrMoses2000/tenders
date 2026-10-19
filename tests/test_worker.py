@@ -663,6 +663,10 @@ async def test_terminal_research_schedules_idempotent_report_job(
         async def fetchval(self, *_args):
             return "completion-1"
 
+        async def fetchrow(self, *_args):
+            # No opted-in owner research runtime is attached to this fake run.
+            return None
+
         def transaction(self):
             @asynccontextmanager
             async def manager():

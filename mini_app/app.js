@@ -1696,11 +1696,134 @@ function researchGeographyText(decision) {
     ? labels[decision] : null;
 }
 
+function caseAdoptionPanel(caseId) {
+  const panel = el("details", "entry-panel");
+  panel.append(el("summary", "", "Подключить существующую заявку к исследованию"));
+  panel.append(el("p", "data-note", "Сначала проверим текущий разбор, позиции и действующее согласие. Заявка и её позиции не будут переписаны."));
+  const preflightButton = el("button", "entry-submit", "Проверить заявку");
+  preflightButton.type = "button";
+  const feedback = el("p", "entry-feedback");
+  panel.append(preflightButton, feedback);
+  preflightButton.addEventListener("click", async () => {
+    preflightButton.disabled = true;
+    feedback.textContent = "Сверяем текущие позиции и согласие…";
+    try {
+      const facts = await api("/api/cases/" + encodeURIComponent(caseId) + "/owner-research-preflight");
+      feedback.textContent = "Проверено: " + facts.items.length + " исходных позиций · города " +
+        facts.ordered_cities.join(" → ") + " · SHA разбора " + facts.source_payload_sha256.slice(0, 12) + "…";
+      const form = el("form", "entry-form");
+      const assertionWrap = el("label", "entry-field");
+      assertionWrap.append(el("span", "", "Подтверждение владельца"));
+      const assertion = el("textarea");
+      assertion.required = true;
+      assertion.maxLength = 2000;
+      assertion.value = "Подтверждаю подключение именно этой существующей заявки к исследованию по указанному согласию.";
+      assertionWrap.append(assertion);
+      const referenceWrap = el("label", "entry-field");
+      referenceWrap.append(el("span", "", "Основание подключения"));
+      const reference = el("input");
+      reference.required = true;
+      reference.maxLength = 500;
+      reference.value = "owner-confirmed-existing-case";
+      referenceWrap.append(reference);
+      const adopt = el("button", "entry-submit", "Подтвердить и поставить поиск в очередь");
+      adopt.type = "submit";
+      const result = el("p", "entry-feedback");
+      form.append(assertionWrap, referenceWrap, adopt, result);
+      panel.append(form);
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        adopt.disabled = true;
+        result.textContent = "Фиксируем подтверждение владельца…";
+        try {
+          await apiWrite("/api/cases/" + encodeURIComponent(caseId) + "/owner-research-adopt", {
+            preflight_sha256: facts.preflight_sha256,
+            owner_assertion: assertion.value.trim(),
+            adoption_reference: reference.value.trim()
+          });
+          result.textContent = "Подключено. Нативная очередь получила задание подготовить поиск.";
+          await openDetail(caseId);
+        } catch (error) {
+          result.textContent = error.message;
+          adopt.disabled = false;
+        }
+      });
+    } catch (error) {
+      feedback.textContent = error.message;
+      preflightButton.disabled = false;
+    }
+  });
+  return panel;
+}
+
+function sourcingInstructionForm(caseId, item, source) {
+  const details = el("details", "entry-panel");
+  details.append(el("summary", "", "Свидетельство о закупке или исключении позиции"));
+  details.append(el("p", "data-note", "По умолчанию это только свидетельство. Отдельный флажок явно применяет указание владельца к следующему плану поиска; SHA источника указывается владельцем и не проверяется как байты файла."));
+  const form = el("form", "entry-form");
+  const [sourceField, sourceRef] = inputField("Источник / ссылка владельца", "text", {maxLength: 500, required: true});
+  const [hashField, sourceHash] = inputField("SHA-256 источника (указан владельцем)", "text", {
+    maxLength: 64, minLength: 64, required: true, pattern: "[0-9a-f]{64}"});
+  const [kindField, kind] = selectField("Указание по позиции", [
+    ["skip", "Уже обеспечено · исключить из поиска"],
+    ["bought", "Уже закуплено · указать купленное количество"],
+    ["reduce_quantity", "Уменьшить искомое количество"]
+  ]);
+  const [quantityField, amount] = inputField("Уже купленное количество", "number", {
+    step: "0.000001", min: "0.000001", max: String(item.quantity || ""), required: true});
+  const [assertionField, assertion] = inputField("Подтверждение владельца", "text", {
+    maxLength: 4000, required: true});
+  const [reasonField, reason] = inputField("Почему источник соответствует этой точной позиции", "text", {
+    maxLength: 2000, required: true});
+  const applyWrap = el("label", "entry-field");
+  const apply = el("input");
+  apply.type = "checkbox";
+  const applyText = el("span", "", "Явно применить к следующему плану поиска по этой точной позиции");
+  applyWrap.append(apply, applyText);
+  const feedback = el("p", "entry-feedback");
+  const save = el("button", "entry-submit", "Сохранить свидетельство владельца");
+  save.type = "submit";
+  const setQuantityState = () => {
+    quantityField.hidden = kind.value === "skip";
+    amount.required = kind.value !== "skip";
+  };
+  kind.addEventListener("change", setQuantityState);
+  setQuantityState();
+  form.append(sourceField, hashField, kindField, quantityField, assertionField, reasonField,
+    applyWrap, save, feedback);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    save.disabled = true;
+    feedback.textContent = "Сохраняем…";
+    try {
+      await apiWrite("/api/cases/" + encodeURIComponent(caseId) + "/items/" +
+        encodeURIComponent(item.id) + "/sourcing-dispositions", {
+          source_kind: "operator_attestation", source_artifact_id: null,
+          source_reference: sourceRef.value.trim(), source_sha256: sourceHash.value.trim(),
+          disposition: kind.value, quantity: kind.value === "skip" ? null : amount.value,
+          unit: item.unit || "", owner_assertion: assertion.value.trim(),
+          exact_match_rationale: reason.value.trim(), applies_to_sourcing: apply.checked,
+          source_payload_sha256: apply.checked ? source.source_payload_sha256 : null,
+          idempotency_key: crypto.randomUUID()
+        });
+      feedback.textContent = apply.checked
+        ? "Указание владельца сохранено и связано с текущим разбором для следующего плана поиска."
+        : "Свидетельство сохранено. Объём поиска не менялся.";
+      await openDetail(caseId);
+    } catch (error) {
+      feedback.textContent = error.message;
+      save.disabled = false;
+    }
+  });
+  return details;
+}
+
 function sourceItemPanel(source) {
   const panel = el("details", "item-requirements-panel");
   const stages = {ready_for_search: "Готово к поиску", needs_review: "Нужно уточнение",
     comparable_quote: "Есть сравнимое КП", bought: "Закуплено, подтверждено",
-    evidence_only: "Есть свидетельство владельца"};
+    evidence_only: "Есть свидетельство владельца · поиск не изменён",
+    owner_excluded_from_sourcing: "По явному указанию владельца исключено из поиска"};
   panel.append(el("summary", "", stages[source.stage] || "Источник позиции"));
   if (source.source_reference) panel.append(el("p", "data-note", "Источник: " + source.source_reference));
   const issues = (source.issues || []).map(issue => ({name_missing: "Не указано название",
@@ -1717,10 +1840,12 @@ function sourceItemPanel(source) {
     if (evidence.source_reference) panel.append(el("p", "data-note",
       (evidence.source_kind === "operator_attestation" ? "Источник, указанный владельцем: "
         : "Источник: ") + evidence.source_reference));
-    panel.append(el("p", "data-note", evidence.source_kind === "operator_attestation"
-      ? "SHA-256 источника заявлен владельцем; свидетельство сохранено для проверки."
-      : "SHA-256 файла Telegram сохранён."));
-    panel.append(el("p", "data-note", "Объём поиска ещё не изменён."));
+    panel.append(el("p", "data-note", evidence.source_sha256_basis === "owner_declared"
+      ? "SHA-256 заявлен владельцем; файл не проверялся системой."
+      : "SHA-256 файла Telegram проверен по сохранённому источнику."));
+    panel.append(el("p", "data-note", evidence.applies_to_sourcing
+      ? "Указание владельца связано с конкретной версией разбора. Это не запись в бухгалтерии."
+      : "Свидетельство не применено к поиску и не подтверждает факт бухгалтерского учёта."));
   }
   return panel;
 }
@@ -1787,6 +1912,9 @@ async function openDetail(id, options = {}) {
     });
     body.append(grid, detailOptions());
     const sourceVisibility = data.source_visibility;
+    if (sourceVisibility?.research_consent === "manual" && c.status === "ready") {
+      body.append(caseAdoptionPanel(id));
+    }
     if (sourceVisibility?.warnings?.length) {
       const warnings = el("details", "item-requirements-panel");
       warnings.append(el("summary", "", "Замечания к источнику · " + sourceVisibility.warnings.length));
@@ -2059,6 +2187,10 @@ async function openDetail(id, options = {}) {
       ));
       if (item.specification_text) box.append(detailField("Техспек", item.specification_text, "spec"));
       if (sourceItem) box.append(sourceItemPanel(sourceItem));
+      if (sourceVisibility?.research_consent === "manual"
+          && sourceVisibility?.source_payload_sha256 && c.status === "ready") {
+        box.append(sourcingInstructionForm(id, item, sourceVisibility));
+      }
       box.append(itemRequirementsPanel(id, item, data.requirements || [], editable));
       if (item.reconciliation_label) box.append(detailField("Уточнение", item.reconciliation_label, "history"));
       if (item.location_label) box.append(detailField("Местонахождение по Notion", item.location_label, "history"));

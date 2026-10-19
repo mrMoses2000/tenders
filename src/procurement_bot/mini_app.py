@@ -72,7 +72,9 @@ from procurement_bot.outreach_batch import (
 from procurement_bot.owner_autonomy import (
     ResearchPolicyDenied,
     ResearchProfileEnrollment,
+    adopt_existing_case_for_research,
     load_case_source_visibility,
+    preflight_existing_case_adoption,
     record_sourcing_disposition,
     replace_research_profile,
     revoke_research_profile,
@@ -968,6 +970,12 @@ async def add_sourcing_disposition(request: web.Request) -> web.Response:
         source_reference = body.get("source_reference")
         if source_reference is not None and not isinstance(source_reference, str):
             raise ValueError("Неверная ссылка на источник")
+        applies_to_sourcing = body.get("applies_to_sourcing", False)
+        if not isinstance(applies_to_sourcing, bool):
+            raise ValueError("Неверный режим применения к поиску")
+        source_payload_sha256 = body.get("source_payload_sha256")
+        if source_payload_sha256 is not None and not isinstance(source_payload_sha256, str):
+            raise ValueError("Неверный хеш разбора заявки")
         async with request.app["pool"].acquire() as connection:
             disposition_id = await record_sourcing_disposition(
                 connection, owner_id=request["owner_id"], case_id=case_id, item_id=item_id,
@@ -976,13 +984,47 @@ async def add_sourcing_disposition(request: web.Request) -> web.Response:
                 owner_assertion=body["owner_assertion"],
                 exact_match_rationale=body["exact_match_rationale"],
                 idempotency_key=body["idempotency_key"], source_kind=source_kind,
-                source_reference=source_reference,
+                source_reference=source_reference, applies_to_sourcing=applies_to_sourcing,
+                expected_source_payload_sha256=source_payload_sha256,
             )
         return _json(request, {"disposition_id": disposition_id}, status=201)
     except ResearchPolicyDenied as exc:
         return _json(request, {"error": str(exc)}, status=409)
     except (ValueError, TypeError):
         return _json(request, {"error": "Неверные или неполные сведения об источнике"}, status=400)
+
+
+async def case_adoption_preflight(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        async with request.app["pool"].acquire() as connection:
+            result = await preflight_existing_case_adoption(
+                connection, case_id=case_id, owner_id=request["owner_id"],
+            )
+        return _json(request, result)
+    except (ValueError, ResearchPolicyDenied) as exc:
+        return _json(request, {"error": str(exc)}, status=409)
+
+
+async def adopt_existing_case(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        body = await _body(request)
+        for key in ("preflight_sha256", "owner_assertion", "adoption_reference"):
+            if not isinstance(body.get(key), str):
+                raise ValueError("Owner attestation and preflight reference are required")
+        async with request.app["pool"].acquire() as connection:
+            snapshot_id = await adopt_existing_case_for_research(
+                connection, case_id=case_id, owner_id=request["owner_id"],
+                expected_preflight_sha256=body["preflight_sha256"],
+                owner_assertion=body["owner_assertion"],
+                adoption_reference=body["adoption_reference"],
+            )
+        return _json(request, {"snapshot_id": str(snapshot_id), "queued": True}, status=202)
+    except ResearchPolicyDenied as exc:
+        return _json(request, {"error": str(exc)}, status=409)
+    except (ValueError, TypeError):
+        return _json(request, {"error": "Invalid explicit case adoption evidence"}, status=400)
 
 
 async def research_profiles(request: web.Request) -> web.Response:
@@ -2152,6 +2194,8 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_get("/api/cases", cases)
     app.router.add_get("/api/cases/{case_id}", case_detail)
     app.router.add_get("/api/cases/{case_id}/source-visibility", case_source_visibility)
+    app.router.add_get("/api/cases/{case_id}/owner-research-preflight", case_adoption_preflight)
+    app.router.add_post("/api/cases/{case_id}/owner-research-adopt", adopt_existing_case)
     app.router.add_post(
         "/api/cases/{case_id}/items/{item_id}/sourcing-dispositions", add_sourcing_disposition,
     )
