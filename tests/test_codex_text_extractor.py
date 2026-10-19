@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from procurement_bot.codex_text_extractor import (
     MAX_RESULT_BYTES,
@@ -16,8 +16,11 @@ from procurement_bot.codex_text_extractor import (
     CodexTextProfile,
     OptInCodexTextExtractor,
     TextInvocation,
+    _classify_cli_failure,
     _run_cli,
+    _strict_schema,
 )
+from procurement_bot.intake import ParsedProcurementRequest
 
 
 class WordFixture(BaseModel):
@@ -67,6 +70,36 @@ def extract(fake, text="Return the literal greeting hello.", model=WordFixture, 
     return asyncio.run(selected.extract(text, model, **kwargs))
 
 
+
+def _all_schema_values(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _all_schema_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _all_schema_values(child)
+
+
+def test_native_procurement_schema_omits_cli_unsupported_patterns_but_model_stays_strict():
+    native_schema = ParsedProcurementRequest.model_json_schema()
+    assert any("pattern" in node for node in _all_schema_values(native_schema))
+    cli_schema = _strict_schema(native_schema)
+    assert all("pattern" not in node for node in _all_schema_values(cli_schema))
+    with pytest.raises(ValidationError):
+        ParsedProcurementRequest(items=[{"name": "fixture", "quantity": "0"}])
+
+
+def test_invalid_schema_event_outweighs_nonfatal_codex_home_warning():
+    stdout = (
+        b'{"type":"error","error":{"code":"invalid_json_schema",'
+        b'"param":"text.format.schema"}}\n'
+    )
+    stderr = b"Warning: unable to create PATH aliases under temporary CODEX_HOME"
+    assert _classify_cli_failure(stdout, stderr) == "cli_invalid_schema"
+    assert _classify_cli_failure(b"", stderr) == "cli_nonzero_exit"
+
+
 def test_explicit_opt_in_profile():
     for opt_in in [False, None, 1, "true"]:
         with pytest.raises(ValueError, match="explicit opt-in"):
@@ -84,7 +117,7 @@ def test_explicit_opt_in_profile():
         {"executable": Path("relative")},
         {"node_executable": Path("relative")},
         {"timeout_seconds": 0},
-        {"timeout_seconds": 61},
+        {"timeout_seconds": 181},
         {"timeout_seconds": True},
         {"timeout_seconds": float("inf")},
         {"timeout_seconds": float("nan")},
@@ -93,6 +126,21 @@ def test_explicit_opt_in_profile():
 def test_unreviewed_model_configuration_or_unbounded_timeout_rejected(changes):
     with pytest.raises(ValueError):
         replace(PROFILE, **changes)
+
+
+def test_reviewed_text_timeout_cap_and_default_are_bounded():
+    from procurement_bot.config import Settings
+
+    assert Settings(_env_file=None).codex_text_timeout_seconds == 45
+    assert (
+        Settings(_env_file=None, codex_text_timeout_seconds=180).codex_text_timeout_seconds
+        == 180
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, codex_text_timeout_seconds=180.1)
+    assert replace(PROFILE, timeout_seconds=180).timeout_seconds == 180
+    with pytest.raises(ValueError, match="180 seconds"):
+        replace(PROFILE, timeout_seconds=180.1)
 
 
 def test_strict_data_output_and_isolated_text_only_command(monkeypatch):
