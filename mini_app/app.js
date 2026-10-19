@@ -809,7 +809,8 @@ function classifyCaseItemStage(item, sourceItem, progress, offers, currentSource
   }
   if (!instruction && (sourceItem?.stage === "evidence_only"
       || (sourceItem?.sourcing_evidence || []).length > 0)) return "purchase_review";
-  if (sourceItem?.stage === "needs_review" || item.status === "needs_clarification") {
+  if (sourceItem?.stage === "needs_review"
+      || (!sourceItem && item.status === "needs_clarification")) {
     return "needs_clarification";
   }
   if ((offers || []).some(offer => offer.comparison?.rank !== null
@@ -2110,59 +2111,66 @@ async function openDetail(id, options = {}) {
     }
     if (sourceVisibility?.report_checkpoint_at) body.append(el("p", "data-note",
       "Контрольная отметка: " + fmtDateTime(sourceVisibility.report_checkpoint_at)));
+    const stageOverviewSlot = el("div", "stage-overview-slot");
+    body.append(stageOverviewSlot);
+    const diagnostics = el("details", "case-diagnostics");
+    diagnostics.append(el("summary", "", "Ход поиска и диагностика"));
+    const diagnosticContent = el("div", "case-diagnostics-content");
+    diagnostics.append(diagnosticContent);
+    body.append(diagnostics);
     const metrics = data.pipeline_metrics;
     if (metrics) {
-      body.append(el("h3", "", "Поиск, предложения и связь"));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("h3", "", "Поиск, предложения и связь"));
+      diagnosticContent.append(el("p", "data-note",
         `Лиды: ${metrics.leads}; публичные цены: ${metrics.public_prices}; ` +
         `цены из ответов: ${metrics.supplier_prices}; сопоставимые подтверждённые: ${metrics.comparable_quotes}.`));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Принято WAHA: ${metrics.accepted}; в журнале диалогов: ${metrics.outbound_projected}; ` +
         `доставлено: ${metrics.delivered}; прочитано: ${metrics.read}; ` +
         `доставка не подтверждена: ${metrics.delivery_unknown}; ошибки ACK: ${metrics.delivery_failed}.`));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Приём попытки отправки не подтверждён: ${metrics.acceptance_unknown ?? 0}; ` +
         `принято WAHA, ожидает записи в диалог: ${metrics.accepted_pending_projection ?? 0}.`));
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Незавершённые переговоры: ${metrics.waiting_chats}; рабочие группы: ${metrics.active_groups}. ` +
         "Недоступная история WAHA не доказывает отсутствие ответа."));
     }
     const health = data.pipeline_health;
     if (health?.provider_auth?.available === false) {
-      body.append(el("p", "data-note", "Авторизация обработчика AGY отсутствует. " +
+      diagnosticContent.append(el("p", "data-note", "Авторизация обработчика AGY отсутствует. " +
         "Задания, которым он нужен, ожидают восстановления доступа; сообщения сохранены."));
     }
     if (health) {
       const account = health.account || {};
       const ingress = health.ingress || {};
       const research = health.research || {};
-      body.append(el("h3", "", "Надёжность и ожидания"));
+      diagnosticContent.append(el("h3", "", "Надёжность и ожидания"));
       if (Number(account.accounts || 0) > 0) {
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `WhatsApp-сессии: ${account.accounts}; на ручной паузе: ${account.held}; ` +
           `с ограничением/timelock: ${account.restricted}; недоступны по GET: ${account.unavailable}; ` +
           `защитный контур открыт: ${account.circuits_open}; ` +
           `состояние неизвестно: ${account.state_unknown}; разрешено по сохранённым правилам: ${account.outbound_allowed}.`));
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Фактический статус WAHA по последнему GET: ${account.session_status || "не записан"}; ` +
           `состояние аккаунта наблюдалось: ${fmtDateTime(account.provider_observed_at)}; ` +
           `следующая проверка аккаунта: ${fmtDateTime(account.next_probe_at)}.`));
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Суточные лимиты связанных сессий: ${account.daily_message_limit ?? 0} сообщений, ` +
           `${account.daily_new_contact_limit ?? 0} новых контактов; ` +
           `одновременные отправки по аккаунтам: ${account.max_concurrent_posts ?? 0}. ` +
           `Рабочие группы назначаются отдельно: ${metrics?.active_groups ?? 0}.`));
       }
-      body.append(el("p", "data-note",
+      diagnosticContent.append(el("p", "data-note",
         `Webhook события за 7 дней (вся система): приняты ${ingress.accepted_7d ?? 0}, ` +
         `проигнорированы ${ingress.ignored_7d ?? 0}, отклонены ${ingress.rejected_7d ?? 0}; ` +
         `последнее событие: ${fmtDateTime(ingress.last_seen_at)}.`));
       if (research.run_status) {
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Состояние поиска: ${research.run_status}; причина ожидания: ${pipelineWaitLabel(research.wait_reason)}; ` +
           `последний сохранённый прогресс: ${fmtDateTime(research.last_real_progress_at)}; ` +
           `следующее пробуждение: ${fmtDateTime(research.next_wake_at)}.`));
-        body.append(el("p", "data-note",
+        diagnosticContent.append(el("p", "data-note",
           `Заданий очереди без активного владельца: ${research.queued_without_runnable_job}; ` +
           `с завершённым заданием: ${research.queued_with_terminal_job}; ` +
           `остановка без задания: ${research.stalled ? "да" : "нет"}.`));
@@ -2170,19 +2178,19 @@ async function openDetail(id, options = {}) {
     }
     const reviews = data.pipeline_reviews;
     if (reviews && Object.keys(reviews.counts || {}).length) {
-      body.append(el("h3", "", "Требуется проверка"));
+      diagnosticContent.append(el("h3", "", "Требуется проверка"));
       const labels = {unknown_send: "Результат отправки не подтверждён",
         blocked_reply: "Ответ ждёт подтверждения исходного сообщения",
         reply_processing_failed: "Ошибка обработки сохранённого ответа"};
       Object.entries(reviews.counts).forEach(([kind, count]) => {
-        body.append(el("p", "data-note", `${labels[kind] || kind}: ${count}.`));
+        diagnosticContent.append(el("p", "data-note", `${labels[kind] || kind}: ${count}.`));
       });
-      body.append(el("p", "data-note", "Исходные сообщения и идентификаторы сохранены. " +
+      diagnosticContent.append(el("p", "data-note", "Исходные сообщения и идентификаторы сохранены. " +
         "Неопределённые отправки не повторяются автоматически."));
-      if (reviews.truncated) body.append(el("p", "data-note",
+      if (reviews.truncated) diagnosticContent.append(el("p", "data-note",
         "Показаны первые 100 записей; общий счётчик включает остальные."));
       (reviews.items || []).forEach(review => {
-        body.append(el("p", "data-note", `${labels[review.kind] || review.kind}: ` +
+        diagnosticContent.append(el("p", "data-note", `${labels[review.kind] || review.kind}: ` +
           `${review.subject_id}; причина: ${review.reason_code}; ` +
           `последняя проверка: ${fmtDateTime(review.last_seen_at)}.`));
         const context = [];
@@ -2213,16 +2221,16 @@ async function openDetail(id, options = {}) {
               (review.reply_job_error_code || "нет") + ".");
           }
         }
-        if (context.length) body.append(el("p", "data-note", context.join(" ")));
+        if (context.length) diagnosticContent.append(el("p", "data-note", context.join(" ")));
       });
     }
     const runtime = data.pipeline_runtime;
     if (runtime?.enabled) {
       if (runtime.last_tick_summary?.waha_status && runtime.last_tick_summary.waha_status !== "WORKING") {
-        body.append(el("p", "data-note", "WhatsApp недоступен: " + runtime.last_tick_summary.waha_status +
+        diagnosticContent.append(el("p", "data-note", "WhatsApp недоступен: " + runtime.last_tick_summary.waha_status +
           ". Отправки ожидают восстановления соединения."));
       }
-      body.append(el("p", "data-note", runtime.paused ? "Пайплайн приостановлен владельцем."
+      diagnosticContent.append(el("p", "data-note", runtime.paused ? "Пайплайн приостановлен владельцем."
         : runtime.quota_probe_at ? "Ожидание лимита. Следующая проверка: " + fmtDate(runtime.quota_probe_at)
         : "Следующая проверка очереди: " + fmtDate(runtime.next_tick_at)));
     }
@@ -2284,8 +2292,8 @@ async function openDetail(id, options = {}) {
     if (editable && data.outreach_drafts?.length) {
       body.append(outreachDraftsPanel(id, data.outreach_drafts, data.outreach_enabled));
     }
-    body.append(el("h3", "", "Позиции по этапам"));
-    body.append(el("p", "stage-explainer", "Этапы показывают ход сверки и поиска, а не готовность к покупке. " +
+    stageOverviewSlot.append(el("h3", "", "Позиции по этапам"));
+    stageOverviewSlot.append(el("p", "stage-explainer", "Этапы показывают ход сверки и поиска, а не готовность к покупке. " +
       "Сравнимым считается только подтверждённая цена по нужной партии и проверенному ТЗ."));
     const groupedItems = groupCaseItems(data.items, sourceVisibility, progressRows,
       data.offers, metrics?.waiting_chats);
@@ -2299,7 +2307,7 @@ async function openDetail(id, options = {}) {
       if (key !== "all") stageSections.get(key).section.open = true;
       filterItems();
     });
-    body.append(stageSummaryModel.element);
+    stageOverviewSlot.append(stageSummaryModel.element);
 
     const itemFilter = el("div", "item-filter");
     const itemSearch = el("input", "offer-search item-search");

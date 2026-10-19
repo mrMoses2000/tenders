@@ -252,3 +252,24 @@ console.log(JSON.stringify(items.map(item => grouped.assignments.get(item.id))))
 """
     )
     assert result == ["in_research", "paused"]
+
+
+def test_current_source_stage_overrides_stale_flat_clarification_status() -> None:
+    result = _run_stage_scenario(
+        """
+const hash = "a".repeat(64);
+const items = [
+  {id: "ready", status: "needs_clarification"},
+  {id: "comparable", status: "needs_clarification"}
+];
+const source = {source_payload_sha256: hash, items: [
+  {item_id: "ready", stage: "ready_for_search", sourcing_evidence: []},
+  {item_id: "comparable", stage: "comparable_quote", sourcing_evidence: []}
+]};
+const offers = [{request_item_id: "comparable",
+  comparison: {rank: 1, price_state: "supplier_confirmed"}}];
+const grouped = groupCaseItems(items, source, [], offers, 0);
+console.log(JSON.stringify(items.map(item => grouped.assignments.get(item.id))));
+"""
+    )
+    assert result == ["not_started", "comparable_options"]
