@@ -58,6 +58,8 @@ class _StartPayload:
     research_run_id: UUID
     plan_sha256: str
     canonical: dict[str, str]
+    policy_authorization_id: UUID | None = None
+    policy_authorization_sha256: str | None = None
 
 
 def _mapping(value: object, *, field: str) -> dict[str, Any]:
@@ -89,7 +91,8 @@ def _parse_uuid(value: object, *, field: str) -> UUID:
 def _parse_start_payload(value: object) -> _StartPayload:
     payload = _mapping(value, field="approval payload")
     required = {"case_id", "research_run_id", "plan_sha256"}
-    if set(payload) != required:
+    policy_fields = {"policy_authorization_id", "policy_authorization_sha256"}
+    if set(payload) not in (required, required | policy_fields):
         raise ResearchStartDenied(
             "start_research approval payload must contain exactly "
             "case_id, research_run_id, and plan_sha256"
@@ -106,7 +109,25 @@ def _parse_start_payload(value: object) -> _StartPayload:
         "research_run_id": str(run_id),
         "plan_sha256": plan_hash,
     }
+    if policy_fields.issubset(payload):
+        policy_id = _parse_uuid(payload["policy_authorization_id"], field="policy_authorization_id")
+        policy_hash = payload["policy_authorization_sha256"]
+        if not isinstance(policy_hash, str) or len(policy_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in policy_hash
+        ):
+            raise ResearchStartDenied("policy_authorization_sha256 must be a SHA-256 digest")
+        canonical.update(policy_authorization_id=str(policy_id),
+                         policy_authorization_sha256=policy_hash)
+        return _StartPayload(case_id, run_id, plan_hash, canonical, policy_id, policy_hash)
     return _StartPayload(case_id, run_id, plan_hash, canonical)
+
+
+def _event_policy_data(payload: _StartPayload) -> dict[str, str]:
+    if payload.policy_authorization_id is None:
+        return {}
+    return {"authorization_mode": "owner_research_profile",
+            "policy_authorization_id": str(payload.policy_authorization_id),
+            "policy_authorization_sha256": str(payload.policy_authorization_sha256)}
 
 
 def _plan_hash(search_scope: object) -> str:
@@ -205,6 +226,22 @@ async def start_approved_research(
         )
         if case is None:
             raise ResearchStartDenied("approved procurement case does not exist")
+        policy_snapshot = None
+        if payload.policy_authorization_id is not None:
+            from procurement_bot.owner_autonomy import (
+                ResearchPolicyDenied,
+                validate_research_policy_binding,
+            )
+
+            try:
+                policy_snapshot = await validate_research_policy_binding(
+                    connection, authorization_id=payload.policy_authorization_id,
+                    authorization_sha256=str(payload.policy_authorization_sha256),
+                    case_id=payload.case_id, run_id=payload.research_run_id,
+                    plan_sha256=payload.plan_sha256, approved_by=approval["approved_by"],
+                )
+            except ResearchPolicyDenied as exc:
+                raise ResearchStartDenied(str(exc)) from exc
 
         job_key = stable_key("execute-research", payload.research_run_id)
         event_key = stable_key("workflow.research-started", payload.research_run_id)
@@ -273,7 +310,19 @@ async def start_approved_research(
             "approval_id": str(approval_id),
             "research_run_id": str(payload.research_run_id),
             "plan_sha256": payload.plan_sha256,
+            **_event_policy_data(payload),
         }
+        if policy_snapshot is not None:
+            # This persists the honest checkpoint from actual approved start.
+            # Dispatching the existing partial report at this time is a later hook.
+            await connection.execute(
+                """UPDATE case_pipeline_runtime SET research_policy_snapshot_id=$2,
+                active_city_tier=0,report_checkpoint_at=COALESCE(report_checkpoint_at,
+                (SELECT started_at FROM research_runs WHERE id=$3)+$4*interval '1 hour')
+                WHERE case_id=$1""", payload.case_id, policy_snapshot["id"],
+                payload.research_run_id,
+                policy_snapshot["snapshot"]["policy"]["report_checkpoint_hours"],
+            )
         event_inserted = await connection.fetchval(
             """
             INSERT INTO workflow_events(
@@ -337,6 +386,7 @@ async def _resolve_idempotent_start(
         "approval_id": str(approval_id),
         "research_run_id": str(payload.research_run_id),
         "plan_sha256": payload.plan_sha256,
+        **_event_policy_data(payload),
     }
     if (
         event is None

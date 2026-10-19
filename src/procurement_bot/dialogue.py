@@ -99,6 +99,8 @@ def _clarification_questions(blockers: list[IntakeBlocker], maximum: int = 1) ->
 def evaluate_missing_blockers(
     request: ParsedProcurementRequest,
     policy: SearchScopePolicy,
+    *,
+    allow_partial_items: bool = False,
 ) -> GapReport:
     from procurement_bot.intake import SearchScope
 
@@ -201,5 +203,12 @@ def evaluate_missing_blockers(
                         ),
                     )
                 )
+    if allow_partial_items:
+        from procurement_bot.owner_autonomy import item_search_issues
+
+        if any(not item_search_issues(item) for item in request.items):
+            # Item conflicts remain in the immutable source projection. They
+            # cannot prevent unrelated clear lines from entering research.
+            blockers = [blocker for blocker in blockers if blocker.item_index is None]
     questions = _clarification_questions(blockers)
     return GapReport(blockers=blockers, questions=questions, ready_to_search=not blockers)

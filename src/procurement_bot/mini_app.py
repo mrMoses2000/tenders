@@ -69,6 +69,14 @@ from procurement_bot.outreach_batch import (
     load_initial_outreach_drafts,
     refresh_initial_outreach_drafts,
 )
+from procurement_bot.owner_autonomy import (
+    ResearchPolicyDenied,
+    ResearchProfileEnrollment,
+    load_case_source_visibility,
+    record_sourcing_disposition,
+    replace_research_profile,
+    revoke_research_profile,
+)
 from procurement_bot.queue import enqueue_job, stable_key
 from procurement_bot.research_workflow import ResearchStartDenied
 from procurement_bot.resources import resource_path
@@ -857,10 +865,21 @@ async def case_detail(request: web.Request) -> web.Response:
             "WHERE case_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1",
             case_id,
         )
+        source_visibility = await load_case_source_visibility(
+            connection, case_id=case_id, owner_id=request["owner_id"],
+        )
+        comparable_items = {str(offer["request_item_id"]) for offer in offers
+                            if comparisons[str(offer["id"])].get("rank") is not None
+                            and comparisons[str(offer["id"])].get("price_state")
+                            == "supplier_confirmed"}
+        for item in source_visibility["items"]:
+            if item["stage"] == "ready_for_search" and item["item_id"] in comparable_items:
+                item["stage"] = "comparable_quote"
     return _json(
         request,
         {
             "case": dict(case),
+            "source_visibility": source_visibility,
             "items": [dict(row) for row in items],
             "offers": [
                 {
@@ -912,6 +931,99 @@ async def case_detail(request: web.Request) -> web.Response:
 
 def vars_issue(issue) -> dict[str, object]:
     return {"code": issue.code, "message": issue.message, "request_item_id": issue.request_item_id}
+
+
+async def case_source_visibility(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        async with request.app["pool"].acquire() as connection:
+            projection = await load_case_source_visibility(
+                connection, case_id=case_id, owner_id=request["owner_id"],
+            )
+        return _json(request, projection)
+    except (ValueError, ResearchPolicyDenied):
+        raise web.HTTPNotFound from None
+
+
+async def add_sourcing_disposition(request: web.Request) -> web.Response:
+    try:
+        case_id = _uuid(request.match_info["case_id"])
+        item_id = _uuid(request.match_info["item_id"])
+        body = await _body(request)
+        source_kind = body.get("source_kind")
+        if source_kind not in {"telegram_artifact", "operator_attestation"}:
+            raise ValueError("Укажите тип источника")
+        artifact_id = (
+            None if body.get("source_artifact_id") is None
+            else _uuid(body["source_artifact_id"])
+        )
+        raw_quantity = body.get("quantity")
+        quantity = None if raw_quantity is None else _decimal(raw_quantity)
+        if not isinstance(body.get("source_sha256"), str):
+            raise ValueError("Укажите SHA-256 источника")
+        for key in ("disposition", "unit", "owner_assertion",
+                    "exact_match_rationale", "idempotency_key"):
+            if not isinstance(body.get(key), str):
+                raise ValueError("Заполните сведения о точном соответствии позиции")
+        source_reference = body.get("source_reference")
+        if source_reference is not None and not isinstance(source_reference, str):
+            raise ValueError("Неверная ссылка на источник")
+        async with request.app["pool"].acquire() as connection:
+            disposition_id = await record_sourcing_disposition(
+                connection, owner_id=request["owner_id"], case_id=case_id, item_id=item_id,
+                artifact_id=artifact_id, artifact_sha256=body["source_sha256"],
+                disposition=body["disposition"], quantity=quantity, unit=body["unit"],
+                owner_assertion=body["owner_assertion"],
+                exact_match_rationale=body["exact_match_rationale"],
+                idempotency_key=body["idempotency_key"], source_kind=source_kind,
+                source_reference=source_reference,
+            )
+        return _json(request, {"disposition_id": disposition_id}, status=201)
+    except ResearchPolicyDenied as exc:
+        return _json(request, {"error": str(exc)}, status=409)
+    except (ValueError, TypeError):
+        return _json(request, {"error": "Неверные или неполные сведения об источнике"}, status=400)
+
+
+async def research_profiles(request: web.Request) -> web.Response:
+    async with request.app["pool"].acquire() as connection:
+        profiles = await connection.fetch(
+            """SELECT id,customer_id,version,research_autostart,policy,policy_sha256,
+            consent_reference,consent_text,authorized_at,revoked_at
+            FROM owner_research_automation_profiles WHERE owner_user_id=$1
+            ORDER BY authorized_at DESC,version DESC""", request["owner_id"],
+        )
+    return _json(request, {"profiles": [dict(profile) for profile in profiles]})
+
+
+async def enroll_research_profile(request: web.Request) -> web.Response:
+    try:
+        enrollment = ResearchProfileEnrollment.model_validate(await _body(request))
+        async with request.app["pool"].acquire() as connection:
+            profile_id = await replace_research_profile(
+                connection, owner_id=request["owner_id"],
+                **enrollment.model_dump(exclude={"policy"}), policy=enrollment.policy,
+            )
+        return _json(request, {"profile_id": profile_id}, status=201)
+    except ResearchPolicyDenied as exc:
+        return _json(request, {"error": str(exc)}, status=409)
+    except ValueError:
+        return _json(request, {"error": "Explicit research policy and consent required"},
+                     status=400)
+
+
+async def revoke_research_profile_api(request: web.Request) -> web.Response:
+    try:
+        profile_id = _uuid(request.match_info["profile_id"])
+        async with request.app["pool"].acquire() as connection:
+            revoked = await revoke_research_profile(
+                connection, owner_id=request["owner_id"], profile_id=profile_id,
+            )
+        if not revoked:
+            raise web.HTTPNotFound
+        return _json(request, {"revoked": True})
+    except ValueError:
+        raise web.HTTPNotFound from None
 
 
 async def control_research(request: web.Request) -> web.Response:
@@ -2039,6 +2151,13 @@ def create_mini_app(pool: asyncpg.Pool, settings: Settings) -> web.Application:
     app.router.add_get("/api/summary", summary)
     app.router.add_get("/api/cases", cases)
     app.router.add_get("/api/cases/{case_id}", case_detail)
+    app.router.add_get("/api/cases/{case_id}/source-visibility", case_source_visibility)
+    app.router.add_post(
+        "/api/cases/{case_id}/items/{item_id}/sourcing-dispositions", add_sourcing_disposition,
+    )
+    app.router.add_get("/api/research-profiles", research_profiles)
+    app.router.add_post("/api/research-profiles", enroll_research_profile)
+    app.router.add_post("/api/research-profiles/{profile_id}/revoke", revoke_research_profile_api)
     app.router.add_post(
         "/api/cases/{case_id}/offers/{offer_id}/manual-quotes",
         add_manual_quote,

@@ -1696,6 +1696,35 @@ function researchGeographyText(decision) {
     ? labels[decision] : null;
 }
 
+function sourceItemPanel(source) {
+  const panel = el("details", "item-requirements-panel");
+  const stages = {ready_for_search: "Готово к поиску", needs_review: "Нужно уточнение",
+    comparable_quote: "Есть сравнимое КП", bought: "Закуплено, подтверждено",
+    evidence_only: "Есть свидетельство владельца"};
+  panel.append(el("summary", "", stages[source.stage] || "Источник позиции"));
+  if (source.source_reference) panel.append(el("p", "data-note", "Источник: " + source.source_reference));
+  const issues = (source.issues || []).map(issue => ({name_missing: "Не указано название",
+    low_confidence: "Низкая уверенность распознавания",
+    source_projection_unavailable: "Нет связанного разбора источника"}[issue]
+    || (issue.startsWith("requirements.") ? "Неоднозначное техническое требование" : "Уточнить: " + issue)));
+  for (const text of [...new Set(issues)]) panel.append(el("p", "data-note", text));
+  for (const requirement of (source.requirements || []).filter(row => row.ambiguous)) {
+    panel.append(el("p", "data-note", [requirement.name, requirement.value,
+      requirement.source_reference].filter(Boolean).join(" · ")));
+  }
+  for (const evidence of source.sourcing_evidence || []) {
+    panel.append(el("p", "data-note", "По словам владельца: «" + evidence.owner_assertion + "»"));
+    if (evidence.source_reference) panel.append(el("p", "data-note",
+      (evidence.source_kind === "operator_attestation" ? "Источник, указанный владельцем: "
+        : "Источник: ") + evidence.source_reference));
+    panel.append(el("p", "data-note", evidence.source_kind === "operator_attestation"
+      ? "SHA-256 источника заявлен владельцем; свидетельство сохранено для проверки."
+      : "SHA-256 файла Telegram сохранён."));
+    panel.append(el("p", "data-note", "Объём поиска ещё не изменён."));
+  }
+  return panel;
+}
+
 function researchIssueText(code) {
   const labels = {source_exhausted: "Просмотренные результаты закончились",
     target_reached: "Цель поиска достигнута", no_new_candidates: "Новых продавцов в этой порции нет",
@@ -1749,13 +1778,23 @@ async function openDetail(id, options = {}) {
     body.append(badge(c.status), el("h2", "", c.title || "Заявка без названия"),
       el("p", "detail-sub", [c.city, c.customer_name].filter(Boolean).join(" / ") || "Основная информация"));
     const grid = el("div", "info-grid");
-    [["Город", c.city || "Не указан"], ["Срок", fmtDate(c.deadline_at)],
+    [["Город поиска", c.city || "Не указан"], ["Доставка", c.delivery_address || "Не указана"],
+      ["Срок", fmtDate(c.deadline_at)],
       ["Позиций", String(data.items.length)], ["Обновлено", fmtDate(c.updated_at)]].forEach(([key, value]) => {
       const cell = el("div", "info-cell");
       cell.append(el("small", "", key), el("strong", "", value));
       grid.append(cell);
     });
     body.append(grid, detailOptions());
+    const sourceVisibility = data.source_visibility;
+    if (sourceVisibility?.warnings?.length) {
+      const warnings = el("details", "item-requirements-panel");
+      warnings.append(el("summary", "", "Замечания к источнику · " + sourceVisibility.warnings.length));
+      sourceVisibility.warnings.forEach(text => warnings.append(el("p", "data-note", text)));
+      body.append(warnings);
+    }
+    if (sourceVisibility?.report_checkpoint_at) body.append(el("p", "data-note",
+      "Контрольная отметка: " + fmtDateTime(sourceVisibility.report_checkpoint_at)));
     const metrics = data.pipeline_metrics;
     if (metrics) {
       body.append(el("h3", "", "Поиск, предложения и связь"));
@@ -1950,6 +1989,7 @@ async function openDetail(id, options = {}) {
     const itemBoxes = [];
     data.items.forEach(item => {
       const box = el("div", "item-card");
+      const sourceItem = sourceVisibility?.items?.find(row => row.item_id === item.id);
       itemBoxes.push({item, box});
       const head = el("div", "item-head");
       const statusBadges = el("div", "item-statuses");
@@ -2018,6 +2058,7 @@ async function openDetail(id, options = {}) {
         "Поставлено по Notion", quantity(item.reported_delivered_quantity, item.unit)
       ));
       if (item.specification_text) box.append(detailField("Техспек", item.specification_text, "spec"));
+      if (sourceItem) box.append(sourceItemPanel(sourceItem));
       box.append(itemRequirementsPanel(id, item, data.requirements || [], editable));
       if (item.reconciliation_label) box.append(detailField("Уточнение", item.reconciliation_label, "history"));
       if (item.location_label) box.append(detailField("Местонахождение по Notion", item.location_label, "history"));
