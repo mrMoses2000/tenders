@@ -1291,19 +1291,10 @@ class JobWorker:
                         available_at=datetime.now(UTC) + timedelta(minutes=30),
                         reason="waha_session_unavailable",
                     )
-        from procurement_bot.whatsapp_account import get_account_state
-
-        async with self.pool.acquire() as connection:
-            account = await get_account_state(connection, self.waha_session)
-        if (
-            not account["outbound_allowed"]
-            or (self.waha_client is not None
-                and not getattr(self.waha_client, "outbound_enabled", True))
-        ):
-            raise WhatsAppSendDeferred(
-                available_at=datetime.now(UTC) + timedelta(minutes=30),
-                reason="whatsapp_account_outbound_held",
-            )
+        # Drafts establish the case conversations needed for owner-authorized
+        # account pinning. They must be preparable while held/unpinned. The
+        # native repository still checks owner/contact/opt-out state; physical
+        # delivery rechecks approval, identity, hold, health and budgets.
         if self.waha_client is not None:
             checked, confirmed = await verify_case_whatsapp_numbers(
                 self.pool,
