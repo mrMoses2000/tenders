@@ -294,3 +294,26 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
   .stage-filter { padding: 7px; }
   .stage-badge { max-width: 145px; }
 }
+
+
+.wa-operator { margin: 26px 18px 0; padding: 22px 16px; border: 1px solid var(--ink); background: #eef0e8; }
+.wa-operator-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; }
+.wa-operator-head h2 { margin: 0; max-width: 460px; font-size: 21px; line-height: 1.2; letter-spacing: -.045em; }
+.wa-operator > .data-note { margin: 13px 0; }
+.wa-account-card { margin-top: 14px; padding: 14px 12px; border-top: 2px solid var(--ink); background: var(--paper); }
+.wa-account-heading { display: grid; gap: 8px; }
+.wa-account-name { overflow-wrap: anywhere; font-size: 13px; font-weight: 750; }
+.wa-account-heading .badge { width: fit-content; white-space: normal; overflow-wrap: anywhere; }
+.wa-account-facts { display: grid; gap: 5px; padding: 10px 0; color: var(--ink-soft); font-size: 11px; line-height: 1.45; }
+.wa-account-facts p { margin: 0; overflow-wrap: anywhere; }
+.wa-action { margin-top: 8px; border: 1px solid var(--line); background: var(--surface); }
+.wa-action > summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; padding: 8px 11px; font-size: 11px; line-height: 1.4; font-weight: 700; }
+.wa-form { display: grid; gap: 10px; padding: 11px; border-top: 1px solid var(--line); }
+.wa-quarantine-form { display: grid; gap: 10px; }
+.wa-confirm { display: flex; align-items: start; gap: 8px; color: var(--ink-soft); font-size: 11px; line-height: 1.45; }
+.wa-confirm input { margin-top: 2px; accent-color: #597a20; }
+.wa-success { margin: 0; color: #385a40; font-size: 11px; line-height: 1.45; }
+@media (max-width: 420px) {
+  .wa-operator { margin: 22px 19px 0; padding: 18px 12px; }
+  .wa-operator-head h2 { font-size: 19px; }
+}
