@@ -38,9 +38,14 @@ from procurement_bot.research_scope import append_citywide_scope_revision
 from procurement_bot.search_profiles import (
     SearchIntent,
     SearchProfile,
+    SearchProfileConflict,
     ensure_search_profiles,
     load_search_intent_plan,
     load_search_item_snapshot,
+)
+from scripts.postgres_test_safety import (
+    parse_test_postgres_dsn,
+    verify_postgres_test_connection,
 )
 
 ROOT = Path(__file__).parents[1]
@@ -65,6 +70,149 @@ def _locality_resolution() -> LocalityResolution:
         candidates=[candidate],
         selected=candidate,
     )
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_citywide_snapshot_ignores_case_area_hint_but_keeps_strict_bindings() -> None:
+    dsn = os.getenv("TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("TEST_POSTGRES_DSN is not set")
+
+    target = parse_test_postgres_dsn(
+        dsn, expected_database="test_uran_integrated", expected_port=55450
+    )
+    await verify_postgres_test_connection(dsn, target)
+
+    schema = f"test_citywide_area_hint_{uuid4().hex}"
+    admin = await asyncpg.connect(dsn)
+    await admin.execute(f'CREATE SCHEMA "{schema}"')
+
+    async def init_connection(connection: asyncpg.Connection) -> None:
+        for type_name in ("json", "jsonb"):
+            await connection.set_type_codec(
+                type_name,
+                schema="pg_catalog",
+                encoder=json.dumps,
+                decoder=json.loads,
+                format="text",
+            )
+
+    pool = await asyncpg.create_pool(
+        dsn,
+        min_size=1,
+        max_size=4,
+        server_settings={"search_path": schema},
+        init=init_connection,
+    )
+    try:
+        await run_migrations(pool, ROOT / "migrations")
+        owner_id = uuid4()
+        await pool.execute(
+            "INSERT INTO users(id,telegram_id,display_name) VALUES ($1,$2,'area-hint-owner')",
+            owner_id,
+            710_000_000 + int(owner_id.hex[:8], 16),
+        )
+
+        async def persist_case(
+            *, city: str, case_area: str, scope: SearchScope, plan_area: str | None
+        ) -> tuple[UUID, UUID, UUID]:
+            case_id, item_id = uuid4(), uuid4()
+            await pool.execute(
+                "INSERT INTO procurement_cases(id,owner_user_id,title,city,"
+                "search_area_text,status) "
+                "VALUES ($1,$2,'Area binding check',$3,$4,'researching')",
+                case_id, owner_id, city, case_area,
+            )
+            item = ProcurementItem(name="Кисть малярная", quantity=5, unit="шт")
+            await pool.execute(
+                "INSERT INTO request_items(id,case_id,line_number,name,quantity,unit,status) "
+                "VALUES ($1,$2,1,$3,5,'шт','ready')",
+                item_id, case_id, item.name,
+            )
+            await pool.execute(
+                "INSERT INTO item_requirements(request_item_id,requirement_key,operator,"
+                "expected_value,is_hard,source_pointer) "
+                "VALUES ($1,'color','equals',$2::jsonb,TRUE,'line 1')",
+                item_id, {"value": "white"},
+            )
+            parsed = ParsedProcurementRequest(
+                city=city, search_scope=scope, search_area_text=plan_area, items=[item]
+            )
+            plan = build_research_plan(parsed, minimum_unique_candidates=1)
+            async with pool.acquire() as connection:
+                persisted = await persist_research_plan(
+                    connection, case_id=case_id, plan=plan, requested_by=owner_id
+                )
+            await pool.execute(
+                "INSERT INTO research_item_groups(research_run_id,request_item_id,"
+                "target_suppliers) "
+                "VALUES ($1,$2,1)",
+                persisted.id, item_id,
+            )
+            return case_id, persisted.id, item_id
+
+        _, citywide_run, citywide_item = await persist_case(
+            city="Тараз", case_area="Тараз", scope=SearchScope.CITYWIDE, plan_area=None
+        )
+        async with pool.acquire() as connection:
+            snapshot = await load_search_item_snapshot(connection, citywide_run, citywide_item)
+        assert snapshot.context["item_id"] == str(citywide_item)
+        assert snapshot.context["case_city"] == "Тараз"
+        assert snapshot.context["locality"]["scope"] == SearchScope.CITYWIDE.value
+        assert snapshot.context["locality"]["raw_area_text"] is None
+        assert snapshot.context["requirements"] == [
+            {
+                "name": "color",
+                "operator": "equals",
+                "expected_value": {"value": "white"},
+                "hard_requirement": True,
+                "source_reference": "line 1",
+            }
+        ]
+
+        _, specific_run, specific_item = await persist_case(
+            city="Тараз",
+            case_area="Тараз",
+            scope=SearchScope.SPECIFIC_AREA,
+            plan_area="Центральный район",
+        )
+        async with pool.acquire() as connection:
+            with pytest.raises(SearchProfileConflict, match="case locality differs"):
+                await load_search_item_snapshot(connection, specific_run, specific_item)
+
+        await pool.execute(
+            "UPDATE procurement_cases SET city=$2 "
+            "WHERE id=(SELECT case_id FROM research_runs WHERE id=$1)",
+            citywide_run,
+            "Шымкент",
+        )
+        async with pool.acquire() as connection:
+            with pytest.raises(SearchProfileConflict, match="case city differs"):
+                await load_search_item_snapshot(connection, citywide_run, citywide_item)
+        await pool.execute(
+            "UPDATE procurement_cases SET city=$2 "
+            "WHERE id=(SELECT case_id FROM research_runs WHERE id=$1)",
+            citywide_run,
+            "Тараз",
+        )
+
+        stored_scope = await pool.fetchval(
+            "SELECT search_scope FROM research_runs WHERE id=$1", citywide_run
+        )
+        stored_scope["plan"]["source_plans"][1]["locality"]["raw_area_text"] = "Другой район"
+        await pool.execute(
+            "UPDATE research_runs SET search_scope=$2::jsonb WHERE id=$1",
+            citywide_run,
+            stored_scope,
+        )
+        async with pool.acquire() as connection:
+            with pytest.raises(SearchProfileConflict, match="inconsistent item locality"):
+                await load_search_item_snapshot(connection, citywide_run, citywide_item)
+    finally:
+        await pool.close()
+        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await admin.close()
 
 
 def _profile() -> SearchProfile:

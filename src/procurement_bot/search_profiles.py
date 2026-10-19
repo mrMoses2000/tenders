@@ -270,9 +270,14 @@ async def load_search_item_snapshot(
     case_city = str(row["city"] or "").strip().casefold()
     frozen_area = str(locality.get("raw_area_text") or "").strip().casefold()
     case_area = str(row["search_area_text"] or "").strip().casefold()
+    locality_scope = str(locality.get("scope") or "").strip().casefold()
     if frozen_city and case_city and frozen_city != case_city:
         raise SearchProfileConflict("case city differs from the frozen source plan")
-    if frozen_area != case_area:
+    # A citywide plan deliberately carries no area constraint. Some imported
+    # cases repeat the city in search_area_text; that hint must not narrow the
+    # immutable citywide plan. Keep exact area binding for specific-area plans
+    # and unknown legacy scopes.
+    if locality_scope != "citywide" and frozen_area != case_area:
         raise SearchProfileConflict("case locality differs from the frozen source plan")
     context: dict[str, Any] = {
         "item_id": str(row["request_item_id"]),
