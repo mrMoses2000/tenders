@@ -113,6 +113,14 @@ CREATE TABLE item_sourcing_dispositions (
         AND source_reference !~ '[[:cntrl:]]'
     )),
     artifact_sha256 TEXT NOT NULL CHECK (artifact_sha256 ~ '^[0-9a-f]{64}$'),
+    source_sha256_basis TEXT NOT NULL CHECK (
+        source_sha256_basis IN ('telegram_verified', 'owner_declared')
+    ),
+    source_parse_version_id UUID REFERENCES case_parse_versions(id) ON DELETE RESTRICT,
+    source_payload_sha256 TEXT CHECK (
+        source_payload_sha256 IS NULL OR source_payload_sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    applies_to_sourcing BOOLEAN NOT NULL DEFAULT FALSE,
     disposition TEXT NOT NULL CHECK (disposition IN ('bought','skip','reduce_quantity')),
     quantity NUMERIC(18,6) CHECK (quantity>0),
     unit TEXT NOT NULL CHECK (btrim(unit)<>''),
@@ -129,13 +137,25 @@ CREATE TABLE item_sourcing_dispositions (
     FOREIGN KEY (request_item_id,case_id) REFERENCES request_items(id,case_id),
     CHECK (disposition='skip' OR quantity IS NOT NULL),
     CHECK (
+        (applies_to_sourcing AND source_parse_version_id IS NOT NULL
+         AND source_payload_sha256 IS NOT NULL)
+        OR
+        (NOT applies_to_sourcing AND source_parse_version_id IS NULL
+         AND source_payload_sha256 IS NULL)
+    ),
+    CHECK (
         (source_kind='telegram_artifact' AND source_artifact_id IS NOT NULL
-         AND source_reference IS NULL)
+         AND source_reference IS NULL AND source_sha256_basis='telegram_verified')
         OR
         (source_kind='operator_attestation' AND source_artifact_id IS NULL
-         AND source_reference IS NOT NULL AND btrim(source_reference)<>'')
+         AND source_reference IS NOT NULL AND btrim(source_reference)<>''
+         AND source_sha256_basis='owner_declared')
     )
 );
+
+CREATE UNIQUE INDEX item_sourcing_dispositions_one_effective_per_parse_item
+    ON item_sourcing_dispositions(case_id,request_item_id,source_parse_version_id)
+    WHERE applies_to_sourcing;
 
 CREATE FUNCTION guard_sourcing_disposition_scope() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
@@ -167,6 +187,13 @@ BEGIN
         END IF;
     ELSE
         RAISE EXCEPTION 'unsupported sourcing evidence kind';
+    END IF;
+    IF NEW.applies_to_sourcing AND NOT EXISTS (
+        SELECT 1 FROM case_parse_versions v
+        WHERE v.id=NEW.source_parse_version_id AND v.case_id=NEW.case_id
+          AND v.status='applied'
+    ) THEN
+        RAISE EXCEPTION 'sourcing instruction parse version is not current for case';
     END IF;
     RETURN NEW;
 END $$;
