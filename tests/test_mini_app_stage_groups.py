@@ -25,6 +25,8 @@ def _run_stage_scenario(scenario: str) -> dict:
             for name in (
                 "effectiveOwnerSourcingInstruction",
                 "isFullOwnerSourcingInstruction",
+                "badge",
+                "itemBadge",
                 "ownerInstructionBadgeLabel",
                 "classifyCaseItemStage",
                 "caseStageBadgeLabel",
@@ -36,6 +38,7 @@ def _run_stage_scenario(scenario: str) -> dict:
     assert all(piece is not None for piece in pieces)
     helpers = "\n".join(piece.group(0) for piece in pieces if piece is not None)
     script = """
+const labels = {needs_clarification: "Нужно уточнить", ready: "Готова к поиску"};
 class FakeNode {
   constructor(tag, className, text) {
     this.tag = tag;
@@ -273,3 +276,31 @@ console.log(JSON.stringify(items.map(item => grouped.assignments.get(item.id))))
 """
     )
     assert result == ["not_started", "comparable_options"]
+
+
+def test_current_stage_hides_stale_generic_badge_but_keeps_accounting_and_notion() -> None:
+    result = _run_stage_scenario(
+        """
+const item = {id: "item", status: "needs_clarification", quantity: 10, unit: "шт",
+  event_count: 0, purchased_quantity: null, accepted_quantity: null};
+const sourceItem = {stage: "comparable_quote"};
+const purchased = {...item, event_count: 1, purchased_quantity: 10,
+  accepted_quantity: 10, delivered_quantity: 10};
+const notion = {...item, source_record_url: "https://example.org/item"};
+console.log(JSON.stringify({
+  staleBadge: itemBadge(item, sourceItem)?.textContent ?? null,
+  currentStage: classifyCaseItemStage(item, sourceItem, null,
+    [{comparison: {rank: 1, price_state: "supplier_confirmed"}}], null),
+  purchasedBadge: itemBadge(purchased, sourceItem)?.textContent,
+  notionBadge: itemBadge(notion, sourceItem)?.textContent,
+  fallbackBadge: itemBadge(item, null)?.textContent
+}));
+"""
+    )
+    assert result == {
+        "staleBadge": None,
+        "currentStage": "comparable_options",
+        "purchasedBadge": "Исполнено",
+        "notionBadge": "История из Notion",
+        "fallbackBadge": "Нужно уточнить",
+    }

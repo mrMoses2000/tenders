@@ -114,8 +114,8 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
 .field-options-grid { display: flex; flex-wrap: wrap; gap: 7px; max-height: 220px; overflow: auto; padding: 0 10px 12px; }
 .item-card { padding: 17px 0; border-bottom: 1px solid var(--line); }
 .item-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; font-size: 13px; line-height: 1.45; font-weight: 700; }
-.item-head .badge { flex: none; }
-.item-statuses { display: flex; flex-wrap: wrap; justify-content: end; gap: 5px; }
+.item-head .badge { flex: none; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.item-statuses { display: flex; min-width: 0; max-width: 100%; flex-wrap: wrap; justify-content: end; gap: 5px; }
 .delivery-badge { background: #d5fb78; color: #253315; }
 .delivery-section { margin-top: 22px; }
 .delivery-entry { margin-top: 12px; border-color: var(--ink); }
@@ -288,6 +288,8 @@ button.record:hover { background: #e8ebdf; padding-left: 8px; }
 .stage-group-items { padding-bottom: 4px; }
 .stage-badge { max-width: 190px; min-height: 27px; white-space: normal; text-align: center; font-size: 12px; line-height: 1.25; }
 @media (max-width: 520px) {
+  .item-head { flex-direction: column; align-items: stretch; }
+  .item-statuses { width: 100%; justify-content: flex-start; }
   .stage-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stage-filter { padding: 7px; }
   .stage-badge { max-width: 145px; }
