@@ -40,7 +40,7 @@ from procurement_bot.owner_autonomy import (
 )
 from procurement_bot.research_workflow import ResearchStartDenied, start_approved_research
 from procurement_bot.worker import JobWorker
-from scripts.postgres_test_safety import parse_test_postgres_dsn, verify_postgres_test_connection
+from scripts.postgres_test_safety import configured_postgres_target, verify_postgres_test_connection
 
 pytestmark = pytest.mark.postgres
 
@@ -50,7 +50,7 @@ async def owner_pg():
     dsn = os.getenv("TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("requires the disposable owner-autonomy PostgreSQL cluster")
-    target = parse_test_postgres_dsn(dsn, expected_database="test_uran_owner", expected_port=55448)
+    target = configured_postgres_target(dsn)
     await verify_postgres_test_connection(dsn, target)
     admin = await asyncpg.connect(dsn)
     schema = f"owner_autonomy_{uuid4().hex}"
