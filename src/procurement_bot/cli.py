@@ -16,7 +16,10 @@ from aiogram.types import MenuButtonWebApp, Update, WebAppInfo
 from aiohttp import web
 
 from procurement_bot.config import Settings, get_settings
-from procurement_bot.configured_extractor import ConfiguredAgyExtractor
+from procurement_bot.configured_extractor import (
+    ConfiguredAgyAudioTranscriber,
+    ConfiguredStructuredExtractor,
+)
 from procurement_bot.db import create_pool, run_migrations
 from procurement_bot.dialogue import SearchScopePolicy
 from procurement_bot.health import health_snapshot
@@ -31,7 +34,6 @@ from procurement_bot.providers.browser import BrowserResearchPort, StructuredBro
 from procurement_bot.providers.codex_chrome import CodexChromeExecutor
 from procurement_bot.providers.configured_agy_browser import ConfiguredAgyBrowserExecutor
 from procurement_bot.providers.olx_fallback import OlxFallbackProvider
-from procurement_bot.providers.supplier_audio import KazakhAudioTranscriber
 from procurement_bot.providers.supplier_image import CodexSupplierImageReader
 from procurement_bot.providers.two_gis_fallback import TwoGisFallbackProvider
 from procurement_bot.providers.waha import WahaClient
@@ -260,13 +262,14 @@ def _start_worker_tasks(
     bot: Bot,
 ) -> None:
     storage = LocalContentAddressedStorage(settings.media_root)
-    # Profile provisioning is deferred until an AGY-backed job is claimed so
+    # Profile provisioning is deferred until a provider-backed job is claimed so
     # missing credentials cannot take the worker process down at startup.
-    agy_home = settings.agy_home
-    extractor = ConfiguredAgyExtractor(settings)
+    extractor = ConfiguredStructuredExtractor(settings)
     intake = IntakeService(extractor, scope_policy=SearchScopePolicy.require_explicit())
     research_executor = _build_research_executor(settings, pool, profile_extractor=extractor)
-    if settings.voice_provider == "assemblyai":
+    if settings.voice_provider == "agy":
+        transcriber = ConfiguredAgyAudioTranscriber(settings)
+    elif settings.voice_provider == "assemblyai":
         transcriber = AssemblyAITranscriber(
             settings.require_assemblyai_api_key(),
             timeout_seconds=settings.assemblyai_timeout_seconds,
@@ -294,10 +297,7 @@ def _start_worker_tasks(
         ) if settings.supplier_media_enabled else None
     )
     kazakh_transcriber = (
-        KazakhAudioTranscriber(
-            executable=settings.agy_executable, model=settings.agy_model,
-            timeout_seconds=settings.agy_timeout_seconds, home_dir=agy_home,
-        ) if settings.supplier_media_enabled else None
+        ConfiguredAgyAudioTranscriber(settings) if settings.supplier_media_enabled else None
     )
     if not settings.telegram_api_base_url:
         download_limit = min(download_limit, settings.telegram_cloud_download_limit_bytes)
@@ -442,7 +442,7 @@ def _build_research_executor(
             separate_contacts=True,
         )
     if settings.staged_research_enabled and profile_extractor is None:
-        profile_extractor = ConfiguredAgyExtractor(settings)
+        profile_extractor = ConfiguredStructuredExtractor(settings)
     if settings.parallel_research_enabled:
         return ParallelResearchRunExecutor(
             pool,

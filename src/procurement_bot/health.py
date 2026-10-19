@@ -7,10 +7,37 @@ import asyncpg
 
 def provider_auth_snapshot(settings) -> dict[str, Any]:
     """Check configured credential availability without exposing or refreshing it."""
-    try:
-        settings._available_agy_auth_token()
-    except (ValueError, OSError):
-        return {"available": False, "reason": "provider_auth_missing"}
+    import os
+    from pathlib import Path
+
+    text_provider = getattr(settings, "structured_text_provider", "agy")
+    if text_provider == "codex":
+        try:
+            executables = (settings.codex_text_executable, settings.codex_text_node_executable)
+            if not all(path.is_file() and os.access(path, os.X_OK) for path in executables):
+                return {"available": False, "reason": "text_provider_executable_missing"}
+            # Metadata only: do not open auth files or claim account/model eligibility.
+            auth = Path(settings.codex_text_codex_home) / "auth.json"
+            if not auth.is_file() or auth.stat().st_size == 0:
+                return {"available": False, "reason": "provider_auth_missing"}
+        except OSError:
+            return {"available": False, "reason": "provider_auth_missing"}
+    agy_browser_required = (
+        getattr(settings, "browser_research_enabled", False)
+        and not (getattr(settings, "staged_research_enabled", False)
+                 and getattr(settings, "staged_research_primary", "agy") == "codex")
+    )
+    agy_required = (
+        text_provider == "agy"
+        or getattr(settings, "voice_provider", "disabled") == "agy"
+        or getattr(settings, "supplier_media_enabled", False)
+        or agy_browser_required
+    )
+    if agy_required:
+        try:
+            settings._available_agy_auth_token()
+        except (ValueError, OSError):
+            return {"available": False, "reason": "provider_auth_missing"}
     return {"available": True, "reason": "credentials_present_not_account_verified"}
 
 

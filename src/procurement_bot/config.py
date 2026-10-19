@@ -61,6 +61,17 @@ class Settings(BaseSettings):
     telegram_cloud_download_limit_bytes: int = Field(default=20 * 1024 * 1024, ge=1)
     max_audio_duration_seconds: int = Field(default=3600, ge=1, le=86_400)
 
+    # Explicit choice only; missing AGY auth never switches providers.
+    structured_text_provider: Literal["agy", "codex"] = "agy"
+    codex_text_executable: Path = Path.home() / ".local/bin/codex"
+    codex_text_node_executable: Path = Path.home() / ".local/bin/node"
+    codex_text_home: Path = Path.home()
+    codex_text_codex_home: Path = Path.home() / ".codex"
+    codex_text_model: Literal["gpt-6.1-sol"] = "gpt-6.1-sol"
+    codex_text_reasoning_effort: Literal["low", "medium", "high", "xhigh"] = "xhigh"
+    codex_text_timeout_seconds: float = Field(default=45, gt=0, le=60, allow_inf_nan=False)
+    codex_text_concurrency: int = Field(default=2, ge=1, le=8)
+
     agy_executable: str = "agy"
     agy_model: str = "gemini-3.8-flash-high"
     agy_timeout_seconds: int = Field(default=240, ge=30, le=1800)
@@ -87,7 +98,7 @@ class Settings(BaseSettings):
     codex_2gis_reasoning_effort: Literal["low", "medium", "high"] = "high"
     codex_2gis_timeout_seconds: int = Field(default=900, ge=30, le=1800)
 
-    voice_provider: str = "assemblyai"
+    voice_provider: str = "agy"
     assemblyai_env_file: Path = Path.home() / "audio_transcription" / ".env"
     assemblyai_key_name: str = "ASSEMBLI_AI_5"
     assemblyai_timeout_seconds: int = Field(default=10_800, ge=30, le=21_600)
@@ -112,6 +123,10 @@ class Settings(BaseSettings):
     waha_webhook_port: int = Field(default=8081, ge=1, le=65535)
 
     @field_validator(
+        "codex_text_executable",
+        "codex_text_node_executable",
+        "codex_text_home",
+        "codex_text_codex_home",
         "media_root",
         "results_root",
         "agy_home",
@@ -135,8 +150,8 @@ class Settings(BaseSettings):
     @classmethod
     def valid_voice_provider(cls, value: str) -> str:
         normalized = value.casefold().strip()
-        if normalized not in {"assemblyai", "disabled"}:
-            raise ValueError("VOICE_PROVIDER must be assemblyai or disabled")
+        if normalized not in {"agy", "assemblyai", "disabled"}:
+            raise ValueError("VOICE_PROVIDER must be agy, assemblyai or disabled")
         return normalized
 
     @field_validator("assemblyai_key_name")
