@@ -938,8 +938,11 @@ class JobWorker:
             raise PermanentProviderError("prepare_research payload is invalid")
         if self.research_executor is not None:
             try:
+                from procurement_bot.city_tier_runtime import city_budget_from_executor
+
                 if await autostart_snapshotted_research(
                     self.pool, case_id=case_id, intake_version=intake_version,
+                    city_budget=city_budget_from_executor(self.research_executor),
                 ):
                     return
             except ResearchPolicyDenied as exc:
@@ -1160,6 +1163,16 @@ class JobWorker:
 
     async def _finish_research_result(self, result: Any, run_id: UUID) -> None:
         """Idempotent terminal hooks shared by legacy runs and child batches."""
+        from procurement_bot.city_tier_runtime import city_tick
+
+        async with self.pool.acquire() as connection:
+            if await connection.fetchrow(
+                "SELECT research_run_id FROM research_city_admissions WHERE research_run_id=$1",
+                run_id,
+            ):
+                # Re-read native state; a returned result is not exhaustion proof.
+                await city_tick(connection, result.case_id)
+                return
         if result.status == "failed":
             async with self.pool.acquire() as connection, connection.transaction():
                 chat_id = await connection.fetchval(

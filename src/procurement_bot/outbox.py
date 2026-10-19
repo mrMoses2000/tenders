@@ -118,6 +118,12 @@ class TelegramOutboxWorker:
             return False
         heartbeat = asyncio.create_task(self._heartbeat(event))
         try:
+            from procurement_bot.city_tier_runtime import checkpoint_delivery_allowed
+
+            if event.idempotency_key.startswith("telegram.city-checkpoint:"):
+                async with self.pool.acquire() as connection:
+                    if not await checkpoint_delivery_allowed(connection, event.id):
+                        raise RetryableProviderError("city_checkpoint_delivery_held")
             payload = parse_telegram_outbox_payload(event.event_type, event.payload)
             if isinstance(payload, TelegramSendMessagePayload):
                 sent = await self.bot.send_message(**to_aiogram_kwargs(payload))

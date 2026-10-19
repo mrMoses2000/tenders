@@ -54,6 +54,7 @@ async def build_case_report(
     research_run_id: UUID | None = None,
     refresh_key: str | None = None,
     partial_research_snapshot: bool = False,
+    checkpoint_id: UUID | None = None,
 ) -> ReportBuildResult:
     """Build one conservative HTML report and publish its metadata atomically.
 
@@ -71,6 +72,10 @@ async def build_case_report(
 
     if partial_research_snapshot and not refresh_key:
         raise ValueError("partial research report requires a distinct refresh key")
+    if checkpoint_id is not None and (
+        not partial_research_snapshot or refresh_key != f"city-checkpoint:{checkpoint_id}"
+    ):
+        raise ValueError("city checkpoint report requires its exact partial refresh key")
 
     async with connection.transaction():
         await connection.execute(
@@ -555,9 +560,14 @@ async def build_case_report(
                     + _telegram_announcement(summary)
                 ),
             },
-            idempotency_key=stable_key("telegram.report-ready", artifact.id),
+            idempotency_key=stable_key(
+                "telegram.city-checkpoint" if checkpoint_id else "telegram.report-ready",
+                artifact.id,
+            ),
         )
         for item in items:
+            if checkpoint_id is not None:
+                break
             ranked_cards = sorted(
                 (
                     card
@@ -635,7 +645,9 @@ async def _load_research_run(
         raise ReportBuildRejected("research run does not exist")
     if run["case_id"] != case_id:
         raise ReportBuildRejected("research run belongs to a different case")
-    if run["status"] not in {*_TERMINAL_RESEARCH_STATUSES, *(["running"] if allow_running else [])}:
+    if run["status"] not in {
+        *_TERMINAL_RESEARCH_STATUSES, *(["running", "failed"] if allow_running else []),
+    }:
         raise ReportBuildRejected("research run is not complete enough for reporting")
     return run
 

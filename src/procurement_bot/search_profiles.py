@@ -271,7 +271,40 @@ async def load_search_item_snapshot(
     frozen_area = str(locality.get("raw_area_text") or "").strip().casefold()
     case_area = str(row["search_area_text"] or "").strip().casefold()
     if frozen_city and case_city and frozen_city != case_city:
-        raise SearchProfileConflict("case city differs from the frozen source plan")
+        try:
+            admission = await connection.fetchrow(
+                """SELECT snapshot_id,case_id,tier,city FROM research_city_admissions
+                WHERE research_run_id=$1 AND case_id=$2""",
+                research_run_id,
+                row["case_id"],
+            )
+            if admission is None or admission["tier"] not in {1, 2}:
+                raise SearchProfileConflict("case city differs from the frozen source plan")
+            from procurement_bot.city_tier_runtime import validate_city_admission
+            from procurement_bot.owner_autonomy import load_valid_snapshot
+
+            policy_snapshot = await load_valid_snapshot(
+                connection, snapshot_id=admission["snapshot_id"], case_id=row["case_id"],
+            )
+            verified = await validate_city_admission(
+                connection, policy_snapshot, research_run_id,
+            )
+            binding = verified["binding"] if verified is not None else {}
+            item_ids = binding.get("item_ids", [])
+            item_indices = binding.get("item_indices", [])
+            if (
+                admission["city"] != locality.get("city")
+                or binding.get("case_id") != str(row["case_id"])
+                or binding.get("research_run_id") != str(research_run_id)
+                or binding.get("snapshot_id") != str(admission["snapshot_id"])
+                or item_index not in item_indices
+                or str(row["request_item_id"]) not in item_ids
+            ):
+                raise SearchProfileConflict("later city lacks an exact immutable admission")
+        except SearchProfileConflict:
+            raise
+        except Exception as exc:
+            raise SearchProfileConflict("later city admission could not be validated") from exc
     if frozen_area != case_area:
         raise SearchProfileConflict("case locality differs from the frozen source plan")
     context: dict[str, Any] = {

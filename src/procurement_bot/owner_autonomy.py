@@ -515,8 +515,10 @@ async def bind_research_policy(
         scope = json.loads(scope)
     plan = scope.get("plan") if isinstance(scope, dict) else None
     first_city = row["snapshot"]["policy"]["ordered_cities"][0]
+    from procurement_bot.city_tier_runtime import validate_city_admission
+    admission = await validate_city_admission(connection, row, run_id)
     if (actual_plan_sha256 != plan_sha256 or not isinstance(plan, dict)
-            or plan.get("city") != first_city):
+            or (admission is None and plan.get("city") != first_city)):
         raise ResearchPolicyDenied("research plan hash or initial city differs from policy")
     instruction_ids = scope.get("sourcing_instruction_ids", [])
     if not isinstance(instruction_ids, list) or any(
@@ -570,6 +572,8 @@ async def validate_research_policy_binding(
         raise ResearchPolicyDenied("authorized run plan is invalid") from exc
     if actual_plan_sha256 != plan_sha256:
         raise ResearchPolicyDenied("authorized run plan changed after binding")
+    from procurement_bot.city_tier_runtime import validate_city_admission
+    await validate_city_admission(connection, row, run_id)
     scope = run["search_scope"]
     if isinstance(scope, str):
         import json
@@ -587,6 +591,7 @@ async def validate_research_policy_binding(
 
 async def autostart_snapshotted_research(
     pool: asyncpg.Pool, *, case_id: UUID, intake_version: int,
+    city_budget: dict[str, int] | None = None,
 ) -> bool:
     """Prepare/request/approve/start atomically through the canonical native helpers.
 
@@ -610,6 +615,31 @@ async def autostart_snapshotted_research(
         if snapshot is None or not snapshot["snapshot"]["automatic_start_eligible"]:
             return False
         valid = await load_valid_snapshot(connection, snapshot_id=snapshot["id"], case_id=case_id)
+        from procurement_bot.city_tier_runtime import (
+            bootstrap_existing_first_city_run,
+            city_route,
+            start_city_research,
+        )
+        if city_route(valid["snapshot"]):
+            runtime = await connection.fetchrow(
+                """SELECT research_run_id FROM case_pipeline_runtime WHERE case_id=$1 FOR UPDATE""",
+                case_id,
+            )
+            if runtime is not None and runtime["research_run_id"] is not None:
+                exists = await connection.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM research_city_admissions "
+                    "WHERE research_run_id=$1)",
+                    runtime["research_run_id"],
+                )
+                if not exists:
+                    await bootstrap_existing_first_city_run(
+                        connection, valid, runtime["research_run_id"], city_budget=city_budget,
+                    )
+            elif city_budget is not None:
+                await start_city_research(connection, valid, 0, city_budget=city_budget)
+            else:
+                raise ResearchPolicyDenied("parallel native executor budget is unavailable")
+            return True
         request = ParsedProcurementRequest.model_validate(valid["normalized_payload"])
         instructions = await connection.fetch(
             """SELECT d.id,d.request_item_id,d.disposition,d.quantity,i.line_number,
@@ -689,6 +719,7 @@ async def guard_profile_research_work(
     async with pool.acquire() as connection, connection.transaction():
         runtime = await connection.fetchrow(
             """SELECT rt.case_id,rt.research_run_id,rt.research_policy_snapshot_id,
+            rt.enabled,rt.paused,
             a.id AS authorization_id,a.binding_sha256,a.plan_sha256,r.search_scope,
             c.owner_user_id FROM case_pipeline_runtime rt
             JOIN procurement_cases c ON c.id=rt.case_id
@@ -700,6 +731,13 @@ async def guard_profile_research_work(
         )
         if runtime is None:
             return True
+        city_run = run_id is not None and await connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM research_city_admissions WHERE research_run_id=$1)",
+            run_id,
+        )
+        if city_run and (runtime["research_run_id"] != run_id
+                         or not runtime["enabled"] or runtime["paused"]):
+            return False  # held/historical work cannot replace or pause a newer city run
         try:
             if runtime["authorization_id"] is None:
                 raise ResearchPolicyDenied("profile runtime has no exact run authorization")

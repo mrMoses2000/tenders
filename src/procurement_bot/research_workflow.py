@@ -259,8 +259,20 @@ async def start_approved_research(
             )
         if approval["status"] != "approved" or not approval["is_live"]:
             raise ResearchStartDenied("approval is not approved and unexpired")
+        city_tier = None
+        if policy_snapshot is not None:
+            from procurement_bot.city_tier_runtime import activate_city_admission
+            try:
+                city_tier = await activate_city_admission(
+                    connection, policy_snapshot, payload.research_run_id,
+                )
+            except ValueError as exc:
+                raise ResearchStartDenied(str(exc)) from exc
         if case["status"] != _STARTABLE_CASE_STATUS and not (
             allow_followup and case["status"] in {"evaluating", "report_ready"}
+        ) and not (
+            city_tier is not None
+            and case["status"] in {"researching", "contacting", "evaluating", "report_ready"}
         ):
             raise ResearchStartDenied("procurement case is not ready for research")
         if run["status"] != _STARTABLE_RUN_STATUS:
@@ -281,10 +293,12 @@ async def start_approved_research(
             """
             UPDATE procurement_cases
             SET status='researching',updated_at=now()
-            WHERE id=$1 AND (status='ready' OR ($2 AND status IN ('evaluating','report_ready')))
+            WHERE id=$1 AND (status='ready' OR ($2 AND status IN ('evaluating','report_ready'))
+                OR ($3 AND status IN ('researching','contacting','evaluating','report_ready')))
             """,
             payload.case_id,
             allow_followup,
+            city_tier is not None,
         )
         if case_updated != "UPDATE 1":
             raise ResearchStartDenied("procurement case changed before research start")
@@ -317,12 +331,21 @@ async def start_approved_research(
             # Dispatching the existing partial report at this time is a later hook.
             await connection.execute(
                 """UPDATE case_pipeline_runtime SET research_policy_snapshot_id=$2,
-                active_city_tier=0,report_checkpoint_at=COALESCE(report_checkpoint_at,
+                active_city_tier=$5,report_checkpoint_at=COALESCE(report_checkpoint_at,
                 (SELECT started_at FROM research_runs WHERE id=$3)+$4*interval '1 hour')
                 WHERE case_id=$1""", payload.case_id, policy_snapshot["id"],
                 payload.research_run_id,
                 policy_snapshot["snapshot"]["policy"]["report_checkpoint_hours"],
+                city_tier or 0,
             )
+            if city_tier is not None:
+                await connection.execute(
+                    """INSERT INTO research_city_report_checkpoints(case_id,snapshot_id,
+                    start_run_id,started_at,due_at) SELECT $1,$2,id,started_at,
+                    started_at+interval '4 hours' FROM research_runs WHERE id=$3
+                    ON CONFLICT(case_id,snapshot_id) DO NOTHING""", payload.case_id,
+                    policy_snapshot["id"], payload.research_run_id,
+                )
         event_inserted = await connection.fetchval(
             """
             INSERT INTO workflow_events(

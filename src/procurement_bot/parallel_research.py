@@ -467,6 +467,13 @@ class ParallelResearchRunExecutor:
                       AND procurement_case.status IN ('researching','contacting')
                       AND job.status='running' AND job.locked_by=$4
                       AND job.lease_expires_at>now()
+                      AND (NOT EXISTS (SELECT 1 FROM research_city_admissions a
+                          WHERE a.research_run_id=run.id) OR EXISTS (
+                          SELECT 1 FROM research_city_item_cursors ci
+                          JOIN case_pipeline_runtime rt ON rt.case_id=ci.case_id
+                          WHERE ci.request_item_id=grp.request_item_id
+                            AND ci.current_run_id=run.id AND rt.research_run_id=run.id
+                            AND rt.enabled AND NOT rt.paused))
                     FOR UPDATE OF checkpoint
                     """,
                     task_id,
@@ -910,6 +917,9 @@ class ParallelResearchRunExecutor:
         async with _connection(self.database) as connection:
             async with connection.transaction():
                 await connection.execute("SELECT pg_advisory_xact_lock($1)", _SCHEDULER_LOCK_KEY)
+                from procurement_bot.city_tier_runtime import prepare_city_resume
+
+                await prepare_city_resume(connection, run_id)
                 await connection.execute(
                     """UPDATE case_pipeline_runtime SET paused=false,next_tick_at=now(),
                     wake_reason='owner_resume' WHERE research_run_id=$1""",
@@ -967,6 +977,11 @@ class ParallelResearchRunExecutor:
                 """SELECT cp.* FROM research_branch_checkpoints cp
                 JOIN research_item_groups g ON g.id=cp.group_id
                 WHERE cp.research_run_id=$1 AND cp.status IN ('failed','succeeded')
+                  AND (NOT EXISTS (SELECT 1 FROM research_city_admissions a
+                      WHERE a.research_run_id=cp.research_run_id) OR EXISTS (
+                      SELECT 1 FROM research_city_item_cursors ci
+                      WHERE ci.request_item_id=g.request_item_id
+                        AND ci.current_run_id=cp.research_run_id))
                   AND g.eligible_suppliers<g.target_suppliers
                   AND (cp.recovery_due_at IS NULL OR cp.recovery_due_at<=now())
                   AND ((cp.status='failed' AND (
@@ -2130,6 +2145,13 @@ class ParallelResearchRunExecutor:
               AND procurement_case.status IN ('researching','contacting')
               AND job.status='running' AND job.locked_by=$4
               AND job.lease_expires_at>now()
+              AND (NOT EXISTS (SELECT 1 FROM research_city_admissions a
+                  WHERE a.research_run_id=run.id) OR EXISTS (
+                  SELECT 1 FROM research_city_item_cursors ci
+                  JOIN case_pipeline_runtime rt ON rt.case_id=ci.case_id
+                  WHERE ci.request_item_id=grp.request_item_id
+                    AND ci.current_run_id=run.id AND rt.research_run_id=run.id
+                    AND rt.enabled AND NOT rt.paused))
             FOR UPDATE OF cp,job
             """,
             task_id,

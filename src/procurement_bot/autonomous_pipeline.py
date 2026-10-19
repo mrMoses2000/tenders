@@ -362,6 +362,12 @@ def _report_signature(value):
 
 async def run_pipeline_tick(worker, case_id: UUID) -> None:
     async with worker.pool.acquire() as c:
+        from procurement_bot.city_tier_runtime import city_budget_from_executor, city_tick
+
+        await city_tick(
+            c, case_id, results_root=getattr(worker, "results_root", None),
+            city_budget=city_budget_from_executor(getattr(worker, "research_executor", None)),
+        )
         runtime = await c.fetchrow(
             "SELECT research_run_id,last_tick_summary FROM case_pipeline_runtime WHERE case_id=$1",
             case_id,

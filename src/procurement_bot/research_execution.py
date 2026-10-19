@@ -956,12 +956,19 @@ class ResearchRunExecutor:
                 )
                 target_case_status = "report_ready" if has_report else "ready"
             case = await connection.fetchrow(
-                "SELECT id,status FROM procurement_cases WHERE id=$1 FOR UPDATE",
+                """SELECT id,status,EXISTS(SELECT 1 FROM research_city_admissions
+                    WHERE research_run_id=$2) AS city_run
+                FROM procurement_cases WHERE id=$1 FOR UPDATE""",
                 case_id,
+                run_id,
             )
             if case is None:
                 raise ResearchExecutionRejected("procurement case does not exist")
-            if case["status"] == "researching":
+            if case.get("city_run", False):
+                # A city result owns only this historical run. The city tick owns
+                # item progression and the one case pointer, including stale completions.
+                pass
+            elif case["status"] == "researching":
                 updated = await connection.execute(
                     """
                     UPDATE procurement_cases
