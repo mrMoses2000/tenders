@@ -143,17 +143,20 @@ Every row below fails on both initial combined HEAD and clean `5f2ba1f`; none is
 ## Remaining gaps and protected-file boundary
 
 - **City runtime is not implemented in this checkpoint.** No migration 046, immutable per-city authorization/outcome repository, Taraz → Shymkent → Almaty transition, current-pointer stale-completion fence, failure resumption or idempotent four-hour report dispatch has been added. The existing pure city policy is not presented as runtime coverage. The requested batched original-item-ID tier behavior still needs implementation and PostgreSQL tests.
-- **Four purchased-item exclusions are not covered/applied.** Current source-bound sourcing dispositions remain evidence-only in the incoming owner implementation. No claim is made that this harness skips four purchased lines or prevents later-tier inclusion. Original item identity/ambiguity is tested for the two-line fixture only.
+- **The four current-case purchased-item exclusions are not applied by this synthetic suite.** The owner implementation can skip exact source-bound lines, and this checkpoint proves an index-0 skip preserves original index 1 and the original second item UUID through the actual offer. The real four item dispositions still require a private owner-reviewed plan/preflight; no current case was adopted.
+- **Partial owner reductions are not purchase-ready.** The requested plan can be reduced while the canonical request item remains unchanged. Comparison/accounting does not yet consume a typed source-backed remaining-demand quantity; only full skip semantics are covered.
 - **Delivery terms are preserved as raw supplier evidence, not projected facts.** `offer_observations.raw_payload.text` retains the complete delivery sentence. Quote snapshots currently select amount/unit/stock fields, and protected `mini_app.py:_public_quote_facts` does not allow delivery terms. A future typed, source-backed delivery-term projection requires a reviewed schema/reply/snapshot change and a minimal protected MiniApp allowlist/projection update; that file was not touched.
 - **Report generation/timer dispatch is not connected.** Native terminal report jobs stay queued outside this test's selected stage drains. There is no all-search-completion or four-hour-report claim.
 - **Historical unknown sends/quarantine are not exercised or modified.** No migration 045 or pilot-grant framework. No old unknown action was queried, resent, converted to not-sent, or cleared from exposure. The global unknown gate's interaction with new scoped sends remains unconnected here.
 - The harness injects fake structured intake for its four full flows, a fake browser port, fake Telegram download and fake WAHA methods. Native browser validation, offer persistence, auth and durable job/outbox code run; live provider capacity, HTTP adapter behavior, deployment and production readiness are unverified. Two currency checks separately use the native table parser.
-- The existing account-pin authorization race described in the strategy remains outside this minimal worker fix.
+- The existing account-pin authorization race described in the strategy remains outside this minimal worker fix. Adoption can race a claimed pre-adoption manual prepare job; the reviewed current-case release path must first verify zero pending/running jobs and no run, while the general case needs a transaction-level case fence.
 
 ## Exact writer paths
 
 - `src/procurement_bot/worker.py` — only `_prepare_supplier_outreach`, four added / thirteen removed lines.
-- `tests/test_uran_connected_postgres.py` — new connected PostgreSQL harness and generated fixtures.
+- `tests/test_uran_connected_postgres.py` — connected PostgreSQL harness and generated fixtures, including a source-bound first-item skip/retry proof that leaves a native offer bound to the original second item UUID.
+- `src/procurement_bot/research_repository.py`, `src/procurement_bot/owner_autonomy.py`, and `src/procurement_bot/research_execution.py` — additive, strict sourcing instruction metadata is persisted before idempotency comparison; retries reuse the same exact scope, and executor accepts only the legacy shape or the canonical metadata extension.
+- `tests/test_research_repository.py` — rejects malformed, noncanonical, and duplicate instruction IDs before database writes.
 - `docs/uranenergo-2026-10-19/integration-strategy.md` — preserve root decisions, update approved scope/revisions and observed bootstrap fix.
 - `docs/uranenergo-2026-10-19/integration-checkpoint.md` — this handoff and diagnostics.
 

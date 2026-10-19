@@ -19,6 +19,8 @@ from procurement_bot.research_repository import (
     research_job_payload,
 )
 
+_DUPLICATE_INSTRUCTION_ID = str(uuid4())
+
 
 def _plan():
     request = ParsedProcurementRequest(
@@ -274,3 +276,26 @@ async def test_completion_requires_running_and_failure_code() -> None:
             status="partial",
             error_code="some_sources_failed",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "instruction_ids",
+    [
+        ["not-a-uuid"],
+        ["AABBCCDD-0000-0000-0000-000000000001"],
+        [_DUPLICATE_INSTRUCTION_ID, _DUPLICATE_INSTRUCTION_ID],
+    ],
+)
+async def test_invalid_sourcing_instruction_metadata_is_rejected_before_write(
+    instruction_ids: list[str],
+) -> None:
+    connection = _Connection()
+    with pytest.raises(ValueError, match="sourcing instruction IDs"):
+        await persist_research_plan(
+            connection,  # type: ignore[arg-type]
+            case_id=uuid4(),
+            plan=_plan(),
+            sourcing_instruction_ids=instruction_ids,
+        )
+    assert not connection.runs_by_id

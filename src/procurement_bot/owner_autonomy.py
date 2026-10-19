@@ -640,12 +640,8 @@ async def autostart_snapshotted_research(
         )
         persisted = await persist_research_plan(
             connection, case_id=case_id, plan=plan, requested_by=valid["owner_user_id"],
+            sourcing_instruction_ids=instruction_ids,
         )
-        if instruction_ids:
-            await connection.execute(
-                "UPDATE research_runs SET search_scope=search_scope || $2::jsonb WHERE id=$1",
-                persisted.id, {"sourcing_instruction_ids": instruction_ids},
-            )
         binding = await bind_research_policy(
             connection, snapshot_id=valid["id"], case_id=case_id,
             run_id=persisted.id, plan_sha256=plan.plan_sha256,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
@@ -199,6 +199,7 @@ async def persist_research_plan(
     case_id: UUID,
     plan: ResearchPlan,
     requested_by: UUID | None = None,
+    sourcing_instruction_ids: Sequence[str] = (),
 ) -> PersistedResearchRun:
     """Atomically persist one immutable plan and every source branch.
 
@@ -211,6 +212,23 @@ async def persist_research_plan(
         raise ResearchPersistenceConflict("plan_sha256 does not match the plan payload")
     idempotency_key = research_run_idempotency_key(case_id, plan.plan_sha256)
     search_scope = _run_payload(plan)
+    instruction_ids = tuple(sourcing_instruction_ids)
+    canonical_ids: list[str] = []
+    for value in instruction_ids:
+        if not isinstance(value, str):
+            raise ValueError("sourcing instruction IDs must be canonical UUID strings")
+        try:
+            canonical = str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("sourcing instruction IDs must be canonical UUID strings") from exc
+        if value != canonical:
+            raise ValueError("sourcing instruction IDs must be canonical UUID strings")
+        canonical_ids.append(canonical)
+    if len(set(canonical_ids)) != len(canonical_ids):
+        raise ValueError("sourcing instruction IDs must be unique")
+    instruction_ids = tuple(canonical_ids)
+    if instruction_ids:
+        search_scope["sourcing_instruction_ids"] = list(instruction_ids)
     async with connection.transaction():
         proposed_id = uuid4()
         row = await connection.fetchrow(

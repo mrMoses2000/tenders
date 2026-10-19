@@ -215,8 +215,26 @@ def _validate_query_row(row: Mapping[str, Any], branch: SourcePlan, ordinal: int
 
 def _parse_plan(search_scope: object) -> ResearchPlan:
     scope = _mapping(search_scope, field="research run search_scope")
-    if set(scope) != {"contract_version", "plan_sha256", "plan"}:
+    base_fields = {"contract_version", "plan_sha256", "plan"}
+    fields = set(scope)
+    valid_shapes = {
+        frozenset(base_fields),
+        frozenset(base_fields | {"sourcing_instruction_ids"}),
+    }
+    if fields not in valid_shapes:
         raise ResearchPlanDrift("research run search_scope has an unknown shape")
+    if "sourcing_instruction_ids" in scope:
+        instruction_ids = scope["sourcing_instruction_ids"]
+        if not isinstance(instruction_ids, list) or any(
+            not isinstance(value, str) for value in instruction_ids
+        ):
+            raise ResearchPlanDrift("sourcing instruction IDs must be a UUID string array")
+        try:
+            canonical_ids = [str(UUID(value)) for value in instruction_ids]
+        except ValueError as exc:
+            raise ResearchPlanDrift("sourcing instruction IDs must be canonical UUIDs") from exc
+        if canonical_ids != instruction_ids or len(set(canonical_ids)) != len(canonical_ids):
+            raise ResearchPlanDrift("sourcing instruction IDs must be unique canonical UUIDs")
     if scope["contract_version"] != 1:
         raise ResearchPlanDrift("unsupported research plan contract version")
     raw_plan = _mapping(scope["plan"], field="research run plan")

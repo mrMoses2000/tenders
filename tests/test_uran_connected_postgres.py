@@ -25,13 +25,17 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from docx import Document
 
-from procurement_bot.approvals import approve_request
+from procurement_bot.approvals import approve_request, payload_sha256
 from procurement_bot.config import Settings
 from procurement_bot.db import _init_connection, run_migrations
 from procurement_bot.intake import IntakeService, ParsedProcurementRequest, ProcurementRequestPatch
 from procurement_bot.mini_app import create_mini_app
 from procurement_bot.outbox import WhatsAppOutboxWorker
-from procurement_bot.owner_autonomy import ResearchAutomationPolicy, replace_research_profile
+from procurement_bot.owner_autonomy import (
+    ResearchAutomationPolicy,
+    record_sourcing_disposition,
+    replace_research_profile,
+)
 from procurement_bot.parallel_research import ParallelResearchRunExecutor
 from procurement_bot.providers.browser import BROWSER_SPEC_SHA256, SupplierBrowserResult
 from procurement_bot.providers.waha import WahaAccountIdentity, WahaContactCheck, WahaSendResult
@@ -268,7 +272,7 @@ async def drain(state, *kinds):
     assert not failures, [dict(row) for row in failures]
 
 
-async def ingest(state, kind, *, opted_in, table_currency=None):
+async def ingest(state, kind, *, opted_in, ambiguous=None, autostart=True, table_currency=None):
     path = state.root / f"synthetic.{kind}"
     body = "Synthetic cable 2 m; Synthetic mat 1 piece; source price USD 17"
     if kind == "pdf":
@@ -299,7 +303,7 @@ async def ingest(state, kind, *, opted_in, table_currency=None):
         document.save(path)
     state.bot = SyntheticTelegram(path.read_bytes())
     state.storage = LocalContentAddressedStorage(state.root / "objects")
-    state.extractor = SyntheticExtractor(ambiguous=opted_in)
+    state.extractor = SyntheticExtractor(ambiguous=opted_in if ambiguous is None else ambiguous)
     # Owner enrollment is an authenticated application operation, before intake.
     owner = await state.pool.fetchval(
         "INSERT INTO users(telegram_id,display_name) VALUES($1,'Synthetic owner') RETURNING id",
@@ -315,7 +319,7 @@ async def ingest(state, kind, *, opted_in, table_currency=None):
                 policy=ResearchAutomationPolicy(ordered_cities=CITIES),
                 consent_reference="synthetic-owner-action",
                 consent_text="Public research only.",
-                research_autostart=True,
+                research_autostart=autostart,
             )
     kwargs = dict(
         update_id=900_400,
@@ -601,3 +605,80 @@ async def test_native_docx_currency_guard_without_structured_extraction(connecte
     assert parsed["normalized_payload"]["warnings"]
     assert state.extractor.calls == []
     assert await state.pool.fetchval("SELECT count(*) FROM request_item_financials") == 0
+
+
+async def test_source_bound_skip_first_item_keeps_second_offer_bound_to_original_uuid(connected_pg):
+    state = connected_pg
+    await ingest(state, "pdf", opted_in=True, ambiguous=False)
+    original = await state.pool.fetch(
+        "SELECT id,line_number,quantity,unit FROM request_items WHERE case_id=$1 "
+        "ORDER BY line_number",
+        state.case,
+    )
+    assert len(original) == 2
+    first, second = original
+    assert (first["line_number"], second["line_number"]) == (1, 2)
+
+    async with state.pool.acquire() as connection:
+        parse = await connection.fetchrow(
+            "SELECT id,normalized_payload FROM case_parse_versions "
+            "WHERE case_id=$1 AND status='applied'",
+            state.case,
+        )
+        disposition_id = await record_sourcing_disposition(
+            connection,
+            owner_id=state.owner,
+            case_id=state.case,
+            item_id=first["id"],
+            artifact_id=None,
+            artifact_sha256="c" * 64,
+            source_kind="operator_attestation",
+            source_reference="synthetic owner skip for first line",
+            disposition="skip",
+            quantity=None,
+            unit=first["unit"],
+            owner_assertion="The exact first synthetic item is already purchased.",
+            exact_match_rationale="The first stable item UUID is explicitly identified.",
+            idempotency_key="synthetic-index-hole-skip-first",
+            applies_to_sourcing=True,
+            expected_source_payload_sha256=payload_sha256(parse["normalized_payload"]),
+        )
+
+    await drain(state, "prepare_research")
+    run = await state.pool.fetchrow(
+        "SELECT id,search_scope FROM research_runs WHERE case_id=$1", state.case
+    )
+    plan = run["search_scope"]["plan"]
+    assert {branch["item_index"] for branch in plan["source_plans"]} == {1}
+    assert run["search_scope"]["sourcing_instruction_ids"] == [str(disposition_id)]
+    await new_worker(state)._prepare_research({"case_id": str(state.case), "intake_version": 1})
+    replayed = await state.pool.fetchrow(
+        "SELECT id,search_scope FROM research_runs WHERE case_id=$1", state.case
+    )
+    assert replayed["id"] == run["id"] and replayed["search_scope"] == run["search_scope"]
+    assert (
+        await state.pool.fetchval("SELECT count(*) FROM research_runs WHERE case_id=$1", state.case)
+        == 1
+    )
+    await drain(state, "execute_research", "parallel_research_task")
+    run_status = await state.pool.fetchrow(
+        "SELECT status,error_code FROM research_runs WHERE case_id=$1", state.case
+    )
+    job_states = await state.pool.fetch(
+        "SELECT kind,status,last_error_code FROM jobs ORDER BY created_at"
+    )
+    assert {call.item_index for call in state.browser.calls} == {1}, (
+        run_status,
+        [(row["kind"], row["status"], row["last_error_code"]) for row in job_states],
+    )
+    offers = await state.pool.fetch(
+        "SELECT request_item_id FROM offers WHERE request_item_id=ANY($1::uuid[])",
+        [first["id"], second["id"]],
+    )
+    assert [row["request_item_id"] for row in offers] == [second["id"]]
+    after = await state.pool.fetch(
+        "SELECT id,line_number,quantity,unit FROM request_items WHERE case_id=$1 "
+        "ORDER BY line_number",
+        state.case,
+    )
+    assert after == original
