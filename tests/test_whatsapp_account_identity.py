@@ -14,6 +14,7 @@ import pytest
 from procurement_bot.db import run_migrations
 from procurement_bot.providers.waha import WahaAccountIdentity
 from procurement_bot.whatsapp_account import (
+    WhatsAppAccountDenied,
     pin_whatsapp_account_identity,
 )
 from scripts.postgres_test_safety import configured_postgres_target, verify_postgres_test_connection
@@ -629,7 +630,9 @@ async def test_real_pre043_null_identity_rows_migrate_and_replay_without_provide
         "circuit_reason='unresolved_historical_provider_outcome'"
     )
     assert await run_migrations(pool, Path(__file__).parents[1] / "migrations") == [
-        "043_whatsapp_account_identity_binding.sql"
+        "043_whatsapp_account_identity_binding.sql",
+        "044_owner_research_autonomy.sql",
+        "045_whatsapp_operator_pin_quarantine.sql",
     ]
     # A migrated worker starts with fresh connection/statement caches.
     await pool.expire_connections()
@@ -1080,3 +1083,311 @@ async def test_outcome_waits_for_account_before_locking_action_reservation(
         if pending is not None and not pending.done():
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
+
+
+
+@pytest.mark.postgres
+async def test_keyed_pin_retry_returns_original_version_without_second_provider_read(identity_pg):
+    pool, owner_id, _conversation_id, _contact_id = identity_pg
+
+    class CountedIdentityClient(_IdentityClient):
+        calls = 0
+
+        async def get_account_identity(self) -> WahaAccountIdentity:
+            self.calls += 1
+            return await super().get_account_identity()
+
+    from procurement_bot.whatsapp_operator import (
+        AuthenticatedOperatorContext,
+        pin_from_operator_context,
+    )
+
+    client = CountedIdentityClient(SELF_JID)
+    auth = AuthenticatedOperatorContext(
+        actor_user_id=owner_id,
+        authentication_source="synthetic_test_auth_context",
+    )
+    first = await pin_from_operator_context(
+        pool,
+        client,
+        auth=auth,
+        expected_account_jid=SELF_JID,
+        reason="stable_operator_pin",
+        idempotency_key="pin-command-0001",
+    )
+    retry = await pin_from_operator_context(
+        pool,
+        client,
+        auth=auth,
+        expected_account_jid=SELF_JID,
+        reason="stable_operator_pin",
+        idempotency_key="pin-command-0001",
+    )
+    with pytest.raises(PermissionError, match="another pin"):
+        await pin_from_operator_context(
+            pool,
+            client,
+            auth=auth,
+            expected_account_jid="77000000004@c.us",
+            reason="stable_operator_pin",
+            idempotency_key="pin-command-0001",
+        )
+    next_version = await pin_whatsapp_account_identity(
+        pool,
+        client,
+        actor_user_id=owner_id,
+        expected_account_jid=SELF_JID,
+        reason="intentional_repin",
+        operator_idempotency_key="pin-command-0002",
+    )
+
+    assert first == retry == 1
+    assert next_version == 2
+    assert client.calls == 2
+    assert await pool.fetchval(
+        """SELECT count(*) FROM whatsapp_account_control_events
+           WHERE session_name=$1 AND operator_idempotency_key IS NOT NULL""",
+        _IdentityClient.session_name,
+    ) == 2
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("race", ["case_owner_transfer", "actor_deactivation"])
+async def test_pin_rechecks_active_owner_after_provider_observation(identity_pg, race):
+    pool, owner_id, _conversation_id, _contact_id = identity_pg
+    other_owner = uuid4()
+    await pool.execute(
+        "INSERT INTO users(id,telegram_id,display_name) VALUES($1,$2,$3)",
+        other_owner,
+        int(uuid4().int % 2_000_000_000) + 2_000_000_000,
+        "Synthetic alternate owner",
+    )
+
+    class OwnershipRaceClient(_IdentityClient):
+        async def get_account_identity(self) -> WahaAccountIdentity:
+            if race == "case_owner_transfer":
+                await pool.execute(
+                    """UPDATE procurement_cases SET owner_user_id=$2
+                       WHERE id=(
+                           SELECT case_id FROM supplier_conversations WHERE session_name=$1
+                       )""",
+                    self.session_name,
+                    other_owner,
+                )
+            else:
+                await pool.execute("UPDATE users SET active=FALSE WHERE id=$1", owner_id)
+            return self.identity
+
+    with pytest.raises(PermissionError, match="own the active cases"):
+        await pin_whatsapp_account_identity(
+            pool,
+            OwnershipRaceClient(SELF_JID),
+            actor_user_id=owner_id,
+            expected_account_jid=SELF_JID,
+            reason="owner_changed_during_provider_observation",
+        )
+    assert not await pool.fetchval(
+        """SELECT pinned_account_jid IS NOT NULL
+           FROM whatsapp_account_controls WHERE session_name=$1""",
+        _IdentityClient.session_name,
+    )
+
+
+@pytest.mark.postgres
+async def test_exact_legacy_unknown_quarantine_preserves_unknown_and_independent_gates(identity_pg):
+    from procurement_bot.whatsapp_account import (
+        attest_legacy_unknown_inventory,
+        get_account_state,
+        load_legacy_unknown_inventory,
+    )
+
+    pool, owner_id, conversation_id, contact_id = identity_pg
+    event = await _seed_event(identity_pg)
+    from procurement_bot.whatsapp_account import ensure_account
+
+    async with pool.acquire() as connection:
+        await ensure_account(connection, _IdentityClient.session_name)
+    cutoff = await pool.fetchval(
+        """SELECT applied_at FROM schema_migrations
+           WHERE name='043_whatsapp_account_identity_binding.sql'"""
+    )
+    legacy_time = cutoff - timedelta(days=1)
+    await pool.execute(
+        """INSERT INTO whatsapp_account_send_reservations(
+               outbox_event_id,session_name,conversation_id,supplier_contact_id,state,
+               is_new_contact,reserved_at,outcome_source,created_at,updated_at
+           ) VALUES($1,$2,$3,$4,'unknown',TRUE,$5,'migration',$5,$5)""",
+        event.id,
+        _IdentityClient.session_name,
+        conversation_id,
+        contact_id,
+        legacy_time,
+    )
+    await pool.execute(
+        """UPDATE whatsapp_account_controls SET operator_held=TRUE,
+               circuit_open=TRUE,circuit_reason='keep_this_circuit'
+           WHERE session_name=$1""",
+        _IdentityClient.session_name,
+    )
+
+    snapshot = await load_legacy_unknown_inventory(
+        pool,
+        session_name=_IdentityClient.session_name,
+        actor_user_id=owner_id,
+    )
+    assert snapshot["reservation_ids"] == [event.id]
+    assert snapshot["reservation_count"] == 1
+    with pytest.raises(PermissionError, match="hash differs"):
+        await attest_legacy_unknown_inventory(
+            pool,
+            session_name=_IdentityClient.session_name,
+            actor_user_id=owner_id,
+            reservation_ids=snapshot["reservation_ids"],
+            inventory_sha256="0" * 64,
+            source_reference="handoff:synthetic-legacy-inventory",
+            reason="attested synthetic old unknown",
+            operator_idempotency_key="quarantine-command-01",
+        )
+    assert await pool.fetchval("SELECT count(*) FROM whatsapp_legacy_unknown_quarantines") == 0
+    attested = await attest_legacy_unknown_inventory(
+        pool,
+        session_name=_IdentityClient.session_name,
+        actor_user_id=owner_id,
+        reservation_ids=snapshot["reservation_ids"],
+        inventory_sha256=snapshot["inventory_sha256"],
+        source_reference="handoff:synthetic-legacy-inventory",
+        reason="attested synthetic old unknown",
+        operator_idempotency_key="quarantine-command-01",
+    )
+    replay = await attest_legacy_unknown_inventory(
+        pool,
+        session_name=_IdentityClient.session_name,
+        actor_user_id=owner_id,
+        reservation_ids=snapshot["reservation_ids"],
+        inventory_sha256=snapshot["inventory_sha256"],
+        source_reference="handoff:synthetic-legacy-inventory",
+        reason="attested synthetic old unknown",
+        operator_idempotency_key="quarantine-command-01",
+    )
+    reservation = await pool.fetchrow(
+        """SELECT state,pinned_account_jid,account_pin_version,
+                  observed_account_jid,account_identity_observed_at
+           FROM whatsapp_account_send_reservations WHERE outbox_event_id=$1""",
+        event.id,
+    )
+    with pytest.raises(asyncpg.RaiseError, match="immutable"):
+        await pool.execute(
+            "UPDATE whatsapp_legacy_unknown_quarantines SET reason='changed' WHERE id=$1",
+            attested["quarantine_id"],
+        )
+    async with pool.acquire() as connection:
+        state = await get_account_state(connection, _IdentityClient.session_name)
+    controls = await pool.fetchrow(
+        """SELECT operator_held,circuit_open,circuit_reason
+           FROM whatsapp_account_controls WHERE session_name=$1""",
+        _IdentityClient.session_name,
+    )
+
+    assert attested["replayed"] is False
+    assert replay["replayed"] is True
+    assert replay["quarantine_id"] == attested["quarantine_id"]
+    assert reservation["state"] == "unknown"
+    assert all(reservation[field] is None for field in (
+        "pinned_account_jid",
+        "account_pin_version",
+        "observed_account_jid",
+        "account_identity_observed_at",
+    ))
+    assert state["unknown_reservations"] == 1
+    assert await pool.fetchval(
+        """SELECT count(*) FROM whatsapp_account_send_reservations
+           WHERE session_name=$1 AND state IN ('reserved','accepted','unknown')""",
+        _IdentityClient.session_name,
+    ) == 1
+    assert state["quarantined_unknown_reservations"] == 1
+    assert state["unresolved_reservations"] == 0
+    assert state["oldest_quarantined_unknown_age_seconds"] >= 86400
+    assert controls["operator_held"] is True
+    assert controls["circuit_open"] is True
+    assert controls["circuit_reason"] == "keep_this_circuit"
+
+    from procurement_bot.whatsapp_account import observe_provider_state, set_account_hold
+
+    async with pool.acquire() as connection:
+        await observe_provider_state(
+            connection,
+            _IdentityClient.session_name,
+            state="clear",
+            observed_at=datetime.now(UTC),
+            source="synthetic_operator_test",
+            reason="fresh_clear_after_attestation",
+        )
+    controls = await pool.fetchrow(
+        "SELECT operator_held,circuit_open FROM whatsapp_account_controls WHERE session_name=$1",
+        _IdentityClient.session_name,
+    )
+    assert controls["operator_held"] is True
+    assert controls["circuit_open"] is False
+    async with pool.acquire() as connection:
+        await set_account_hold(
+            connection,
+            _IdentityClient.session_name,
+            held=False,
+            reason="explicit_release_after_fresh_clear",
+            actor_user_id=owner_id,
+        )
+    await pin_whatsapp_account_identity(
+        pool,
+        _IdentityClient(SELF_JID),
+        actor_user_id=owner_id,
+        expected_account_jid=SELF_JID,
+        reason="explicit synthetic gate setup",
+        operator_idempotency_key="pin-quarantine-test-01",
+    )
+    from procurement_bot.whatsapp_account import assert_account_send_allowed
+
+    async with pool.acquire() as connection:
+        await assert_account_send_allowed(connection, _IdentityClient.session_name)
+
+
+
+@pytest.mark.postgres
+async def test_post043_bound_unknown_stays_blocking_and_outside_quarantine_inventory(identity_pg):
+    from procurement_bot.whatsapp_account import (
+        assert_account_send_allowed,
+        load_legacy_unknown_inventory,
+    )
+
+    pool, owner_id, conversation_id, contact_id = identity_pg
+    await _open_account(identity_pg)
+    event = await _seed_event(identity_pg)
+    now = datetime.now(UTC)
+    await pool.execute(
+        """INSERT INTO whatsapp_account_send_reservations(
+               outbox_event_id,session_name,conversation_id,supplier_contact_id,state,
+               is_new_contact,reserved_at,outcome_source,pinned_account_jid,
+               account_pin_version,observed_account_jid,account_identity_observed_at
+           ) VALUES($1,$2,$3,$4,'unknown',TRUE,$5,'migration',$6,1,$6,$5)""",
+        event.id,
+        _IdentityClient.session_name,
+        conversation_id,
+        contact_id,
+        now,
+        SELF_JID,
+    )
+    await pool.execute(
+        """UPDATE whatsapp_account_controls SET operator_held=FALSE,circuit_open=FALSE,
+               provider_state='clear',provider_observed_at=now()
+           WHERE session_name=$1""",
+        _IdentityClient.session_name,
+    )
+
+    snapshot = await load_legacy_unknown_inventory(
+        pool,
+        session_name=_IdentityClient.session_name,
+        actor_user_id=owner_id,
+    )
+    assert snapshot["reservation_ids"] == []
+    async with pool.acquire() as connection:
+        with pytest.raises(WhatsAppAccountDenied, match="outcome_unresolved"):
+            await assert_account_send_allowed(connection, _IdentityClient.session_name)

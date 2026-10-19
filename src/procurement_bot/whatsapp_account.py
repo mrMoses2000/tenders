@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -21,6 +24,7 @@ DEFAULT_MINIMUM_INTERVAL_SECONDS = 120
 DEFAULT_MAX_CONCURRENT_POSTS = 1
 PROVIDER_CLEAR_MAX_AGE = timedelta(minutes=30)
 ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE = timedelta(seconds=30)
+OPERATOR_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,119}$")
 
 ProviderState = Literal["unknown", "clear", "restricted", "timelock", "capped", "unavailable"]
 SendOutcome = Literal["accepted", "unknown", "rejected"]
@@ -108,6 +112,242 @@ async def ensure_account(connection: asyncpg.Connection, session_name: str) -> a
     return existing
 
 
+async def _legacy_unknown_inventory(
+    connection: asyncpg.Connection,
+    session_name: str,
+) -> tuple[datetime, list[asyncpg.Record], str]:
+    cutoff = await connection.fetchval(
+        "SELECT applied_at FROM schema_migrations "
+        "WHERE name='043_whatsapp_account_identity_binding.sql'"
+    )
+    if cutoff is None:
+        raise RuntimeError("identity-binding migration cutoff is unavailable")
+    rows = await connection.fetch(
+        """SELECT reservation.outbox_event_id,reservation.conversation_id,
+                  conversation.case_id,reservation.state,reservation.reserved_at,
+                  reservation.created_at,reservation.outcome_source,
+                  reservation.pinned_account_jid,reservation.account_pin_version,
+                  reservation.observed_account_jid,reservation.account_identity_observed_at
+           FROM whatsapp_account_send_reservations reservation
+           JOIN supplier_conversations conversation
+             ON conversation.id=reservation.conversation_id
+           WHERE reservation.session_name=$1 AND reservation.state='unknown'
+             AND reservation.reserved_at<$2 AND reservation.created_at<$2
+             AND reservation.pinned_account_jid IS NULL
+             AND reservation.account_pin_version IS NULL
+             AND reservation.observed_account_jid IS NULL
+             AND reservation.account_identity_observed_at IS NULL
+           ORDER BY reservation.outbox_event_id""",
+        session_name,
+        cutoff,
+    )
+    canonical = [
+        {
+            "outbox_event_id": str(row["outbox_event_id"]),
+            "conversation_id": str(row["conversation_id"]),
+            "case_id": str(row["case_id"]),
+            "state": row["state"],
+            "reserved_at": _now(row["reserved_at"]).isoformat(),
+            "created_at": _now(row["created_at"]).isoformat(),
+            "outcome_source": row["outcome_source"],
+            "identity": {
+                "pinned_account_jid": row["pinned_account_jid"],
+                "account_pin_version": row["account_pin_version"],
+                "observed_account_jid": row["observed_account_jid"],
+                "account_identity_observed_at": row["account_identity_observed_at"],
+            },
+        }
+        for row in rows
+    ]
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "session_name": session_name,
+                "cutoff_at": _now(cutoff).isoformat(),
+                "items": canonical,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return cutoff, list(rows), digest
+
+
+async def load_legacy_unknown_inventory(
+    pool: asyncpg.Pool,
+    *,
+    session_name: str,
+    actor_user_id: UUID,
+) -> dict[str, Any]:
+    """Read the exact eligible legacy inventory for an active owner."""
+
+    if not isinstance(session_name, str) or not session_name.strip():
+        raise ValueError("session_name must be non-empty")
+    session_name = session_name.strip()
+    async with pool.acquire() as connection, connection.transaction():
+        await ensure_account(connection, session_name)
+        await connection.fetchrow(
+            "SELECT session_name FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+            session_name,
+        )
+        await _lock_authorize_session_owner(connection, session_name, actor_user_id)
+        cutoff, rows, digest = await _legacy_unknown_inventory(connection, session_name)
+        await _lock_authorize_inventory_cases(connection, actor_user_id, rows)
+        return {
+            "session_name": session_name,
+            "cutoff_at": _now(cutoff),
+            "reservation_ids": [row["outbox_event_id"] for row in rows],
+            "inventory_sha256": digest,
+            "reservation_count": len(rows),
+            "oldest_age_seconds": (
+                max(
+                    0,
+                    int(
+                        (
+                            datetime.now(UTC)
+                            - _now(min(row["reserved_at"] for row in rows))
+                        ).total_seconds()
+                    ),
+                )
+                if rows
+                else None
+            ),
+        }
+
+
+async def attest_legacy_unknown_inventory(
+    pool: asyncpg.Pool,
+    *,
+    session_name: str,
+    actor_user_id: UUID,
+    reservation_ids: list[UUID],
+    inventory_sha256: str,
+    source_reference: str,
+    reason: str,
+    operator_idempotency_key: str,
+) -> dict[str, Any]:
+    """Attest a complete exact legacy inventory without changing original rows."""
+
+    if not isinstance(session_name, str) or not session_name.strip():
+        raise ValueError("session_name must be non-empty")
+    session_name = session_name.strip()
+    key = _operator_key(operator_idempotency_key)
+    if key is None:
+        raise ValueError("operator_idempotency_key is required")
+    reason = _reason(reason)
+    if not isinstance(source_reference, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:/#-]{2,159}", source_reference
+    ):
+        raise ValueError("source_reference must be a safe evidence reference")
+    if not isinstance(inventory_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", inventory_sha256
+    ):
+        raise ValueError("inventory_sha256 must be a lowercase SHA-256")
+    supplied_ids = [UUID(str(value)) for value in reservation_ids]
+    if not supplied_ids or len(supplied_ids) != len(set(supplied_ids)):
+        raise ValueError("reservation_ids must be a non-empty unique exact inventory")
+
+    async with pool.acquire() as connection, connection.transaction():
+        await ensure_account(connection, session_name)
+        await connection.fetchrow(
+            "SELECT session_name FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+            session_name,
+        )
+        await _lock_authorize_session_owner(connection, session_name, actor_user_id)
+
+        prior = await connection.fetchrow(
+            """SELECT id,actor_user_id,inventory_sha256,reservation_count,
+                      source_reference,reason
+               FROM whatsapp_legacy_unknown_quarantines
+               WHERE session_name=$1 AND operator_idempotency_key=$2""",
+            session_name,
+            key,
+        )
+        if prior is not None:
+            prior_ids = await connection.fetch(
+                """SELECT item.outbox_event_id,reservation.conversation_id
+                   FROM whatsapp_legacy_unknown_quarantine_items item
+                   JOIN whatsapp_account_send_reservations reservation
+                     ON reservation.outbox_event_id=item.outbox_event_id
+                   WHERE item.quarantine_id=$1 ORDER BY item.outbox_event_id""",
+                prior["id"],
+            )
+            await _lock_authorize_inventory_cases(connection, actor_user_id, prior_ids)
+            if (
+                prior["actor_user_id"] != actor_user_id
+                or prior["inventory_sha256"] != inventory_sha256
+                or prior["source_reference"] != source_reference
+                or prior["reason"] != reason
+                or [row["outbox_event_id"] for row in prior_ids] != sorted(supplied_ids)
+            ):
+                raise PermissionError(
+                    "operator idempotency key was already used for another quarantine"
+                )
+            return {
+                "quarantine_id": prior["id"],
+                "reservation_count": int(prior["reservation_count"]),
+                "inventory_sha256": prior["inventory_sha256"],
+                "replayed": True,
+            }
+
+        existing_event = await connection.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM whatsapp_account_control_events
+               WHERE session_name=$1 AND operator_idempotency_key=$2)""",
+            session_name,
+            key,
+        )
+        if existing_event:
+            raise PermissionError("operator idempotency key was already used for another command")
+
+        cutoff, rows, actual_digest = await _legacy_unknown_inventory(connection, session_name)
+        await _lock_authorize_inventory_cases(connection, actor_user_id, rows)
+        actual_ids = [row["outbox_event_id"] for row in rows]
+        if supplied_ids != sorted(supplied_ids) or supplied_ids != actual_ids:
+            raise PermissionError(
+                "legacy unknown inventory IDs differ from the current exact inventory"
+            )
+        if actual_digest != inventory_sha256:
+            raise PermissionError("legacy unknown inventory hash differs from the current snapshot")
+
+        quarantine_id = await connection.fetchval(
+            """INSERT INTO whatsapp_legacy_unknown_quarantines(
+                   session_name,actor_user_id,operator_idempotency_key,inventory_sha256,
+                   reservation_count,source_reference,reason,cutoff_at
+               ) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
+            session_name,
+            actor_user_id,
+            key,
+            actual_digest,
+            len(rows),
+            source_reference,
+            reason,
+            cutoff,
+        )
+        await connection.executemany(
+            """INSERT INTO whatsapp_legacy_unknown_quarantine_items(
+                   quarantine_id,outbox_event_id) VALUES($1,$2)""",
+            [(quarantine_id, row["outbox_event_id"]) for row in rows],
+        )
+        await connection.execute(
+            """INSERT INTO whatsapp_account_control_events(
+                   session_name,event_type,reason,actor_user_id,details,
+                   operator_idempotency_key
+               ) VALUES($1,'legacy_unknown_quarantined',$2,$3,$4::jsonb,$5)""",
+            session_name,
+            reason,
+            actor_user_id,
+            {"inventory_sha256": actual_digest, "reservation_count": len(rows),
+             "source_reference": source_reference},
+            key,
+        )
+        return {
+            "quarantine_id": quarantine_id,
+            "reservation_count": len(rows),
+            "inventory_sha256": actual_digest,
+            "replayed": False,
+        }
+
+
 async def get_account_state(connection: asyncpg.Connection, session_name: str) -> dict[str, Any]:
     """Return account gates and budgets; an absent row is represented as held."""
 
@@ -134,14 +374,38 @@ async def get_account_state(connection: asyncpg.Connection, session_name: str) -
             "account_pin_version": 0,
             "outbound_allowed": False,
             "unresolved_reservations": 0,
+            "unknown_reservations": 0,
+            "quarantined_unknown_reservations": 0,
+            "oldest_quarantined_unknown_age_seconds": None,
         }
     unresolved = int(
         await connection.fetchval(
-            """SELECT count(*) FROM whatsapp_account_send_reservations
-               WHERE session_name=$1 AND state IN ('reserved','unknown')""",
+            """SELECT count(*) FROM whatsapp_account_send_reservations reservation
+               WHERE reservation.session_name=$1 AND (
+                   reservation.state='reserved'
+                   OR (reservation.state='unknown' AND NOT EXISTS (
+                       SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                       WHERE item.outbox_event_id=reservation.outbox_event_id
+                   )))""",
             session_name.strip(),
         )
         or 0
+    )
+    unknown_total = int(
+        await connection.fetchval(
+            """SELECT count(*) FROM whatsapp_account_send_reservations
+               WHERE session_name=$1 AND state='unknown'""",
+            session_name.strip(),
+        )
+        or 0
+    )
+    quarantined = await connection.fetchrow(
+        """SELECT count(*) AS count,min(reservation.reserved_at) AS oldest
+           FROM whatsapp_legacy_unknown_quarantine_items item
+           JOIN whatsapp_account_send_reservations reservation
+             ON reservation.outbox_event_id=item.outbox_event_id
+           WHERE reservation.session_name=$1 AND reservation.state='unknown'""",
+        session_name.strip(),
     )
     result = dict(row)
     result["account_identity_pinned"] = bool(result.get("pinned_account_jid"))
@@ -149,6 +413,13 @@ async def get_account_state(connection: asyncpg.Connection, session_name: str) -
     for private_field in ("pinned_account_jid", "pinned_by", "pinned_at", "pin_observed_at"):
         result.pop(private_field, None)
     result["unresolved_reservations"] = unresolved
+    result["unknown_reservations"] = unknown_total
+    result["quarantined_unknown_reservations"] = int(quarantined["count"] or 0)
+    result["oldest_quarantined_unknown_age_seconds"] = (
+        max(0, int((datetime.now(UTC) - _now(quarantined["oldest"])).total_seconds()))
+        if quarantined["oldest"] is not None
+        else None
+    )
     result["provider_clear_fresh"] = _provider_clear_is_fresh(result, datetime.now(UTC))
     result["outbound_allowed"] = (
         not result["operator_held"]
@@ -179,8 +450,10 @@ async def assert_account_send_allowed(
     if not state["pinned_account_jid"] or int(state["pin_version"]) < 1:
         raise _blocked("whatsapp_account_identity_not_pinned", now=current)
     if await connection.fetchval(
-        """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
-           WHERE session_name=$1 AND state='unknown')""",
+        """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations reservation
+           WHERE reservation.session_name=$1 AND reservation.state='unknown'
+             AND NOT EXISTS (SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                             WHERE item.outbox_event_id=reservation.outbox_event_id))""",
         session_name,
     ):
         raise _blocked("whatsapp_account_outcome_unresolved", now=current)
@@ -217,6 +490,101 @@ async def _authorize_session_owner(
         or (not require_all and not row["actor_owns_session"])
     ):
         raise PermissionError("actor must own the active cases using this WhatsApp session")
+
+
+async def _lock_authorize_session_owner(
+    connection: asyncpg.Connection,
+    session_name: str,
+    actor_user_id: UUID,
+) -> list[asyncpg.Record]:
+    """Lock the active actor and all session case links after the account lock."""
+
+    actor = await connection.fetchrow(
+        "SELECT active FROM users WHERE id=$1 FOR SHARE",
+        actor_user_id,
+    )
+    cases = await connection.fetch(
+        """SELECT conversation.id AS conversation_id,
+                  procurement_case.id AS case_id,
+                  procurement_case.owner_user_id
+           FROM supplier_conversations conversation
+           JOIN procurement_cases procurement_case
+             ON procurement_case.id=conversation.case_id
+           WHERE conversation.session_name=$1
+             AND procurement_case.status NOT IN ('closed','cancelled','selected')
+           ORDER BY procurement_case.id,conversation.id
+           FOR SHARE OF conversation,procurement_case""",
+        session_name,
+    )
+    if (
+        actor is None
+        or not actor["active"]
+        or not cases
+        or any(row["owner_user_id"] != actor_user_id for row in cases)
+    ):
+        raise PermissionError("actor must own the active cases using this WhatsApp session")
+    return cases
+
+
+async def _lock_authorize_inventory_cases(
+    connection: asyncpg.Connection,
+    actor_user_id: UUID,
+    rows: list[asyncpg.Record],
+) -> None:
+    conversation_ids = sorted({row["conversation_id"] for row in rows})
+    if not conversation_ids:
+        return
+    cases = await connection.fetch(
+        """SELECT conversation.id AS conversation_id,procurement_case.owner_user_id
+           FROM supplier_conversations conversation
+           JOIN procurement_cases procurement_case
+             ON procurement_case.id=conversation.case_id
+           WHERE conversation.id=ANY($1::uuid[])
+           ORDER BY procurement_case.id,conversation.id
+           FOR SHARE OF conversation,procurement_case""",
+        conversation_ids,
+    )
+    if len(cases) != len(conversation_ids) or any(
+        row["owner_user_id"] != actor_user_id for row in cases
+    ):
+        raise PermissionError("actor must own every legacy reservation case")
+
+
+def _operator_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not OPERATOR_KEY_RE.fullmatch(value):
+        raise ValueError("operator_idempotency_key must be 8-120 safe characters")
+    return value
+
+
+async def _existing_pin_retry(
+    connection: asyncpg.Connection,
+    *,
+    session_name: str,
+    actor_user_id: UUID,
+    expected_jid: str,
+    reason: str,
+    key: str,
+) -> int | None:
+    event = await connection.fetchrow(
+        """SELECT actor_user_id,reason,details,event_type
+           FROM whatsapp_account_control_events
+           WHERE session_name=$1 AND operator_idempotency_key=$2""",
+        session_name,
+        key,
+    )
+    if event is None:
+        return None
+    if event["event_type"] not in {"account_identity_pinned", "account_identity_changed"}:
+        raise PermissionError("operator idempotency key was already used for another command")
+    if (
+        event["actor_user_id"] != actor_user_id
+        or event["reason"] != reason
+        or event["details"].get("account_jid") != expected_jid
+    ):
+        raise PermissionError("operator idempotency key was already used for another pin")
+    return int(event["details"]["pin_version"])
 
 
 async def authorize_session_owner(
@@ -296,73 +664,118 @@ async def pin_whatsapp_account_identity(
     expected_account_jid: str,
     reason: str,
     now: datetime | None = None,
+    operator_idempotency_key: str | None = None,
 ) -> int:
-    """Pin an owner-confirmed live self JID without changing send gates."""
+    """Pin an owner-confirmed live self JID without changing send gates.
+
+    Callers without an operator key retain the historical one-call/one-version
+    behavior. Authenticated operator handlers should pass a stable key so a
+    network retry returns the committed version without another WAHA read.
+    """
 
     expected_jid = normalize_account_jid(expected_account_jid)
     reason = _reason(reason)
-    async with pool.acquire() as connection:
-        await authorize_session_owner(
-            connection, client.session_name, actor_user_id, require_all=True
-        )
-    identity: WahaAccountIdentity = await client.get_account_identity()
-    if identity.account_jid != expected_jid:
-        raise PermissionError("live WAHA identity differs from the owner-confirmed identity")
+    key = _operator_key(operator_idempotency_key)
     session_name = client.session_name
-    async with pool.acquire() as connection:
-        await authorize_session_owner(connection, session_name, actor_user_id, require_all=True)
-        async with connection.transaction():
+
+    if key is not None:
+        async with pool.acquire() as connection, connection.transaction():
             await ensure_account(connection, session_name)
             account = await connection.fetchrow(
-                "SELECT * FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+                "SELECT session_name FROM whatsapp_account_controls "
+                "WHERE session_name=$1 FOR UPDATE",
                 session_name,
             )
             if account is None:
                 raise RuntimeError("WhatsApp account control row disappeared")
-            current = _now(now)
-            observed_at = _now(identity.observed_at)
-            if not timedelta(0) <= current - observed_at <= ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE:
-                raise PermissionError("live WAHA identity observation is stale or future-dated")
-            active_post = await connection.fetchval(
-                """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
-                   WHERE session_name=$1 AND state='reserved')""",
-                session_name,
+            await _lock_authorize_session_owner(connection, session_name, actor_user_id)
+            prior = await _existing_pin_retry(
+                connection,
+                session_name=session_name,
+                actor_user_id=actor_user_id,
+                expected_jid=expected_jid,
+                reason=reason,
+                key=key,
             )
-            if active_post:
-                raise PermissionError(
-                    "cannot change account pin while a send reservation is active"
-                )
-            version = int(account["pin_version"]) + 1
-            event_type = (
-                "account_identity_pinned"
-                if account["pinned_account_jid"] is None
-                else "account_identity_changed"
+        if prior is not None:
+            return prior
+    else:
+        async with pool.acquire() as connection:
+            await authorize_session_owner(
+                connection, session_name, actor_user_id, require_all=True
             )
-            await connection.execute(
-                """UPDATE whatsapp_account_controls SET pinned_account_jid=$2,
-                       pinned_by=$3,pinned_at=$4,pin_observed_at=$5,pin_version=$6,
-                       updated_at=$4 WHERE session_name=$1""",
-                session_name,
-                identity.account_jid,
-                actor_user_id,
-                current,
-                identity.observed_at,
-                version,
+
+    identity: WahaAccountIdentity = await client.get_account_identity()
+    if normalize_account_jid(identity.account_jid) != expected_jid:
+        raise PermissionError("live WAHA identity differs from the owner-confirmed identity")
+
+    async with pool.acquire() as connection, connection.transaction():
+        await ensure_account(connection, session_name)
+        account = await connection.fetchrow(
+            "SELECT * FROM whatsapp_account_controls WHERE session_name=$1 FOR UPDATE",
+            session_name,
+        )
+        if account is None:
+            raise RuntimeError("WhatsApp account control row disappeared")
+        await _lock_authorize_session_owner(connection, session_name, actor_user_id)
+        if key is not None:
+            prior = await _existing_pin_retry(
+                connection,
+                session_name=session_name,
+                actor_user_id=actor_user_id,
+                expected_jid=expected_jid,
+                reason=reason,
+                key=key,
             )
-            await connection.execute(
-                """INSERT INTO whatsapp_account_control_events(
-                       session_name,event_type,reason,actor_user_id,details
-                   ) VALUES($1,$2,$3,$4,$5::jsonb)""",
-                session_name,
-                event_type,
-                reason,
-                actor_user_id,
-                {
-                    "account_jid": identity.account_jid,
-                    "pin_version": version,
-                    "observed_at": identity.observed_at.isoformat(),
-                },
+            if prior is not None:
+                return prior
+
+        current = _now(now)
+        observed_at = _now(identity.observed_at)
+        if not timedelta(0) <= current - observed_at <= ACCOUNT_IDENTITY_OBSERVATION_MAX_AGE:
+            raise PermissionError("live WAHA identity observation is stale or future-dated")
+        active_post = await connection.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
+               WHERE session_name=$1 AND state='reserved')""",
+            session_name,
+        )
+        if active_post:
+            raise PermissionError(
+                "cannot change account pin while a send reservation is active"
             )
+        version = int(account["pin_version"]) + 1
+        event_type = (
+            "account_identity_pinned"
+            if account["pinned_account_jid"] is None
+            else "account_identity_changed"
+        )
+        await connection.execute(
+            """UPDATE whatsapp_account_controls SET pinned_account_jid=$2,
+                   pinned_by=$3,pinned_at=$4,pin_observed_at=$5,pin_version=$6,
+                   updated_at=$4 WHERE session_name=$1""",
+            session_name,
+            normalize_account_jid(identity.account_jid),
+            actor_user_id,
+            current,
+            observed_at,
+            version,
+        )
+        await connection.execute(
+            """INSERT INTO whatsapp_account_control_events(
+                   session_name,event_type,reason,actor_user_id,details,
+                   operator_idempotency_key
+               ) VALUES($1,$2,$3,$4,$5::jsonb,$6)""",
+            session_name,
+            event_type,
+            reason,
+            actor_user_id,
+            {
+                "account_jid": expected_jid,
+                "pin_version": version,
+                "observed_at": observed_at.isoformat(),
+            },
+            key,
+        )
     return version
 
 
@@ -397,8 +810,13 @@ async def set_account_hold(
             raise RuntimeError("WhatsApp account control row disappeared")
         if not held:
             unresolved = await connection.fetchval(
-                """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
-                   WHERE session_name=$1 AND state IN ('reserved','unknown'))""",
+                """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations reservation
+                   WHERE reservation.session_name=$1 AND (
+                       reservation.state='reserved'
+                       OR (reservation.state='unknown' AND NOT EXISTS (
+                           SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                           WHERE item.outbox_event_id=reservation.outbox_event_id
+                       ))))""",
                 session_name,
             )
             if unresolved:
@@ -732,8 +1150,10 @@ async def reserve_outbound(
             raise _blocked("whatsapp_account_circuit_open", now=current)
 
         unresolved = await connection.fetchval(
-            """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
-               WHERE session_name=$1 AND state='unknown')""",
+            """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations reservation
+               WHERE reservation.session_name=$1 AND reservation.state='unknown'
+                 AND NOT EXISTS (SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                                 WHERE item.outbox_event_id=reservation.outbox_event_id))""",
             session_name,
         )
         if unresolved:
@@ -1137,8 +1557,13 @@ async def _recover_circuit_if_resolved(
     connection: asyncpg.Connection, session_name: str, now: datetime
 ) -> bool:
     if await connection.fetchval(
-        """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations
-           WHERE session_name=$1 AND state IN ('reserved','unknown'))""",
+        """SELECT EXISTS(SELECT 1 FROM whatsapp_account_send_reservations reservation
+           WHERE reservation.session_name=$1 AND (
+               reservation.state='reserved'
+               OR (reservation.state='unknown' AND NOT EXISTS (
+                   SELECT 1 FROM whatsapp_legacy_unknown_quarantine_items item
+                   WHERE item.outbox_event_id=reservation.outbox_event_id
+               ))))""",
         session_name,
     ):
         return False
