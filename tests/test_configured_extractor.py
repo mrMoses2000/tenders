@@ -9,7 +9,10 @@ from pydantic import BaseModel
 
 from procurement_bot import cli
 from procurement_bot.config import Settings
-from procurement_bot.configured_extractor import ConfiguredAgyExtractor
+from procurement_bot.configured_extractor import (
+    ConfiguredAgyExtractor,
+    ConfiguredStructuredExtractor,
+)
 from procurement_bot.errors import (
     PermanentProviderError,
     ProviderAuthenticationDeferred,
@@ -296,7 +299,8 @@ def test_worker_startup_does_not_prepare_agy_profile_without_auth(
     tasks = TaskCollector()
     try:
         cli._start_worker_tasks(tasks, settings, object(), object())
-        assert isinstance(captured["extractor"], ConfiguredAgyExtractor)
+        assert isinstance(captured["extractor"], ConfiguredStructuredExtractor)
+        assert isinstance(captured["extractor"]._extractor, ConfiguredAgyExtractor)
         assert not settings.agy_home.exists()
     finally:
         for coroutine in tasks.coroutines:

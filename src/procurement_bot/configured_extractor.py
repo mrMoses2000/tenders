@@ -1,4 +1,4 @@
-"""Credential-aware lazy construction for the isolated AGY parser profile."""
+"""Explicit structured text selection and separate lazy AGY audio capability."""
 
 from __future__ import annotations
 
@@ -155,3 +155,76 @@ class ConfiguredAgyExtractor:
         self._profile_token = token
         self._profile_version = credential_file_version(token)
         return self._extractor
+
+
+class ConfiguredStructuredExtractor:
+    """Select once from configuration; provider failures never trigger fallback."""
+
+    def __init__(self, settings: Settings) -> None:
+        from procurement_bot.codex_text_extractor import CodexTextProfile, OptInCodexTextExtractor
+
+        self.provider = settings.structured_text_provider
+        if self.provider == "agy":
+            self._extractor: StructuredExtractor = ConfiguredAgyExtractor(settings)
+        elif self.provider == "codex":
+            self._extractor = OptInCodexTextExtractor(
+                opt_in=True,
+                profile=CodexTextProfile(
+                    executable=settings.codex_text_executable,
+                    node_executable=settings.codex_text_node_executable,
+                    model=settings.codex_text_model,
+                    reasoning_effort=settings.codex_text_reasoning_effort,
+                    timeout_seconds=settings.codex_text_timeout_seconds,
+                    concurrency=settings.codex_text_concurrency,
+                    home=settings.codex_text_home,
+                    codex_home=settings.codex_text_codex_home,
+                ),
+            )
+        else:
+            raise ValueError("unsupported structured text provider")
+
+    async def extract(
+        self,
+        text: str,
+        output_model: type[T],
+        *,
+        context: Any = None,
+        spec_sha256: str = "",
+        context_sha256: str = "",
+    ) -> T:
+        from procurement_bot.codex_text_extractor import CodexTextError
+
+        try:
+            return await self._extractor.extract(
+                text,
+                output_model,
+                context=context,
+                spec_sha256=spec_sha256,
+                context_sha256=context_sha256,
+            )
+        except CodexTextError as exc:
+            if exc.code == "cli_auth_failed":
+                raise ProviderAuthenticationDeferred(reason="provider_auth_failed") from None
+            raise
+
+
+class ConfiguredAgyAudioTranscriber:
+    """Keep AGY audio independent of the selected text provider; provision lazily."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._profile = ConfiguredAgyExtractor(settings)
+        self._transcriber = None
+
+    async def transcribe(self, path: Path, language: str = "auto"):
+        from procurement_bot.providers.supplier_audio import KazakhAudioTranscriber
+
+        await self._profile._get_extractor()
+        if self._transcriber is None:
+            self._transcriber = KazakhAudioTranscriber(
+                executable=self._settings.agy_executable,
+                model=self._settings.agy_model,
+                timeout_seconds=self._settings.agy_timeout_seconds,
+                home_dir=self._settings.agy_home,
+            )
+        return await self._transcriber.transcribe(path, language=language)
