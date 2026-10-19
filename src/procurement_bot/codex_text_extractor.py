@@ -109,10 +109,10 @@ class CodexTextProfile:
             raise ValueError("model/effort is outside the reviewed allowlist")
         if (
             type(self.timeout_seconds) not in (int, float)
-            or not 0 < self.timeout_seconds <= 180
+            or not 0 < self.timeout_seconds <= 300
             or not isfinite(self.timeout_seconds)
         ):
-            raise ValueError("timeout must be finite and at most 180 seconds")
+            raise ValueError("timeout must be finite and at most 300 seconds")
 
 
 @dataclass(frozen=True, slots=True)

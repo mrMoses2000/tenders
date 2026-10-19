@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     codex_text_codex_home: Path = Path.home() / ".codex"
     codex_text_model: Literal["gpt-6.1-sol"] = "gpt-6.1-sol"
     codex_text_reasoning_effort: Literal["low", "medium", "high", "xhigh"] = "xhigh"
-    codex_text_timeout_seconds: float = Field(default=45, gt=0, le=180, allow_inf_nan=False)
+    codex_text_timeout_seconds: float = Field(default=45, gt=0, le=300, allow_inf_nan=False)
     codex_text_concurrency: int = Field(default=2, ge=1, le=8)
 
     agy_executable: str = "agy"
