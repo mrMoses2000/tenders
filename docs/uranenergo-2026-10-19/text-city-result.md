@@ -22,7 +22,7 @@ Base: `5f2ba1fc92afd31ebdd0d35a896e2818aa42c7e2`
 
 ## Limits and handoff
 
-- The generic synthetic run verifies CLI invocation, output schema, and binding behavior. It does not measure extraction capacity for a 55-item procurement request. Do not infer a per-request SLA from the greeting probe. A bounded synthetic multi-item probe remains optional follow-up; if it cannot complete within the adapter's configured timeout, keep that limitation explicit.
+- A bounded synthetic 55-item `ParsedProcurementRequest` input measured 48,254 bytes. The real CLI ended after 4.414 seconds with fixed diagnostic `cli_home_missing`; auth-file metadata stayed unchanged. The result was rejected and did not validate 55-item extraction capacity. Do not infer a per-request SLA from the successful greeting probe; no retry was made.
 - AGY audio remains separate from text selection. The current audio transcript carries no language-confidence value, so `transcript_review_reason` keeps supplier voice messages in human review; no AGY voice confidence was fabricated and the review gate was not bypassed.
 - Native city admission still needs the persistence/scheduler increment: atomic complete-snapshot loading, per-item fencing, shared capacity locking, cursor/checkpoint persistence, and enqueueing existing work. Production activation remains for root review.
 - No production database, `.env`, business document, outbound provider, authentication state, or running service was changed.
