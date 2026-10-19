@@ -1,3 +1,13 @@
+# Current integrated source checkpoint — 2026-10-19 10:33 UTC
+
+The candidate source is at `866c9c0940c3046d4e58f123548902f1b07ff1c4`, a normal merge of Agent A's accepted citywide loader fix `96a68b7ee6d3ebeb7d1ab5267975d0d4b04305e9` into the published account-operator integration head `c8463494882d2aad04860b07e33d09b329dcf4e8`. The fix permits a citywide immutable plan with no area constraint to coexist with an imported case-area hint; city matching remains enforced and specific-area/legacy scope area checks stay strict. It changes only `search_profiles.py` and adds the focused PostgreSQL regression in `test_citywide_execution.py`. The separate retry-helper work in the activation clone was not merged.
+
+Verification after merge: `tests/test_citywide_execution.py tests/test_uran_connected_postgres.py tests/test_whatsapp_account_identity.py`: **48 passed**, 14 existing dependency/aiohttp warnings, on verified `127.0.0.1:55450/test_uran_integrated`. Ruff on the changed source/test, Python compileall, Node 22 `--check mini_app/app.js`, and `git diff --check HEAD^1 HEAD` passed. The API hard guard/PG test, five held-tick cases, and prior account/connected tests remain as separately recorded below. The test creates disposable fixtures only; it does not resume the production Taraz run or mutate production.
+
+This candidate remains isolated and undeployed. No migration 045, identity pin, legacy quarantine, case policy change, account budget change, hold/circuit transition, worker restart, or provider send occurred here. A controlled owner-account dialogue test is being planned privately. Global default-session outbox/approval inventory requires root review before any transport gate change; the test plan keeps all genuine cases blocked and does not seed supplier replies or offers.
+
+---
+
 # Connected synthetic checkpoint for Luna — 2026-10-19
 
 ## Current integrated account-operator checkpoint — 2026-10-19
@@ -15,7 +25,7 @@ Selected verification on the merged tree:
 
 Both PostgreSQL targets were already running and were checked before connecting. Tests used generated fixtures and stubbed network boundaries; no production database, live WAHA request, provider search, service change, or external message was part of these checks.
 
-Validation limits: an earlier broad run found 15 failures in `test_autonomous_pipeline.py` and `test_pipeline_reviews.py`, and reproduced the same names on clean baseline `5f2ba1f`. The complete broad set was not rerun after this merge, so this checkpoint claims only the selected checks above. At report time, the first production Taraz run was blocked at the search-profile loader by a `SearchProfileConflict`; the separate activation checkout owns that small fix. This merged integration source must not be packaged or released until the reviewed fix SHA is included and the Taraz run advances. No production migration 045, pin, quarantine, hold/circuit action, or worker restart is authorized by this checkpoint.
+Validation limits: an earlier broad run found 15 failures in `test_autonomous_pipeline.py` and `test_pipeline_reviews.py`, and reproduced the same names on clean baseline `5f2ba1f`. The complete broad set was not rerun after this merge, so this checkpoint claims only the selected checks above. At the earlier report time, the first production Taraz run was blocked at the search-profile loader by a `SearchProfileConflict`. That small citywide binding fix is now merged and covered by the isolated regression below; the production run has not yet been resumed, and release still awaits the root's separate review gate. No production migration 045, pin, quarantine, hold/circuit action, or worker restart is authorized by this checkpoint.
 
 This is an uncommitted implementation checkpoint, not completion of the city-runtime assignment or deployment approval. The only runtime change is inside `JobWorker._prepare_supplier_outreach`: draft/conversation preparation no longer requires an already open/pinned account or an outbound-enabled provider client. Session availability, contact verification, and repository owner/contact/opt-out checks remain. Physical send authorization and delivery code are unchanged.
 
