@@ -117,7 +117,7 @@ def test_explicit_opt_in_profile():
         {"executable": Path("relative")},
         {"node_executable": Path("relative")},
         {"timeout_seconds": 0},
-        {"timeout_seconds": 181},
+        {"timeout_seconds": 301},
         {"timeout_seconds": True},
         {"timeout_seconds": float("inf")},
         {"timeout_seconds": float("nan")},
@@ -133,14 +133,14 @@ def test_reviewed_text_timeout_cap_and_default_are_bounded():
 
     assert Settings(_env_file=None).codex_text_timeout_seconds == 45
     assert (
-        Settings(_env_file=None, codex_text_timeout_seconds=180).codex_text_timeout_seconds
-        == 180
+        Settings(_env_file=None, codex_text_timeout_seconds=300).codex_text_timeout_seconds
+        == 300
     )
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, codex_text_timeout_seconds=180.1)
-    assert replace(PROFILE, timeout_seconds=180).timeout_seconds == 180
-    with pytest.raises(ValueError, match="180 seconds"):
-        replace(PROFILE, timeout_seconds=180.1)
+        Settings(_env_file=None, codex_text_timeout_seconds=300.1)
+    assert replace(PROFILE, timeout_seconds=300).timeout_seconds == 300
+    with pytest.raises(ValueError, match="300 seconds"):
+        replace(PROFILE, timeout_seconds=300.1)
 
 
 def test_strict_data_output_and_isolated_text_only_command(monkeypatch):
