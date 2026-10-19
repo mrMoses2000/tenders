@@ -85,7 +85,7 @@ CREATE TRIGGER research_snapshot_immutable BEFORE UPDATE OR DELETE
 
 CREATE TABLE research_policy_authorizations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    snapshot_id UUID NOT NULL UNIQUE REFERENCES case_research_policy_snapshots(id),
+    snapshot_id UUID NOT NULL REFERENCES case_research_policy_snapshots(id),
     research_run_id UUID NOT NULL UNIQUE REFERENCES research_runs(id),
     plan_sha256 TEXT NOT NULL CHECK (plan_sha256 ~ '^[0-9a-f]{64}$'),
     binding JSONB NOT NULL CHECK (jsonb_typeof(binding)='object'),
@@ -106,18 +106,71 @@ CREATE TABLE item_sourcing_dispositions (
     case_id UUID NOT NULL REFERENCES procurement_cases(id),
     request_item_id UUID NOT NULL,
     owner_user_id UUID NOT NULL REFERENCES users(id),
-    source_artifact_id UUID NOT NULL REFERENCES source_artifacts(id),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('telegram_artifact','operator_attestation')),
+    source_artifact_id UUID REFERENCES source_artifacts(id),
+    source_reference TEXT CHECK (source_reference IS NULL OR (
+        char_length(source_reference) BETWEEN 1 AND 500 AND btrim(source_reference)<>''
+        AND source_reference !~ '[[:cntrl:]]'
+    )),
     artifact_sha256 TEXT NOT NULL CHECK (artifact_sha256 ~ '^[0-9a-f]{64}$'),
     disposition TEXT NOT NULL CHECK (disposition IN ('bought','skip','reduce_quantity')),
     quantity NUMERIC(18,6) CHECK (quantity>0),
     unit TEXT NOT NULL CHECK (btrim(unit)<>''),
-    owner_assertion TEXT NOT NULL CHECK (btrim(owner_assertion)<>''),
-    exact_match_rationale TEXT NOT NULL CHECK (btrim(exact_match_rationale)<>''),
+    owner_assertion TEXT NOT NULL CHECK (
+        char_length(owner_assertion) BETWEEN 1 AND 4000 AND btrim(owner_assertion)<>''
+    ),
+    exact_match_rationale TEXT NOT NULL CHECK (
+        char_length(exact_match_rationale) BETWEEN 1 AND 2000
+        AND btrim(exact_match_rationale)<>''
+    ),
     evidence_sha256 TEXT NOT NULL CHECK (evidence_sha256 ~ '^[0-9a-f]{64}$'),
     idempotency_key TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     FOREIGN KEY (request_item_id,case_id) REFERENCES request_items(id,case_id),
-    CHECK (disposition='skip' OR quantity IS NOT NULL)
+    CHECK (disposition='skip' OR quantity IS NOT NULL),
+    CHECK (
+        (source_kind='telegram_artifact' AND source_artifact_id IS NOT NULL
+         AND source_reference IS NULL)
+        OR
+        (source_kind='operator_attestation' AND source_artifact_id IS NULL
+         AND source_reference IS NOT NULL AND btrim(source_reference)<>'')
+    )
 );
+
+CREATE FUNCTION guard_sourcing_disposition_scope() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    actual_sha256 TEXT;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM request_items i
+        JOIN procurement_cases c ON c.id=i.case_id
+        JOIN users u ON u.id=c.owner_user_id AND u.active
+        WHERE i.id=NEW.request_item_id AND c.id=NEW.case_id
+          AND c.owner_user_id=NEW.owner_user_id
+    ) THEN RAISE EXCEPTION 'sourcing disposition item owner/case mismatch'; END IF;
+    IF NEW.source_kind='telegram_artifact' THEN
+        SELECT a.sha256 INTO actual_sha256
+        FROM source_artifacts a
+        JOIN incoming_attachments t ON t.id=a.attachment_id
+        JOIN messages m ON m.id=t.message_id
+        WHERE a.id=NEW.source_artifact_id AND m.user_id=NEW.owner_user_id
+          AND (m.id IN (SELECT source_message_id FROM procurement_cases WHERE id=NEW.case_id)
+               OR EXISTS (SELECT 1 FROM dialogue_turns d
+                          WHERE d.message_id=m.id AND d.case_id=NEW.case_id));
+        IF actual_sha256 IS NULL OR actual_sha256<>NEW.artifact_sha256 THEN
+            RAISE EXCEPTION 'Telegram source artifact is not case-owned or hash differs';
+        END IF;
+    ELSIF NEW.source_kind='operator_attestation' THEN
+        IF NEW.source_artifact_id IS NOT NULL OR NEW.source_reference IS NULL
+           OR btrim(NEW.source_reference)='' THEN
+            RAISE EXCEPTION 'operator source attestation is incomplete';
+        END IF;
+    ELSE
+        RAISE EXCEPTION 'unsupported sourcing evidence kind';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER sourcing_disposition_scope BEFORE INSERT ON item_sourcing_dispositions
+    FOR EACH ROW EXECUTE FUNCTION guard_sourcing_disposition_scope();
 CREATE TRIGGER sourcing_disposition_immutable BEFORE UPDATE OR DELETE
     ON item_sourcing_dispositions FOR EACH ROW EXECUTE FUNCTION reject_research_fact_mutation();

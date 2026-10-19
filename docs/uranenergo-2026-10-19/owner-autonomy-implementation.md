@@ -34,9 +34,13 @@ must both be hash-bound in a snapshot. Delivery facts are never sourcing default
    source visibility endpoint, plus existing MiniApp display. Expose stable item
    ID/ordinal, warning/ambiguity/source pointer and actual eligibility; keep raw
    artifacts, private tender prices and filesystem paths out of this projection.
-5. Define an immutable owner-attested exact-item disposition interface backed by
-   a case-owned artifact SHA and verbatim assertion; keep accounting separate.
-   Do not apply exclusions to run plans until index/quantity compatibility is proven.
+5. Record immutable item dispositions through either a native Telegram artifact
+   whose stored SHA is checked against the case, or an authenticated operator
+   attestation carrying a source reference and owner-declared SHA-256. Operator
+   hashes are claims, not server-verified file bytes. Both paths require an exact
+   owner/case/item mapping and verbatim assertion; they remain separate from
+   accounting. Current dispositions are visible as evidence only and do not yet
+   change plan quantities or exclude rows from research.
 
 Affected files: new owner-autonomy module, migration 044, cases.py, dialogue.py,
 worker.py, research_workflow.py, mini_app.py, mini_app/app.js and focused tests/docs.
@@ -49,11 +53,19 @@ and provider failure remain native queue states, never market exhaustion. First
 plan uses exactly the first policy city. Ordered city scheduling and the report
 checkpoint runtime hook remain explicitly pending integration; no fake SLA timer.
 
-Verification uses synthetic documents, fake providers, real migrations in random
-schemas of a new local cluster in `.operator-test-pg`, TCP 127.0.0.1:55448,
-database `test_uran_owner`, guarded by scripts/postgres_test_safety.py. Prove
-default manual compatibility, defaults/readiness, exact native autostart,
-owner/project/revocation/drift denial, partial ambiguity, immutable records,
-concurrent/restarted retries, owner-only visibility and WhatsApp separation.
-Expand to connected attachment/discovery/RFQ/quote/MiniApp with fake boundaries.
-Commit small sanitized increments using explicit git add allowlists only.
+This slice binds profiles only during new Telegram intake or an already
+profile-bound continuation. Existing manually imported cases remain manual until a separate owner-attested adoption
+flow supplies a read-only parse-hash/stable-item-ID preflight and captures the
+current applied parse without replacing its item projection. No live
+environment, production database, WhatsApp or payment surface was used.
+
+Verification ran synthetic documents and fake providers against the real
+migrations in random schemas of the isolated local `.operator-test-pg` cluster
+(TCP 127.0.0.1:55448, database `test_uran_owner`), guarded by
+`scripts/postgres_test_safety.py`. The focused command
+`bash .operator-test-pg/run-tests.sh tests/test_owner_autonomy_postgres.py -q`
+passed **22 tests**. Ruff, Python compileall, Node `--check`, and
+`git diff --check` passed. The pytest output had 14 dependency/framework warnings
+(SWIG deprecations and aiohttp app/request key notices). No production services or
+providers were called. Connected attachment/discovery/RFQ/quote behavior and the
+current imported-case adoption flow remain outside this checkpoint.

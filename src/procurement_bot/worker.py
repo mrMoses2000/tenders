@@ -59,7 +59,11 @@ from procurement_bot.offer_technical import (
     technical_assessment_context_hash,
 )
 from procurement_bot.outreach_schedule import begin_outreach, finish_outreach, request_outreach
-from procurement_bot.owner_autonomy import ResearchPolicyDenied, autostart_snapshotted_research
+from procurement_bot.owner_autonomy import (
+    ResearchPolicyDenied,
+    autostart_snapshotted_research,
+    guard_profile_research_work,
+)
 from procurement_bot.pipeline_runtime import ProviderQuotaDeferred, schedule_due_pipelines
 from procurement_bot.providers.agy import AgyCliStatusError
 from procurement_bot.providers.browser import BrowserResearchPort
@@ -348,6 +352,10 @@ class JobWorker:
 
             if set(job.payload) != {"case_id"}:
                 raise PermanentProviderError("invalid pipeline tick payload")
+            if not await guard_profile_research_work(
+                self.pool, case_id=UUID(str(job.payload["case_id"])),
+            ):
+                return
             await run_pipeline_tick(self, UUID(str(job.payload["case_id"])))
         elif job.kind == "download_attachment":
             await self._download_attachment(job.payload)
@@ -364,6 +372,10 @@ class JobWorker:
         elif job.kind == "execute_research":
             await self._execute_research(job.payload)
         elif job.kind == "parallel_research_task":
+            if not await guard_profile_research_work(
+                self.pool, run_id=UUID(str(job.payload["research_run_id"])),
+            ):
+                return
             executor = self.research_executor
             if executor is None or not hasattr(executor, "execute_task"):
                 raise PermanentProviderError("parallel research executor is not configured")
@@ -1136,6 +1148,8 @@ class JobWorker:
             raise PermanentProviderError("research run id is invalid") from exc
         if str(run_id) != run_text:
             raise PermanentProviderError("research run id is not canonical")
+        if not await guard_profile_research_work(self.pool, run_id=run_id):
+            return
         result = await self.research_executor.execute(run_id)
         # Keep the port backwards-compatible with external executors that only
         # perform the run. The built-in executor returns the durable terminal

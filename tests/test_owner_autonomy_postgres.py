@@ -4,27 +4,37 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import json
 import os
+import time
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import asyncpg
 import fitz
 import pytest
 import pytest_asyncio
+from aiohttp.test_utils import TestClient, TestServer
 from docx import Document
 
 from procurement_bot.approvals import approve_request
 from procurement_bot.cases import IntakeContext, persist_intake_result
+from procurement_bot.config import Settings
 from procurement_bot.db import _init_connection, run_migrations
 from procurement_bot.dialogue import SearchScopePolicy, evaluate_missing_blockers
 from procurement_bot.documents import extract_document, joined_text
 from procurement_bot.intake import IntakeService, ParsedProcurementRequest, ProcurementRequestPatch
+from procurement_bot.mini_app import create_mini_app
 from procurement_bot.owner_autonomy import (
     ResearchAutomationPolicy,
     ResearchPolicyDenied,
     autostart_snapshotted_research,
+    bind_research_policy,
+    record_sourcing_disposition,
     replace_research_profile,
     revoke_research_profile,
 )
@@ -308,3 +318,312 @@ async def test_generated_document_extraction_to_native_autostart(owner_pg, tmp_p
     await worker._process_intake({"incoming_message_id": str(message),
                                   "extraction_id": str(extraction), "input_kind": "document"})
     assert await state.pool.fetchval("SELECT count(*) FROM procurement_cases") == 1
+
+
+def signed_headers(user_id=800_000_000):
+    values = {"auth_date": str(int(time.time())), "user": json.dumps({"id": user_id})}
+    check = "\n".join(f"{key}={value}" for key, value in sorted(values.items()))
+    secret = hmac.new(b"WebAppData", b"synthetic-token", hashlib.sha256).digest()
+    values["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    return {"Authorization": "tma " + urlencode(values)}
+
+
+def mini_client(state):
+    settings = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="synthetic-token",  # noqa: S106
+                        telegram_allowed_user_ids="800000000,800000001")
+    return TestClient(TestServer(create_mini_app(state.pool, settings)))
+
+
+async def test_miniapp_owner_warning_read_and_crossowner_unauthorized(owner_pg):
+    state = owner_pg
+    await enroll(state)
+    case, _, _ = await intake_case(state, request=request_facts(ambiguous=True))
+    await prepare(state, case)
+    path = f"/api/cases/{case}/source-visibility"
+    async with mini_client(state) as client:
+        assert (await client.get(path)).status == 401
+        assert (await client.get(path, headers=signed_headers(800_000_002))).status == 403
+        # Authenticated other owners get no case existence/data disclosure.
+        assert (await client.get(path, headers=signed_headers(800_000_001))).status == 404
+        response = await client.get(path, headers=signed_headers())
+        assert response.status == 200
+        data = await response.json()
+        assert data["warnings"] == ["SOURCE-E27: inspect source row"]
+        assert data["sourcing_city"] == "City A"
+        assert data["delivery_destination"] == "Synthetic destination in a different city"
+        assert data["items"][1]["issues"] == ["thickness", "requirements.0.ambiguous"]
+        assert data["items"][1]["source_reference"] == "page:1:row:2"
+        assert data["items"][1]["stage"] == "needs_review"
+        assert data["items"][0]["stage"] == "ready_for_search"
+        detail_response = await client.get(f"/api/cases/{case}", headers=signed_headers())
+        assert detail_response.status == 200
+        detail = await detail_response.json()
+        assert detail["source_visibility"] == data
+        serialized = json.dumps(data)
+        assert "tender_unit_price_private" not in serialized and "storage_path" not in serialized
+
+
+async def test_profile_api_explicit_consent_exact_project_and_revocation(owner_pg):
+    state = owner_pg
+    project = await state.pool.fetchval(
+        "INSERT INTO customers(owner_user_id,display_name) VALUES($1,'Owned project') RETURNING id",
+        state.owner,
+    )
+    body = {"customer_id": str(project), "policy": {"ordered_cities": ["City A", "City B"]},
+            "consent_reference": "owner-action:synthetic-v1", "consent_text": "Research only.",
+            "research_autostart": True}
+    async with mini_client(state) as client:
+        assert (await client.post("/api/research-profiles", json=body)).status == 401
+        foreign = await client.post("/api/research-profiles", json=body,
+                                    headers=signed_headers(800_000_001))
+        assert foreign.status == 409
+        invalid = await client.post("/api/research-profiles", json={**body, "consent_text": ""},
+                                    headers=signed_headers())
+        assert invalid.status == 400
+        # Outbound consent fields cannot sneak into research policies.
+        invalid = await client.post(
+            "/api/research-profiles", json={
+                **body, "policy": {**body["policy"], "whatsapp_enabled": True}
+            }, headers=signed_headers(),
+        )
+        assert invalid.status == 400
+        response = await client.post("/api/research-profiles", json=body, headers=signed_headers())
+        assert response.status == 201
+        profile_id = (await response.json())["profile_id"]
+        repeated = await client.post("/api/research-profiles", json=body, headers=signed_headers())
+        assert (await repeated.json())["profile_id"] == profile_id
+        assert (await client.post(f"/api/research-profiles/{profile_id}/revoke",
+                                  headers=signed_headers(800_000_001))).status == 404
+        listing = await client.get("/api/research-profiles", headers=signed_headers(800_000_001))
+        assert (await listing.json())["profiles"] == []
+        response = await client.post(f"/api/research-profiles/{profile_id}/revoke",
+                                     headers=signed_headers())
+        assert response.status == 200
+    assert await state.pool.fetchval("SELECT count(*) FROM case_auto_send_policies") == 0
+
+
+async def test_project_profile_applies_only_authenticated_exact_project_intake(owner_pg):
+    state = owner_pg
+    project = await state.pool.fetchval(
+        "INSERT INTO customers(owner_user_id,display_name) VALUES($1,'Exact project') RETURNING id",
+        state.owner,
+    )
+    await enroll(state, customer=project)
+    case, _, _ = await intake_case(state, customer=project)
+    await prepare(state, case)
+    snapshot = await state.pool.fetchrow("SELECT * FROM case_research_policy_snapshots")
+    assert snapshot["customer_id"] == project
+    assert await state.pool.fetchval("SELECT status FROM research_runs") == "running"
+
+
+async def test_immutable_episodes_null_uniqueness_and_snapshot_and_binding(owner_pg):
+    state = owner_pg
+    first = await enroll(state)
+    async with state.pool.acquire() as c:
+        with pytest.raises(asyncpg.PostgresError, match="immutable"):
+            await c.execute("UPDATE owner_research_automation_profiles SET consent_text='changed'")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await c.execute(
+                """INSERT INTO owner_research_automation_profiles(owner_user_id,version,
+                research_autostart,policy,policy_sha256,consent_reference,consent_text)
+                SELECT owner_user_id,version+1,true,policy,policy_sha256,'second','duplicate'
+                FROM owner_research_automation_profiles""")
+        second = await replace_research_profile(
+            c, owner_id=state.owner, customer_id=None, expected_profile_id=first,
+            policy=ResearchAutomationPolicy(ordered_cities=("City A", "City D")),
+            consent_reference="synthetic-consent-v2", consent_text="Research v2 only.",
+            research_autostart=True,
+        )
+    assert first != second
+    assert await state.pool.fetchval("SELECT version FROM owner_research_automation_profiles "
+                                     "WHERE id=$1", second) == 2
+    case, _, _ = await intake_case(state)
+    await prepare(state, case)
+    for table in ("case_research_policy_snapshots", "research_policy_authorizations"):
+        with pytest.raises(asyncpg.PostgresError, match="immutable"):
+            await state.pool.execute(f"DELETE FROM {table}")  # noqa: S608
+
+
+async def test_atomic_start_rollback_and_recovery_after_job_insert_failure(owner_pg):
+    state = owner_pg
+    await enroll(state)
+    case, _, _ = await intake_case(state)
+    await state.pool.execute(
+        """CREATE FUNCTION reject_execute_job() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.kind='execute_research' THEN RAISE EXCEPTION 'synthetic enqueue failpoint';
+        END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_execute_job BEFORE INSERT ON jobs FOR EACH ROW
+        EXECUTE FUNCTION reject_execute_job()""")
+    with pytest.raises(asyncpg.PostgresError, match="synthetic enqueue failpoint"):
+        await prepare(state, case)
+    assert await state.pool.fetchval("SELECT count(*) FROM research_runs") == 0
+    assert await state.pool.fetchval("SELECT count(*) FROM action_approvals") == 0
+    assert await state.pool.fetchval("SELECT count(*) FROM case_pipeline_runtime") == 0
+    assert await state.pool.fetchval("SELECT status FROM procurement_cases") == "ready"
+    await state.pool.execute("DROP TRIGGER reject_execute_job ON jobs")
+    await prepare(state, case)
+    assert await state.pool.fetchval("SELECT count(*) FROM research_runs") == 1
+
+
+async def test_snapshot_supports_multiple_exact_native_run_bindings(owner_pg):
+    state = owner_pg
+    await enroll(state)
+    case, _, _ = await intake_case(state)
+    await prepare(state, case)
+    snapshot = await state.pool.fetchrow(
+        "SELECT id FROM case_research_policy_snapshots WHERE case_id=$1", case)
+    original = await state.pool.fetchrow(
+        """SELECT research_run_id,plan_sha256 FROM research_policy_authorizations
+        WHERE snapshot_id=$1""", snapshot["id"],
+    )
+    scope = await state.pool.fetchval(
+        "SELECT search_scope FROM research_runs WHERE id=$1", original["research_run_id"])
+    second_run = uuid4()
+    await state.pool.execute(
+        """INSERT INTO research_runs(id,case_id,status,requested_by,search_scope,idempotency_key)
+        VALUES($1,$2,'planned',$3,$4,$5)""", second_run, case, state.owner, scope,
+        "synthetic-second-run-for-same-snapshot",
+    )
+    async with state.pool.acquire() as c:
+        await bind_research_policy(
+            c, snapshot_id=snapshot["id"], case_id=case, run_id=second_run,
+            plan_sha256=original["plan_sha256"],
+        )
+        assert await c.fetchval(
+            "SELECT count(*) FROM research_policy_authorizations WHERE snapshot_id=$1",
+            snapshot["id"],
+        ) == 2
+        with pytest.raises(ResearchPolicyDenied):
+            await bind_research_policy(
+                c, snapshot_id=snapshot["id"], case_id=case, run_id=second_run,
+                plan_sha256="b" * 64,
+            )
+        other_case, _, _ = await intake_case(state, request=request_facts(city="City A"))
+        other_run = uuid4()
+        await c.execute(
+            """INSERT INTO research_runs(
+            id,case_id,status,requested_by,search_scope,idempotency_key)
+            VALUES($1,$2,'planned',$3,$4,$5)""", other_run, other_case, state.owner, scope,
+            "synthetic-run-for-another-case",
+        )
+        with pytest.raises(ResearchPolicyDenied, match="does not belong"):
+            await bind_research_policy(
+                c, snapshot_id=snapshot["id"], case_id=case, run_id=other_run,
+                plan_sha256=original["plan_sha256"],
+            )
+
+
+async def test_operator_attestation_records_external_source_without_telegram_artifact(owner_pg):
+    state = owner_pg
+    case, _, _ = await intake_case(state, request=request_facts(city="City A"))
+    item = await state.pool.fetchval("SELECT id FROM request_items WHERE line_number=1")
+    kwargs = dict(
+        owner_id=state.owner, case_id=case, item_id=item, artifact_id=None,
+        artifact_sha256="c" * 64, source_kind="operator_attestation",
+        source_reference="owner-upload:reviewed-photo-2026-10-16",
+        disposition="skip", quantity=None, unit="m",
+        owner_assertion="I confirm the exact requested brush line was already bought.",
+        exact_match_rationale=(
+            "Owner reviewed the source rows and selected this exact item mapping."
+        ),
+        idempotency_key="synthetic-operator-attestation",
+    )
+    async with state.pool.acquire() as c:
+        evidence_id = await record_sourcing_disposition(c, **kwargs)
+        assert await record_sourcing_disposition(c, **kwargs) == evidence_id
+        for override in ({"owner_id": state.other},
+                         {"source_reference": " "},
+                         {"artifact_sha256": "not-a-digest"},
+                         {"artifact_id": uuid4()},
+                         {"owner_assertion": "changed assertion"}):
+            with pytest.raises(ResearchPolicyDenied):
+                await record_sourcing_disposition(c, **{**kwargs, **override})
+        row = await c.fetchrow(
+            "SELECT source_kind,source_artifact_id,source_reference,artifact_sha256 "
+            "FROM item_sourcing_dispositions WHERE id=$1", evidence_id)
+        assert row["source_kind"] == "operator_attestation"
+        assert row["source_artifact_id"] is None
+        assert row["source_reference"] == kwargs["source_reference"]
+        assert row["artifact_sha256"] == kwargs["artifact_sha256"]
+        with pytest.raises(
+            asyncpg.PostgresError, match="operator source attestation is incomplete",
+        ):
+            await c.execute(
+                """INSERT INTO item_sourcing_dispositions(
+                case_id,request_item_id,owner_user_id,source_kind,source_reference,
+                artifact_sha256,disposition,unit,owner_assertion,exact_match_rationale,
+                evidence_sha256,idempotency_key)
+                VALUES($1,$2,$3,'operator_attestation',NULL,$4,'skip','m','attested',
+                'exact mapping',$5,'partial-provenance')""",
+                case, item, state.owner, "d" * 64, "e" * 64,
+            )
+        with pytest.raises(asyncpg.PostgresError, match="item owner/case mismatch"):
+            await c.execute(
+                """INSERT INTO item_sourcing_dispositions(
+                case_id,request_item_id,owner_user_id,source_kind,source_reference,
+                artifact_sha256,disposition,unit,owner_assertion,exact_match_rationale,
+                evidence_sha256,idempotency_key)
+                VALUES($1,$2,$3,'operator_attestation',$4,$5,'skip','m','attested',
+                'exact mapping',$6,'wrong-owner-provenance')""",
+                case, item, state.other, kwargs["source_reference"], "d" * 64, "e" * 64,
+            )
+        assert await c.fetchval("SELECT count(*) FROM purchase_items") == 0
+        assert await c.fetchval("SELECT status FROM request_items WHERE id=$1", item) == "ready"
+    async with mini_client(state) as client:
+        path = f"/api/cases/{case}/items/{item}/sourcing-dispositions"
+        body = {**kwargs, "owner_id": None, "item_id": str(item), "case_id": str(case),
+                "source_artifact_id": None, "source_sha256": kwargs["artifact_sha256"],
+                "quantity": None}
+        body.pop("artifact_sha256")
+        assert (await client.post(path, json=body)).status == 401
+        wrong_owner = await client.post(path, json=body, headers=signed_headers(800_000_001))
+        assert wrong_owner.status == 409
+        response = await client.post(path, json=body, headers=signed_headers())
+        assert response.status == 201
+        visibility = await client.get(f"/api/cases/{case}/source-visibility",
+                                      headers=signed_headers())
+        source_item = (await visibility.json())["items"][0]
+        assert source_item["sourcing_evidence"][0]["source_kind"] == "operator_attestation"
+        assert source_item["sourcing_evidence"][0]["source_reference"] == kwargs["source_reference"]
+        assert source_item["sourcing_evidence"][0]["source_sha256"] == kwargs["artifact_sha256"]
+        assert source_item["disposition_applied_to_plan"] is False
+
+
+async def test_exact_owner_attested_disposition_is_evidence_only_not_accounting(owner_pg):
+    state = owner_pg
+    case, message, _ = await intake_case(state, request=request_facts(city="City A"))
+    item = await state.pool.fetchval("SELECT id FROM request_items WHERE line_number=1")
+    attachment = await state.pool.fetchval(
+        "INSERT INTO incoming_attachments(message_id,external_file_id,kind) "
+        "VALUES($1,'synthetic-photo','photo') RETURNING id", message,
+    )
+    artifact = await state.pool.fetchval(
+        """INSERT INTO source_artifacts(
+        attachment_id,artifact_kind,storage_path,sha256,byte_size)
+        VALUES($1,'original','synthetic-not-a-real-file',$2,0) RETURNING id""",
+        attachment, "a" * 64,
+    )
+    kwargs = dict(owner_id=state.owner, case_id=case, item_id=item, artifact_id=artifact,
+                  artifact_sha256="a" * 64, disposition="reduce_quantity", quantity=Decimal("1"),
+                  unit="m", owner_assertion="I bought exactly one metre of source line one.",
+                  exact_match_rationale="Reviewed exact item and compatible metre unit.",
+                  idempotency_key="synthetic-owner-disposition")
+    async with state.pool.acquire() as c:
+        first = await record_sourcing_disposition(c, **kwargs)
+        assert await record_sourcing_disposition(c, **kwargs) == first
+        for override in ({"owner_id": state.other}, {"artifact_sha256": "b" * 64},
+                         {"unit": "piece"}, {"quantity": Decimal("3")},
+                         {"owner_assertion": "Different assertion"}):
+            with pytest.raises(ResearchPolicyDenied):
+                await record_sourcing_disposition(c, **{**kwargs, **override})
+        assert await c.fetchval("SELECT count(*) FROM purchase_items") == 0
+        assert await c.fetchval("SELECT count(*) FROM purchase_documents") == 0
+        assert await c.fetchval("SELECT status FROM request_items WHERE id=$1", item) == "ready"
+    async with mini_client(state) as client:
+        response = await client.get(
+            f"/api/cases/{case}/source-visibility", headers=signed_headers(),
+        )
+        source_item = (await response.json())["items"][0]
+        assert source_item["stage"] == "evidence_only"
+        assert source_item["sourcing_evidence"][0]["artifact_sha256"] == "a" * 64
+        assert source_item["disposition_applied_to_plan"] is False

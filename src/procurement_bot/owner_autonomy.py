@@ -5,6 +5,7 @@ No provider calls, outbound policy changes, or accounting writes belong here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
@@ -39,6 +40,17 @@ class ResearchAutomationPolicy(BaseModel):
         if len({city.casefold() for city in values}) != len(values):
             raise ValueError("cities must be distinct and ordered")
         return values
+
+
+class ResearchProfileEnrollment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    customer_id: UUID | None = None
+    policy: ResearchAutomationPolicy
+    consent_reference: str = Field(min_length=1, max_length=500)
+    consent_text: str = Field(min_length=1, max_length=4000)
+    research_autostart: Literal[True]
+    expected_profile_id: UUID | None = None
 
 
 async def _owner_scope(
@@ -290,6 +302,25 @@ async def bind_research_policy(
     run_id: UUID, plan_sha256: str,
 ) -> dict[str, str]:
     row = await load_valid_snapshot(connection, snapshot_id=snapshot_id, case_id=case_id)
+    run = await connection.fetchrow(
+        "SELECT case_id,search_scope FROM research_runs WHERE id=$1 FOR SHARE", run_id,
+    )
+    from procurement_bot.research_workflow import ResearchStartDenied, _plan_hash
+    if run is None or run["case_id"] != case_id:
+        raise ResearchPolicyDenied("research run does not belong to the snapshotted case")
+    try:
+        actual_plan_sha256 = _plan_hash(run["search_scope"])
+    except ResearchStartDenied as exc:
+        raise ResearchPolicyDenied("research run has no valid persisted plan") from exc
+    scope = run["search_scope"]
+    if isinstance(scope, str):
+        import json
+        scope = json.loads(scope)
+    plan = scope.get("plan") if isinstance(scope, dict) else None
+    first_city = row["snapshot"]["policy"]["ordered_cities"][0]
+    if (actual_plan_sha256 != plan_sha256 or not isinstance(plan, dict)
+            or plan.get("city") != first_city):
+        raise ResearchPolicyDenied("research plan hash or initial city differs from policy")
     binding = {"snapshot_id": str(snapshot_id), "snapshot_sha256": row["snapshot_sha256"],
                "case_id": str(case_id), "research_run_id": str(run_id),
                "plan_sha256": plan_sha256, "parse_version_id": str(row["parse_version_id"]),
@@ -324,6 +355,18 @@ async def validate_research_policy_binding(
             or payload_sha256(auth["binding"]) != authorization_sha256):
         raise ResearchPolicyDenied("research policy authorization/plan hash mismatch")
     row = await load_valid_snapshot(connection, snapshot_id=auth["snapshot_id"], case_id=case_id)
+    run = await connection.fetchrow(
+        "SELECT case_id,search_scope FROM research_runs WHERE id=$1 FOR SHARE", run_id,
+    )
+    from procurement_bot.research_workflow import ResearchStartDenied, _plan_hash
+    if run is None or run["case_id"] != case_id:
+        raise ResearchPolicyDenied("authorized run no longer belongs to the snapshotted case")
+    try:
+        actual_plan_sha256 = _plan_hash(run["search_scope"])
+    except ResearchStartDenied as exc:
+        raise ResearchPolicyDenied("authorized run plan is invalid") from exc
+    if actual_plan_sha256 != plan_sha256:
+        raise ResearchPolicyDenied("authorized run plan changed after binding")
     expected = {"snapshot_id": str(row["id"]), "snapshot_sha256": row["snapshot_sha256"],
                 "case_id": str(case_id), "research_run_id": str(run_id),
                 "plan_sha256": plan_sha256, "parse_version_id": str(row["parse_version_id"]),
@@ -398,12 +441,66 @@ async def autostart_snapshotted_research(
         return True
 
 
+async def guard_profile_research_work(
+    pool: asyncpg.Pool, *, case_id: UUID | None = None, run_id: UUID | None = None,
+) -> bool:
+    """Pause opted-in work on the next native job boundary after revocation/drift.
+
+    Manual work retains its existing guards. An already running provider request
+    is not retroactively interrupted; later queued batches/ticks are fenced.
+    """
+    from procurement_bot.queue import stable_key
+    from procurement_bot.research_workflow import ResearchStartDenied, _plan_hash
+
+    async with pool.acquire() as connection, connection.transaction():
+        runtime = await connection.fetchrow(
+            """SELECT rt.case_id,rt.research_run_id,rt.research_policy_snapshot_id,
+            a.id AS authorization_id,a.binding_sha256,a.plan_sha256,r.search_scope,
+            c.owner_user_id FROM case_pipeline_runtime rt
+            JOIN procurement_cases c ON c.id=rt.case_id
+            JOIN research_runs r ON r.id=COALESCE($2::uuid,rt.research_run_id)
+            LEFT JOIN research_policy_authorizations a ON a.research_run_id=r.id
+            WHERE ($1::uuid IS NULL OR rt.case_id=$1)
+            AND ($2::uuid IS NULL OR r.case_id=rt.case_id AND r.id=$2)
+            AND rt.research_policy_snapshot_id IS NOT NULL""", case_id, run_id,
+        )
+        if runtime is None:
+            return True
+        try:
+            if runtime["authorization_id"] is None:
+                raise ResearchPolicyDenied("profile runtime has no exact run authorization")
+            if _plan_hash(runtime["search_scope"]) != runtime["plan_sha256"]:
+                raise ResearchPolicyDenied("research policy runtime plan drift")
+            await validate_research_policy_binding(
+                connection, authorization_id=runtime["authorization_id"],
+                authorization_sha256=runtime["binding_sha256"],
+                case_id=runtime["case_id"], run_id=run_id or runtime["research_run_id"],
+                plan_sha256=runtime["plan_sha256"], approved_by=runtime["owner_user_id"],
+            )
+        except (ResearchPolicyDenied, ResearchStartDenied) as exc:
+            await connection.execute(
+                "UPDATE case_pipeline_runtime SET paused=true,wake_reason='research_policy_review',"
+                "updated_at=now() WHERE case_id=$1", runtime["case_id"],
+            )
+            await connection.execute(
+                """INSERT INTO workflow_events(case_id,event_type,actor_type,actor_id,
+                idempotency_key,data) VALUES($1,'research_policy_paused','worker',
+                'owner-research-guard',$2,$3::jsonb) ON CONFLICT(idempotency_key) DO NOTHING""",
+                runtime["case_id"], stable_key("workflow.research-policy-paused",
+                                             runtime["authorization_id"], runtime["case_id"]),
+                {"reason": str(exc), "authorization_mode": "owner_research_profile"},
+            )
+            return False
+    return True
+
+
 async def record_sourcing_disposition(
     connection: asyncpg.Connection, *, owner_id: UUID, case_id: UUID, item_id: UUID,
-    artifact_id: UUID, artifact_sha256: str,
+    artifact_id: UUID | None, artifact_sha256: str,
     disposition: Literal["bought", "skip", "reduce_quantity"],
     quantity: Decimal | None, unit: str, owner_assertion: str, exact_match_rationale: str,
-    idempotency_key: str,
+    idempotency_key: str, source_kind: Literal["telegram_artifact", "operator_attestation"]
+    = "telegram_artifact", source_reference: str | None = None,
 ) -> UUID:
     """Record an exact reviewed assertion, without inferring accounting facts.
 
@@ -414,6 +511,21 @@ async def record_sourcing_disposition(
     if not all(value.strip() for value in (unit, owner_assertion, exact_match_rationale,
                                            idempotency_key)):
         raise ResearchPolicyDenied("verbatim assertion, exact rationale, unit and key required")
+    if (not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256)
+            or len(owner_assertion) > 4000 or len(exact_match_rationale) > 2000):
+        raise ResearchPolicyDenied("invalid source hash or oversized owner evidence")
+    if source_kind == "telegram_artifact":
+        if artifact_id is None or source_reference is not None:
+            raise ResearchPolicyDenied("Telegram evidence requires its native artifact id")
+    elif source_kind == "operator_attestation":
+        if (artifact_id is not None or not source_reference or len(source_reference) > 500
+                or not source_reference.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in source_reference)):
+            raise ResearchPolicyDenied(
+                "operator evidence requires a plain source reference and no artifact id"
+            )
+    else:
+        raise ResearchPolicyDenied("unsupported sourcing evidence kind")
     async with connection.transaction():
         item = await connection.fetchrow(
             """SELECT i.quantity,i.unit FROM request_items i JOIN procurement_cases c
@@ -421,16 +533,18 @@ async def record_sourcing_disposition(
             WHERE i.id=$1 AND c.id=$2 AND c.owner_user_id=$3 FOR SHARE OF i,c,u""",
             item_id, case_id, owner_id,
         )
-        artifact = await connection.fetchval(
-            """SELECT a.sha256 FROM source_artifacts a JOIN incoming_attachments t
-            ON t.id=a.attachment_id JOIN messages m ON m.id=t.message_id
-            WHERE a.id=$1 AND m.user_id=$2 AND (m.id IN
-            (SELECT source_message_id FROM procurement_cases WHERE id=$3) OR EXISTS
-            (SELECT 1 FROM dialogue_turns d WHERE d.message_id=m.id AND d.case_id=$3))
-            FOR SHARE OF a,m""", artifact_id, owner_id, case_id,
-        )
-        if item is None or artifact != artifact_sha256:
-            raise ResearchPolicyDenied("exact case item and case-owned artifact SHA required")
+        artifact = None
+        if source_kind == "telegram_artifact":
+            artifact = await connection.fetchval(
+                """SELECT a.sha256 FROM source_artifacts a JOIN incoming_attachments t
+                ON t.id=a.attachment_id JOIN messages m ON m.id=t.message_id
+                WHERE a.id=$1 AND m.user_id=$2 AND (m.id IN
+                (SELECT source_message_id FROM procurement_cases WHERE id=$3) OR EXISTS
+                (SELECT 1 FROM dialogue_turns d WHERE d.message_id=m.id AND d.case_id=$3))
+                FOR SHARE OF a,m""", artifact_id, owner_id, case_id,
+            )
+        if item is None or (source_kind == "telegram_artifact" and artifact != artifact_sha256):
+            raise ResearchPolicyDenied("exact case item and source owner/hash binding required")
         if (unit != item["unit"] or quantity is not None and
                 (not quantity.is_finite() or quantity <= 0 or item["quantity"] is None
                  or quantity > item["quantity"])):
@@ -438,18 +552,21 @@ async def record_sourcing_disposition(
         if disposition != "skip" and quantity is None:
             raise ResearchPolicyDenied("bought/reduction quantity required")
         facts = {"case_id": str(case_id), "item_id": str(item_id),
-                 "artifact_id": str(artifact_id), "artifact_sha256": artifact_sha256,
-                 "disposition": disposition, "quantity": str(quantity) if quantity else None,
+                 "source_kind": source_kind,
+                 "artifact_id": str(artifact_id) if artifact_id else None,
+                 "source_reference": source_reference, "artifact_sha256": artifact_sha256,
+                 "disposition": disposition,
+                 "quantity": str(quantity) if quantity is not None else None,
                  "unit": unit, "owner_assertion": owner_assertion,
                  "exact_match_rationale": exact_match_rationale, "owner_id": str(owner_id)}
         digest = payload_sha256(facts)
         row = await connection.fetchrow(
             """INSERT INTO item_sourcing_dispositions(case_id,request_item_id,owner_user_id,
-            source_artifact_id,artifact_sha256,disposition,quantity,unit,owner_assertion,
-            exact_match_rationale,evidence_sha256,idempotency_key)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING
-            RETURNING id,evidence_sha256""", case_id, item_id, owner_id, artifact_id,
-            artifact_sha256, disposition, quantity, unit, owner_assertion,
+            source_kind,source_artifact_id,source_reference,artifact_sha256,disposition,quantity,
+            unit,owner_assertion,exact_match_rationale,evidence_sha256,idempotency_key)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING
+            RETURNING id,evidence_sha256""", case_id, item_id, owner_id, source_kind, artifact_id,
+            source_reference, artifact_sha256, disposition, quantity, unit, owner_assertion,
             exact_match_rationale, digest, idempotency_key,
         )
         if row is None:
@@ -498,8 +615,8 @@ async def load_case_source_visibility(
         WHERE s.case_id=$1 AND s.intake_version=$2""", case_id, case["version"],
     )
     dispositions = await connection.fetch(
-        """SELECT id,request_item_id,source_artifact_id,artifact_sha256,disposition,
-        quantity,unit,owner_assertion,exact_match_rationale,created_at
+        """SELECT id,request_item_id,source_kind,source_artifact_id,source_reference,
+        artifact_sha256,disposition,quantity,unit,owner_assertion,exact_match_rationale,created_at
         FROM item_sourcing_dispositions WHERE case_id=$1 AND owner_user_id=$2
         ORDER BY created_at,id""", case_id, owner_id,
     )
@@ -531,7 +648,11 @@ async def load_case_source_visibility(
                               "ambiguous": req.ambiguous or req.confidence < 0.6,
                               "source_reference": _source_pointer(req.source_reference)}
                              for req in normalized.requirements] if aligned else [],
-            "sourcing_evidence": evidence,
+            "sourcing_evidence": [
+                {**fact, "source_reference": _source_pointer(fact["source_reference"]),
+                 "source_sha256": fact["artifact_sha256"]}
+                for fact in evidence
+            ],
             "disposition_applied_to_plan": False,
         })
     return {
